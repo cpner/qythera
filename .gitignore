@@ -1,1 +1,7 @@
-__pycache__/\n*.pyc\n.venv/\nnode_modules/\n.next/\noutputs/\ndata/\nmodels/*/model.npz\n.env\n.DS_Store\n
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+models/*/model.npz
+.env
+.DS_Store
