@@ -1,5 +1,5 @@
 <?php
-// Qythera API - PHP backend for serv00 hosting
+// Qythera API - PHP backend for web hosting
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');

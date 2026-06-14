@@ -30,11 +30,9 @@ cd qythera && pip install numpy
 python3 -m core.inference.server --port 8080
 ```
 
-### 3. serv00 (PHP hosting)
 ```bash
 git clone https://github.com/cpner/qythera.git
 cp -r qythera/php/* ~/public_html/
-# Open: https://yourname.serv00.net/index.html
 ```
 
 ---
@@ -46,7 +44,6 @@ cp -r qythera/php/* ~/public_html/
 | **Linux** | `curl -fsSL https://raw.githubusercontent.com/cpner/qythera/main/install.sh \| bash` |
 | **macOS** | Same as Linux |
 | **Windows** | Run `install.bat` or `install.ps1` |
-| **FreeBSD/serv00** | `git clone ... && cp -r php/* ~/public_html/` |
 | **Android (Termux)** | `pkg install python git && git clone ...` |
 | **Docker** | `docker build -t qythera . && docker run -p 8080:8080 qythera` |
 | **Any browser** | Open `web/standalone.html` |
@@ -61,7 +58,6 @@ cp -r qythera/php/* ~/public_html/
 - **Safety filters** (toxicity, jailbreak, PII)
 - **Glassmorphism dark theme** (mobile-responsive)
 - **Standalone HTML** (works without server)
-- **PHP backend** (for serv00 hosting)
 - **Docker support**
 
 ---
@@ -75,7 +71,6 @@ cp -r qythera/php/* ~/public_html/
 | `Address already in use` | Use different port: `--port 9000` |
 | `Command not found: python3` | Try `python -m core.inference.server` |
 | `git pull fails` | `rm -rf core/ && git pull` |
-| serv00 404 | Copy `php/` contents to `~/public_html/` |
 
 ---
 

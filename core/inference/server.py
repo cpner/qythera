@@ -146,7 +146,7 @@ def run_server(host="0.0.0.0", port=8000):
         print(f"\n  \033[31mERROR: Permission denied on port {actual_port}\033[0m")
         print(f"  \033[33mSolutions:\033[0m")
         print(f"  1. Use a higher port: python -m core.inference.server --port 8080")
-        print(f"  2. On serv00: use port 8080 or higher")
+        print(f"  2. On restricted hosts: use a higher port")
         print(f"  3. On Linux: sudo python -m core.inference.server")
         sys.exit(1)
     except OSError as e:

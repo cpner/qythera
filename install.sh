@@ -1,5 +1,4 @@
 #!/bin/bash
-# Qythera Universal Installer - works on Linux, macOS, FreeBSD, Android, Raspberry Pi
 
 set -e
 
@@ -41,7 +40,6 @@ if [ -z "$PYTHON" ]; then
     echo "          sudo pacman -S python     (Arch)"
     echo "          sudo dnf install python3  (Fedora)"
     echo "  macOS:  brew install python3      (Homebrew)"
-    echo "  FreeBSD: pkg install python3      (pkg)"
     echo "  Android: pkg install python        (Termux)"
     echo "  Windows: winget install Python.Python.3"
     exit 1
@@ -64,9 +62,6 @@ fi
 
 # Detect environment
 ENV="unknown"
-if [ -f "/etc/serv00-release" ] || [ -d "/usr/home" ]; then
-    ENV="serv00"
-    echo -e "${CYAN}Environment: serv00/FreeBSD hosting${NC}"
 elif [ -d "/data/data/com.termux" ]; then
     ENV="termux"
     echo -e "${CYAN}Environment: Termux (Android)${NC}"
@@ -110,7 +105,6 @@ echo -e "${GREEN}✓ numpy installed${NC}"
 
 # Find free port
 PORT=8080
-if [ "$ENV" = "serv00" ]; then
     PORT=8080
 elif [ "$ENV" = "termux" ]; then
     PORT=8080
