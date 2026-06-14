@@ -2,6 +2,7 @@ import numpy as np
 from core.nn.module import Module, Parameter
 from core.autodiff.tensor import Tensor
 
+
 class RMSNorm(Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -10,6 +11,7 @@ class RMSNorm(Module):
 
     def forward(self, x):
         return x.rmsnorm(eps=self.eps) * self.weight
+
 
 class LayerNorm(Module):
     def __init__(self, dim, eps=1e-5):

@@ -10,6 +10,7 @@ import weakref
 
 
 class Tensor:
+    __array_priority__ = 10000
     """Multi-dimensional tensor with automatic differentiation.
     
     Tracks computation history for gradient computation via reverse-mode AD.
@@ -388,3 +389,23 @@ class Tensor:
     def __le__(self, other):
         other = other if isinstance(other, Tensor) else Tensor(np.array(other))
         return Tensor((self.data <= other.data).astype(np.float32))
+
+
+    def backward(self):
+        """Run backward pass from this tensor."""
+        if self.grad is None:
+            self.grad = Tensor(np.ones_like(self.data))
+        visited = set()
+        order = []
+        queue = [self]
+        while queue:
+            node = queue.pop(0)
+            if id(node) in visited:
+                continue
+            visited.add(id(node))
+            order.append(node)
+            for child in node._prev:
+                if id(child) not in visited:
+                    queue.append(child)
+        for node in order:
+            node._backward()

@@ -1,5 +1,6 @@
 import numpy as np
 from core.nn.module import Module, Parameter
+from core.nn.linear import Linear
 from core.nn.ffn import SwiGLU
 from core.autodiff.tensor import Tensor
 
@@ -10,18 +11,14 @@ class Expert(SwiGLU):
 
 
 class MoELayer(Module):
-    """Mixture of Experts layer with top-k routing.
-    
-    Routes each token to top-k experts, computes weighted sum.
-    Includes auxiliary load balancing loss.
-    """
-    
+    """Mixture of Experts layer with top-k routing."""
+
     def __init__(self, dim, intermediate, num_experts=8, top_k=2):
         super().__init__()
         self.num_experts = num_experts
-        self.top_k = top_k
+        self.top_k = min(top_k, num_experts)
         self.gate = Linear(dim, num_experts, bias=False)
-        self.experts = [Expert(dim, intermediate) for _ in range(num_experts)]
+        self.expert_list = [Expert(dim, intermediate) for _ in range(num_experts)]
 
     def forward(self, x):
         B, L, D = x.shape
@@ -29,7 +26,9 @@ class MoELayer(Module):
 
         logits = self.gate(x_flat)
         weights = logits.softmax(axis=-1)
-        topk_w, topk_idx = Tensor(np.sort(weights.data, axis=-1)[:, -self.top_k:]), Tensor(np.argsort(weights.data, axis=-1)[:, -self.top_k:])
+
+        topk_w = Tensor(np.sort(weights.data, axis=-1)[:, -self.top_k:])
+        topk_idx = Tensor(np.argsort(weights.data, axis=-1)[:, -self.top_k:])
 
         topk_w = topk_w / (topk_w.sum(axis=-1, keepdims=True) + 1e-8)
 
@@ -39,13 +38,13 @@ class MoELayer(Module):
         for e_idx in range(self.num_experts):
             mask = (topk_idx.data == e_idx).any(axis=-1)
             if mask.any():
-                expert_in = Tensor(x_flat.data[mask])
-                expert_out = self.experts[e_idx](expert_in)
+                expert_in = Tensor(x_flat.data[mask].copy())
+                expert_out = self.expert_list[e_idx](expert_in)
                 for k in range(self.top_k):
                     k_mask = (topk_idx.data[:, k] == e_idx) & mask
                     if k_mask.any():
-                        w = Tensor(topk_w.data[k_mask, k:k+1])
-                        e_out = Tensor(expert_out.data[:k_mask.sum()])
+                        w = Tensor(topk_w.data[k_mask, k:k+1].copy())
+                        e_out = Tensor(expert_out.data[:k_mask.sum()].copy())
                         out.data[k_mask] = (w * e_out).data
 
         router_probs = weights.mean(axis=0)

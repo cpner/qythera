@@ -2,6 +2,7 @@ import numpy as np
 from core.nn.module import Module, Parameter
 from core.autodiff.tensor import Tensor
 
+
 class Linear(Module):
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
@@ -11,5 +12,6 @@ class Linear(Module):
 
     def forward(self, x):
         out = x.matmul(self.weight)
-        if self.bias is not None: out = out + self.bias
+        if self.bias is not None:
+            out = out + self.bias
         return out

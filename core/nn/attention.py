@@ -2,6 +2,7 @@ import numpy as np
 import math
 from core.nn.module import Module, Parameter
 from core.nn.linear import Linear
+from core.nn.dropout import Dropout
 from core.autodiff.tensor import Tensor
 
 
@@ -13,9 +14,9 @@ def precompute_freqs(dim, seq_len, theta=10000.0):
 
 
 def apply_rope(x, freqs):
-    """Apply rotary position embeddings to x.
-    x shape: (B, H, L, D)
-    freqs shape: (L, D//2, 2)
+    """Apply rotary position embeddings.
+    x: numpy array (B, H, L, D)
+    freqs: numpy array (L, D//2, 2)
     """
     B, H, L, D = x.shape
     d = D // 2
@@ -31,19 +32,14 @@ def apply_rope(x, freqs):
 
 
 class MultiHeadAttention(Module):
-    """Multi-Head Attention with GQA, RoPE, and KV cache.
-    
-    Supports:
-    - Grouped Query Attention (GQA)
-    - Rotary Position Embeddings (RoPE)
-    - KV-cache for autoregressive generation
-    - Causal masking
-    """
-    
+    """Multi-Head Attention with GQA, RoPE, and KV cache."""
+
     def __init__(self, dim, num_heads, num_kv_heads=None, head_dim=None, max_seq=4096, dropout=0.0):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads or num_heads // 4
+        if self.num_kv_heads < 1:
+            self.num_kv_heads = 1
         self.head_dim = head_dim or dim // num_heads
         self.num_queries_per_kv = num_heads // self.num_kv_heads
 
@@ -61,9 +57,9 @@ class MultiHeadAttention(Module):
         k = self.wk(x).reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.wv(x).reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        freqs = Tensor(self.freqs[position:position+L])
-        q = Tensor(apply_rope(q.data, freqs.data))
-        k = Tensor(apply_rope(k.data, freqs.data))
+        # Apply RoPE
+        q = Tensor(apply_rope(q.data, self.freqs))
+        k = Tensor(apply_rope(k.data, self.freqs))
 
         if kv_cache is not None:
             past_k, past_v = kv_cache
