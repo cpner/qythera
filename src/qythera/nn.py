@@ -429,6 +429,104 @@ class BatchNorm(Module):
         return Tensor(x_norm, requires_grad=x.requires_grad)
 
 
+class BatchNorm1d(Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        super().__init__()
+        self.eps = eps
+        self.momentum = momentum
+        self.track_running_stats = track_running_stats
+        import numpy as np
+        if affine:
+            self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
+            self.register_parameter('bias', Tensor(np.zeros(num_features, dtype=np.float32)))
+        if track_running_stats:
+            self.register_buffer('running_mean', Tensor(np.zeros(num_features, dtype=np.float32)))
+            self.register_buffer('running_var', Tensor(np.ones(num_features, dtype=np.float32)))
+
+    def forward(self, x):
+        import numpy as np
+        if self.training:
+            mean = x.data.mean(axis=0)
+            var = x.data.var(axis=0, ddof=0)
+            if self.track_running_stats:
+                self.running_mean.data = (1 - self.momentum) * self.running_mean.data + self.momentum * mean
+                self.running_var.data = (1 - self.momentum) * self.running_var.data + self.momentum * var
+            x_norm = (x.data - mean) / np.sqrt(var + self.eps)
+        else:
+            x_norm = (x.data - self.running_mean.data) / np.sqrt(self.running_var.data + self.eps)
+        if hasattr(self, 'weight') and self.weight is not None:
+            x_norm = x_norm * self.weight.data
+        if hasattr(self, 'bias') and self.bias is not None:
+            x_norm = x_norm + self.bias.data
+        return Tensor(x_norm, requires_grad=x.requires_grad)
+
+
+class BatchNorm2d(Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        super().__init__()
+        self.eps = eps
+        self.momentum = momentum
+        self.track_running_stats = track_running_stats
+        import numpy as np
+        if affine:
+            self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
+            self.register_parameter('bias', Tensor(np.zeros(num_features, dtype=np.float32)))
+        if track_running_stats:
+            self.register_buffer('running_mean', Tensor(np.zeros(num_features, dtype=np.float32)))
+            self.register_buffer('running_var', Tensor(np.ones(num_features, dtype=np.float32)))
+
+    def forward(self, x):
+        import numpy as np
+        if self.training:
+            mean = x.data.mean(axis=(0, 2, 3), keepdims=True)
+            var = x.data.var(axis=(0, 2, 3), keepdims=True, ddof=0)
+            if self.track_running_stats:
+                self.running_mean.data = (1 - self.momentum) * self.running_mean.data + self.momentum * mean.squeeze()
+                self.running_var.data = (1 - self.momentum) * self.running_var.data + self.momentum * var.squeeze()
+            x_norm = (x.data - mean) / np.sqrt(var + self.eps)
+        else:
+            rm = self.running_mean.data.reshape(1, -1, 1, 1)
+            rv = self.running_var.data.reshape(1, -1, 1, 1)
+            x_norm = (x.data - rm) / np.sqrt(rv + self.eps)
+        if hasattr(self, 'weight'):
+            x_norm = x_norm * self.weight.data.reshape(1, -1, 1, 1)
+        if hasattr(self, 'bias'):
+            x_norm = x_norm + self.bias.data.reshape(1, -1, 1, 1)
+        return Tensor(x_norm, requires_grad=x.requires_grad)
+
+
+class BatchNorm3d(Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        super().__init__()
+        self.eps = eps
+        self.momentum = momentum
+        self.track_running_stats = track_running_stats
+        import numpy as np
+        if affine:
+            self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
+            self.register_parameter('bias', Tensor(np.zeros(num_features, dtype=np.float32)))
+        if track_running_stats:
+            self.register_buffer('running_mean', Tensor(np.zeros(num_features, dtype=np.float32)))
+            self.register_buffer('running_var', Tensor(np.ones(num_features, dtype=np.float32)))
+
+    def forward(self, x):
+        import numpy as np
+        if self.training:
+            mean = x.data.mean(axis=(0, 2, 3, 4), keepdims=True)
+            var = x.data.var(axis=(0, 2, 3, 4), keepdims=True, ddof=0)
+            if self.track_running_stats:
+                self.running_mean.data = (1 - self.momentum) * self.running_mean.data + self.momentum * mean.squeeze()
+                self.running_var.data = (1 - self.momentum) * self.running_var.data + self.momentum * var.squeeze()
+            x_norm = (x.data - mean) / np.sqrt(var + self.eps)
+        else:
+            rm = self.running_mean.data.reshape(1, -1, 1, 1, 1)
+            rv = self.running_var.data.reshape(1, -1, 1, 1, 1)
+            x_norm = (x.data - rm) / np.sqrt(rv + self.eps)
+        if hasattr(self, 'weight'):
+            x_norm = x_norm * self.weight.data.reshape(1, -1, 1, 1, 1)
+        if hasattr(self, 'bias'):
+            x_norm = x_norm + self.bias.data.reshape(1, -1, 1, 1, 1)
+        return Tensor(x_norm, requires_grad=x.requires_grad)
 
 
 class PowerNorm(Module):
@@ -971,11 +1069,107 @@ class Upsample(Module):
         self.scale_factor = scale_factor
         self.mode = mode
 
+    def _bilinear_1d(self, arr, size, axis):
+        import numpy as np
+        n_in = arr.shape[axis]
+        n_out = size
+        out = np.zeros((n_out,) + arr.shape[1:] if axis == 0 else arr.shape[:axis] + (n_out,) + arr.shape[axis + 1:], dtype=np.float32)
+        for i in range(n_out):
+            x = i * (n_in - 1) / max(n_out - 1, 1)
+            lo = int(np.floor(x))
+            hi = min(lo + 1, n_in - 1)
+            w = x - lo
+            if axis == 0:
+                out[i] = arr[lo] * (1 - w) + arr[hi] * w
+            elif axis == 1:
+                out[:, i] = arr[:, lo] * (1 - w) + arr[:, hi] * w
+            elif axis == 2:
+                out[:, :, i] = arr[:, :, lo] * (1 - w) + arr[:, :, hi] * w
+            elif axis == 3:
+                out[:, :, :, i] = arr[:, :, :, lo] * (1 - w) + arr[:, :, :, hi] * w
+        return out
+
+    def _bilinear_2d(self, arr, h_out, w_out):
+        import numpy as np
+        B, C, H, W = arr.shape
+        out = np.zeros((B, C, h_out, w_out), dtype=np.float32)
+        for i in range(h_out):
+            y = i * (H - 1) / max(h_out - 1, 1)
+            y0 = int(np.floor(y))
+            y1 = min(y0 + 1, H - 1)
+            wy = y - y0
+            for j in range(w_out):
+                x = j * (W - 1) / max(w_out - 1, 1)
+                x0 = int(np.floor(x))
+                x1 = min(x0 + 1, W - 1)
+                wx = x - x0
+                out[:, :, i, j] = (
+                    arr[:, :, y0, x0] * (1 - wy) * (1 - wx) +
+                    arr[:, :, y0, x1] * (1 - wy) * wx +
+                    arr[:, :, y1, x0] * wy * (1 - wx) +
+                    arr[:, :, y1, x1] * wy * wx
+                )
+        return out
+
+    def _bicubic_kernel(self, t):
+        import numpy as np
+        t = np.abs(t)
+        t2 = t ** 2
+        t3 = t ** 3
+        return np.where(
+            t < 1,
+            1.5 * t3 - 2.5 * t2 + 1,
+            np.where(t < 2, -0.5 * t3 + 2.5 * t2 - 4 * t + 2, 0.0)
+        )
+
+    def _bicubic_2d(self, arr, h_out, w_out):
+        import numpy as np
+        B, C, H, W = arr.shape
+        out = np.zeros((B, C, h_out, w_out), dtype=np.float32)
+        for i in range(h_out):
+            y = i * (H - 1) / max(h_out - 1, 1)
+            y_int = int(np.floor(y))
+            for j in range(w_out):
+                x = j * (W - 1) / max(w_out - 1, 1)
+                x_int = int(np.floor(x))
+                val = np.zeros((B, C), dtype=np.float32)
+                for m in range(-1, 3):
+                    for n in range(-1, 3):
+                        yy = min(max(y_int + m, 0), H - 1)
+                        xx = min(max(x_int + n, 0), W - 1)
+                        val += arr[:, :, yy, xx] * self._bicubic_kernel(y - (y_int + m)) * self._bicubic_kernel(x - (x_int + n))
+                out[:, :, i, j] = val
+        return out
+
     def forward(self, x):
         import numpy as np
         if self.scale_factor is not None:
             sf = self.scale_factor if isinstance(self.scale_factor, tuple) else (self.scale_factor, self.scale_factor)
-            out = np.repeat(np.repeat(x.data, int(sf[0]), axis=2), int(sf[1]), axis=3)
+            if self.mode == 'nearest':
+                out = np.repeat(np.repeat(x.data, int(sf[0]), axis=2), int(sf[1]), axis=3)
+            elif self.mode == 'bilinear':
+                h_out = int(x.data.shape[2] * sf[0])
+                w_out = int(x.data.shape[3] * sf[1])
+                out = self._bilinear_2d(x.data, h_out, w_out)
+            elif self.mode == 'bicubic':
+                h_out = int(x.data.shape[2] * sf[0])
+                w_out = int(x.data.shape[3] * sf[1])
+                out = self._bicubic_2d(x.data, h_out, w_out)
+            else:
+                out = np.repeat(np.repeat(x.data, int(sf[0]), axis=2), int(sf[1]), axis=3)
+        elif self.size is not None:
+            h_out = self.size[0] if isinstance(self.size, tuple) else self.size
+            w_out = self.size[1] if isinstance(self.size, tuple) else self.size
+            if self.mode == 'nearest':
+                sf_h = h_out / x.data.shape[2]
+                sf_w = w_out / x.data.shape[3]
+                out = np.repeat(np.repeat(x.data, int(sf_h), axis=2), int(sf_w), axis=3)
+            elif self.mode == 'bilinear':
+                out = self._bilinear_2d(x.data, h_out, w_out)
+            elif self.mode == 'bicubic':
+                out = self._bicubic_2d(x.data, h_out, w_out)
+            else:
+                out = x.data
         else:
             out = x.data
         return Tensor(out, requires_grad=x.requires_grad)
@@ -1175,6 +1369,10 @@ class ReLU(Module):
     def forward(self, x):
         return x.relu()
 
+class SquaredReLU(Module):
+    def forward(self, x):
+        return x.relu() ** 2
+
 class ReLU6(Module):
     def forward(self, x):
         return x.relu6()
@@ -1264,6 +1462,13 @@ class ReGLU(Module):
         import numpy as np
         a, b = np.split(x.data, 2, axis=self.dim)
         return Tensor(a * np.maximum(0, b), requires_grad=x.requires_grad)
+
+class BilinearGLU(Module):
+    def __init__(self, in1_features, in2_features, out_features):
+        super().__init__()
+        self.linear = Linear(in1_features, out_features)
+    def forward(self, x1, x2):
+        return x1 * x2
 
 class Softmax(Module):
     def __init__(self, dim=-1):

@@ -61,6 +61,9 @@ def cast(val, dtype):
     if isinstance(val, Tensor):
         return Tensor(val.data.astype(np_dtype(dt)), requires_grad=val.requires_grad)
     return np.array(val, dtype=np_dtype(dt))
+
+def pack_int4(arr):
+    arr = np.asarray(arr, dtype=np.int8).flatten()
     n = len(arr)
     out = bytearray((n + 1) // 2)
     for i in range(n):
@@ -70,6 +73,10 @@ def cast(val, dtype):
         else:
             out[i // 2] |= val << 4
     return bytes(out)
+
+def clamp_to_dtype(val, dtype):
+    dt = dtype_info[dtype] if isinstance(dtype, str) else dtype
+    return np.clip(val.data if isinstance(val, Tensor) else val, dt.min_val, dt.max_val).astype(np_dtype(dt))
 
 def unpack_int4(data, n):
     data = data if isinstance(data, (bytes, bytearray)) else bytes(data)
@@ -887,6 +894,56 @@ class MaskedSelectBackward:
     def backward(ctx, grad):
         return np.zeros_like(ctx.inputs[0].data)
 
+class FloordivBackward:
+    @staticmethod
+    def backward(ctx, grad):
+        a, b = ctx.inputs
+        return _unbroadcast(grad * 0, a.shape), _unbroadcast(grad * 0, b.shape)
+
+class ModBackward:
+    @staticmethod
+    def backward(ctx, grad):
+        a, b = ctx.inputs
+        return _unbroadcast(grad * 1, a.shape), _unbroadcast(grad * 0, b.shape)
+
+class Exp2Backward:
+    @staticmethod
+    def backward(ctx, grad):
+        return _unbroadcast(grad * ctx.saved[0] * np.log(2), ctx.inputs[0].shape),
+
+class RsqrtBackward:
+    @staticmethod
+    def backward(ctx, grad):
+        return _unbroadcast(grad * (-0.5 * ctx.saved[0] ** 3), ctx.inputs[0].shape),
+
+class CrossBackward:
+    @staticmethod
+    def backward(ctx, grad):
+        a, b = ctx.inputs
+        return _unbroadcast(np.cross(b.data, grad, axisa=-1, axisb=-1, axisc=-1), a.shape), \
+               _unbroadcast(np.cross(grad, a.data, axisa=-1, axisb=-1, axisc=-1), b.shape)
+
+class TensordotBackward:
+    @staticmethod
+    def backward(ctx, grad):
+        a, b = ctx.inputs
+        dims = ctx.saved[0]
+        if isinstance(dims, int):
+            axes_a = list(range(-dims, 0))
+            axes_b = list(range(dims))
+        else:
+            axes_a, axes_b = dims
+        ga = np.tensordot(grad, b.data, axes=(list(range(len(axes_b))), [a.data.ndim - len(axes_a) + i for i in range(len(axes_a))]))
+        gb = np.tensordot(a.data, grad, axes=([a.data.ndim - len(axes_a) + i for i in range(len(axes_a))], list(range(len(axes_b)))))
+        return _unbroadcast(ga, a.shape), _unbroadcast(gb, b.shape)
+
+class KronBackward:
+    @staticmethod
+    def backward(ctx, grad):
+        a, b = ctx.inputs
+        return _unbroadcast(np.kron(grad, np.ones(b.shape)), a.shape), \
+               _unbroadcast(np.kron(np.ones(a.shape), grad), b.shape)
+
 def _unbroadcast(grad, shape):
     if grad.shape == shape:
         return grad
@@ -962,6 +1019,13 @@ class Tensor:
 
     @property
     def dtype(self):
+        if hasattr(self.data, 'dtype'):
+            if self.data.dtype == np.float32: return FP32
+            if self.data.dtype == np.float64: return FP64
+            if self.data.dtype == np.float16: return FP16
+            if self.data.dtype == np.int8: return INT8
+            if self.data.dtype == np.int32 or self.data.dtype == np.int64: return INT8
+            if self.data.dtype == np.bool_: return BOOL
         return FP32
 
     @property
@@ -1016,7 +1080,7 @@ class Tensor:
 
     # ---- autograd ----
 
-    def backward(self, gradient=None):
+    def backward(self, gradient=None, retain_graph=False, create_graph=False):
         if gradient is None:
             if self.data.size == 1:
                 gradient = np.ones_like(self.data)
@@ -1031,7 +1095,8 @@ class Tensor:
             tid = id(t)
             if tid in visited:
                 continue
-            visited.add(tid)
+            if not retain_graph:
+                visited.add(tid)
             if t._ctx is None:
                 continue
             grads = t._ctx.op.backward(t._ctx, t.grad)
@@ -1197,15 +1262,21 @@ class Tensor:
 
     def __floordiv__(self, other):
         other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
-        return Tensor(np.floor(self.data / other.data).astype(np.float32), requires_grad=False)
+        req = self.requires_grad or other.requires_grad
+        return Tensor(np.floor(self.data / other.data).astype(np.float32), requires_grad=req,
+                      _ctx=Context(FloordivBackward, (self, other), ()))
 
     def __rfloordiv__(self, other):
         other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
-        return Tensor(np.floor(other.data / self.data).astype(np.float32), requires_grad=False)
+        req = self.requires_grad or other.requires_grad
+        return Tensor(np.floor(other.data / self.data).astype(np.float32), requires_grad=req,
+                      _ctx=Context(FloordivBackward, (other, self), ()))
 
     def __mod__(self, other):
         other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
-        return Tensor(self.data % other.data, requires_grad=self.requires_grad or other.requires_grad)
+        req = self.requires_grad or other.requires_grad
+        return Tensor(self.data % other.data, requires_grad=req,
+                      _ctx=Context(ModBackward, (self, other), ()))
 
     def __pow__(self, exp):
         if not isinstance(exp, Tensor):
@@ -1236,7 +1307,9 @@ class Tensor:
         return out
 
     def exp2(self):
-        return Tensor(2 ** self.data, requires_grad=self.requires_grad)
+        out = Tensor(2 ** self.data, requires_grad=self.requires_grad,
+                     _ctx=Context(Exp2Backward, (self,), (2 ** self.data,)))
+        return out
 
     def log(self):
         out = Tensor(np.log(np.maximum(self.data, 1e-7)), requires_grad=self.requires_grad,
@@ -1256,7 +1329,10 @@ class Tensor:
         return out
 
     def rsqrt(self):
-        return Tensor(1.0 / (np.sqrt(self.data) + 1e-7), requires_grad=self.requires_grad)
+        r = 1.0 / (np.sqrt(np.maximum(self.data, 0)) + 1e-7)
+        out = Tensor(r, requires_grad=self.requires_grad,
+                     _ctx=Context(RsqrtBackward, (self,), (r,)))
+        return out
 
     def sign(self):
         return Tensor(np.sign(self.data).astype(np.float32), requires_grad=self.requires_grad,
@@ -1546,12 +1622,17 @@ class Tensor:
         other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
         return (self * other).sum()
 
+    def inner(self, other):
+        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        return self.reshape(-1).dot(other.reshape(-1))
+
     def cross(self, other, dim=-1):
         other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
         a, b = self.data, other.data
         if dim < 0: dim += a.ndim
         result = np.cross(a, b, axisa=dim, axisb=dim, axisc=dim)
-        return Tensor(result, requires_grad=self.requires_grad or other.requires_grad)
+        return Tensor(result, requires_grad=self.requires_grad or other.requires_grad,
+                      _ctx=Context(CrossBackward, (self, other), (dim,)))
 
     def tensordot(self, other, dims=2):
         other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
@@ -1561,37 +1642,51 @@ class Tensor:
         else:
             axes_a, axes_b = dims
         result = np.tensordot(self.data, other.data, axes=(axes_a, axes_b))
-        return Tensor(result, requires_grad=self.requires_grad or other.requires_grad)
+        return Tensor(result, requires_grad=self.requires_grad or other.requires_grad,
+                      _ctx=Context(TensordotBackward, (self, other), (dims,)))
 
     def kron(self, other):
         other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
-        return Tensor(np.kron(self.data, other.data), requires_grad=self.requires_grad or other.requires_grad)
+        return Tensor(np.kron(self.data, other.data), requires_grad=self.requires_grad or other.requires_grad,
+                      _ctx=Context(KronBackward, (self, other), ()))
 
     def svd(self, full_matrices=True):
         u, s, vh = np.linalg.svd(self.data, full_matrices=full_matrices)
-        return (Tensor(u, requires_grad=self.requires_grad),
-                Tensor(s, requires_grad=self.requires_grad),
-                Tensor(vh, requires_grad=self.requires_grad))
+        req = self.requires_grad
+        ctx = Context(SVDBackward, (self,), (u, s, vh, full_matrices))
+        return (Tensor(u, requires_grad=req, _ctx=ctx),
+                Tensor(s, requires_grad=req, _ctx=ctx),
+                Tensor(vh, requires_grad=req, _ctx=ctx))
 
     def qr(self, reduced=True):
         q, r = np.linalg.qr(self.data, mode='reduced' if reduced else 'complete')
-        return (Tensor(q, requires_grad=self.requires_grad),
-                Tensor(r, requires_grad=self.requires_grad))
+        req = self.requires_grad
+        ctx = Context(QRBackward, (self,), (q, r, reduced))
+        return (Tensor(q, requires_grad=req, _ctx=ctx),
+                Tensor(r, requires_grad=req, _ctx=ctx))
 
     def cholesky(self):
         L = np.linalg.cholesky(self.data + 1e-7 * np.eye(self.shape[-1]))
-        return Tensor(L, requires_grad=self.requires_grad)
+        return Tensor(L, requires_grad=self.requires_grad,
+                      _ctx=Context(CholeskyBackward, (self,), (L,)))
 
     def lu(self):
         p, l, u = np.linalg.lu(self.data)
+        req = self.requires_grad
+        ctx = Context(LUBackward, (self,), (l, u, p))
         return (Tensor(p, requires_grad=False),
-                Tensor(l, requires_grad=self.requires_grad),
-                Tensor(u, requires_grad=self.requires_grad))
+                Tensor(l, requires_grad=req, _ctx=ctx),
+                Tensor(u, requires_grad=req, _ctx=ctx))
 
     def solve(self, other):
         other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
         result = np.linalg.solve(self.data + 1e-7 * np.eye(self.shape[-1]), other.data)
         return Tensor(result, requires_grad=self.requires_grad or other.requires_grad)
+
+    def solve_triangular(self, b, upper=True):
+        b = b if isinstance(b, Tensor) else Tensor(np.array(b, dtype=np.float32))
+        result = np.linalg.solve(self.data, b.data)
+        return Tensor(result, requires_grad=self.requires_grad or b.requires_grad)
 
     def lstsq(self, other):
         other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
@@ -1600,11 +1695,17 @@ class Tensor:
 
     def det(self):
         d = np.linalg.det(self.data)
-        return Tensor(np.array(d), requires_grad=self.requires_grad)
+        return Tensor(np.array(d), requires_grad=self.requires_grad,
+                      _ctx=Context(DetBackward, (self,), (self.data, d)))
 
     def slogdet(self):
         sign, logabsdet = np.linalg.slogdet(self.data)
-        return Tensor(np.array(sign), requires_grad=False), Tensor(np.array(logabsdet), requires_grad=self.requires_grad)
+        return Tensor(np.array(sign), requires_grad=False), \
+               Tensor(np.array(logabsdet), requires_grad=self.requires_grad,
+                      _ctx=Context(SlogdetBackward, (self,), (self.data, (sign, logabsdet))))
+
+    def logdet(self):
+        return Tensor(np.log(np.abs(np.linalg.det(self.data)) + 1e-30), requires_grad=self.requires_grad)
 
     def eig(self, k=None):
         if k is None:
@@ -1612,7 +1713,10 @@ class Tensor:
         else:
             w, v = np.linalg.eigh(self.data)
             w, v = w[:k], v[:, :k]
-        return Tensor(w, requires_grad=self.requires_grad), Tensor(v, requires_grad=self.requires_grad)
+        return Tensor(w, requires_grad=self.requires_grad,
+                      _ctx=Context(EigBackward, (self,), (w, v))), \
+               Tensor(v, requires_grad=self.requires_grad,
+                      _ctx=Context(EigBackward, (self,), (w, v)))
 
     def einsum(self, equation, *others):
         tensors = [self] + list(others)
@@ -1739,6 +1843,12 @@ class Tensor:
             padding = (padding, padding)
         return self.pad(padding).unfold(2, kernel_size[0], stride[0]).unfold(3, kernel_size[1], stride[1])
 
+    def fold(self, output_size, kernel_size, stride=1, padding=0):
+        return Tensor(self.data, requires_grad=self.requires_grad)
+
+    def col2im(self, output_size, kernel_size, stride=1, padding=0):
+        return Tensor(self.data, requires_grad=self.requires_grad)
+
     # ---- comparison ops ----
 
     def __eq__(self, other):
@@ -1778,9 +1888,6 @@ class Tensor:
 
     def contiguous_view(self):
         return self.reshape(*self.shape)
-
-    def is_contiguous(self):
-        return self.data.flags['C_CONTIGUOUS']
 
     # ---- loss helpers ----
 
@@ -1863,28 +1970,6 @@ def huber_loss(pred, target, delta=1.0):
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
-
-def no_grad():
-    return contextmanager(lambda: (yield))() if False else _no_grad_ctx()
-
-class _no_grad_ctx:
-    def __enter__(self):
-        self.prev = getattr(_local, "no_grad_flag", False)
-        _local.no_grad_flag = True
-        return self
-    def __exit__(self, *args):
-        _local.no_grad_flag = self.prev
-
-def enable_grad():
-    return _enable_grad_ctx()
-
-class _enable_grad_ctx:
-    def __enter__(self):
-        self.prev = getattr(_local, "no_grad_flag", False)
-        _local.no_grad_flag = False
-        return self
-    def __exit__(self, *args):
-        _local.no_grad_flag = self.prev
 
 def zeros(*shape, requires_grad=False):
     return Tensor(np.zeros(shape, dtype=np.float32), requires_grad=requires_grad)
@@ -2144,4 +2229,99 @@ def masked_select_tensor(x, mask):
 def index_put_tensor(x, indices, values):
     return x.index_put_(indices, values)
 
+
+# ---------------------------------------------------------------------------
+# Mixed precision utilities
+# ---------------------------------------------------------------------------
+
+class GradScaler:
+    def __init__(self, init_scale=2.**16, growth_factor=2.0, backoff_factor=0.5,
+                 growth_interval=2000):
+        self._scale = init_scale
+        self._growth_factor = growth_factor
+        self._backoff_factor = backoff_factor
+        self._growth_interval = growth_interval
+        self._steps = 0
+
+    @property
+    def scale(self):
+        return self._scale
+
+    def unscale(self, optimizer):
+        for group in optimizer.param_groups:
+            for p in group.get("params", []):
+                if isinstance(p, Tensor) and p.grad is not None:
+                    p.grad.data = p.grad.data / self._scale
+        return True
+
+    def step(self, optimizer):
+        self.unscale(optimizer)
+        optimizer.step()
+
+    def update(self):
+        self._steps += 1
+        if self._steps % self._growth_interval == 0:
+            self._scale *= self._growth_factor
+
+    def backoff(self):
+        self._scale *= self._backoff_factor
+
+
+def gradient_checkpoint(function, *args, **kwargs):
+    saved_inputs = []
+    saved_outputs = []
+
+    class _CheckpointCtx:
+        def __init__(self):
+            self.active = True
+
+    ctx = _CheckpointCtx()
+
+    def _save_for_backward(inp):
+        if ctx.active:
+            saved_inputs.append(inp)
+
+    orig_backward = Tensor.backward
+    def _patched_backward(self, gradient=None, retain_graph=False, create_graph=False):
+        saved_outputs.append(self)
+        return orig_backward(self, gradient, retain_graph, create_graph)
+
+    Tensor.backward = _patched_backward
+    try:
+        output = function(*args, **kwargs)
+    finally:
+        Tensor.backward = orig_backward
+        ctx.active = False
+
+    return output
+
+
+class SparseTensor:
+    def __init__(self, indices, values, dense_shape):
+        self.indices = np.array(indices)
+        self.values = np.array(values, dtype=np.float32)
+        self.dense_shape = tuple(dense_shape)
+
+    @classmethod
+    def from_dense(cls, dense):
+        if isinstance(dense, Tensor):
+            dense = dense.data
+        indices = np.array(np.nonzero(dense))
+        values = dense[dense != 0]
+        return cls(indices, values, dense.shape)
+
+    def to_dense(self):
+        out = np.zeros(self.dense_shape, dtype=np.float32)
+        if self.indices.size > 0:
+            out[tuple(self.indices)] = self.values
+        return Tensor(out)
+
+    def matmul(self, other):
+        dense = self.to_dense()
+        if isinstance(other, SparseTensor):
+            other = other.to_dense()
+        return dense.matmul(other)
+
+    def __repr__(self):
+        return f"SparseTensor(indices={self.indices.shape}, values={self.values.shape}, shape={self.dense_shape})"
 

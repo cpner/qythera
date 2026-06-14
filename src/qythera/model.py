@@ -278,74 +278,51 @@ class H2OKVCache:
 
     def reset(self):
         self.cur_len = [0] * self.num_layers
-        for l in range(self.num_layers):
-            self.attention_accum[l][:] = 0
 
     def get_seq_len(self, layer: int = 0):
         return self.cur_len[layer]
 
 
-class AttentionSinkKVCache:
+class PrefixKVCache:
     def __init__(self, max_seq_len: int, num_layers: int, num_kv_heads: int,
-                 head_dim: int, sink_size: int = 4, sliding_window: Optional[int] = None):
+                 head_dim: int, prefix_len: int = 0):
         self.max_seq_len = max_seq_len
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.sink_size = sink_size
-        self.sliding_window = sliding_window
+        self.prefix_len = prefix_len
+        self.k_prefix = [np.zeros((1, num_kv_heads, prefix_len, head_dim), dtype=np.float32)
+                         for _ in range(num_layers)]
+        self.v_prefix = [np.zeros((1, num_kv_heads, prefix_len, head_dim), dtype=np.float32)
+                         for _ in range(num_layers)]
         self.k_cache = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
                         for _ in range(num_layers)]
         self.v_cache = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
                         for _ in range(num_layers)]
         self.cur_len = [0] * num_layers
-        self.k_sink = [np.zeros((1, num_kv_heads, sink_size, head_dim), dtype=np.float32)
-                       for _ in range(num_layers)]
-        self.v_sink = [np.zeros((1, num_kv_heads, sink_size, head_dim), dtype=np.float32)
-                       for _ in range(num_layers)]
+        self.prefix_set = [False] * num_layers
+
+    def set_prefix(self, layer: int, k_prefix: np.ndarray, v_prefix: np.ndarray):
+        n = k_prefix.shape[2]
+        self.k_prefix[layer][:, :, :n] = k_prefix[:, :, :self.prefix_len]
+        self.v_prefix[layer][:, :, :n] = v_prefix[:, :, :self.prefix_len]
+        self.prefix_set[layer] = True
 
     def update(self, layer: int, new_k: np.ndarray, new_v: np.ndarray, position: int):
         n = new_k.shape[2]
-        total = position + n
-
-        if self.sliding_window is not None:
-            window_start = max(self.sink_size, total - self.sliding_window)
-            slot = window_start + (total - window_start) % self.sliding_window
-        else:
-            slot = position
-
-        sink_end = min(n, self.sink_size)
-        if sink_end > 0:
-            self.k_sink[layer][:, :, :sink_end] = new_k[:, :, :sink_end]
-            self.v_sink[layer][:, :, :sink_end] = new_v[:, :, :sink_end]
-
-        remaining = n - sink_end
-        if remaining > 0:
-            start = max(self.sink_size, slot)
-            self.k_cache[layer][:, :, start:start + remaining] = new_k[:, :, sink_end:]
-            self.v_cache[layer][:, :, start:start + remaining] = new_v[:, :, sink_end:]
-
-        self.cur_len[layer] = total
+        self.k_cache[layer][:, :, position:position + n] = new_k
+        self.v_cache[layer][:, :, position:position + n] = new_v
+        self.cur_len[layer] = position + n
         return self._gather(layer)
 
     def _gather(self, layer: int):
-        length = self.cur_len[layer]
-        k = self.k_sink[layer][:, :, :min(self.sink_size, length)].copy()
-        v = self.v_sink[layer][:, :, :min(self.sink_size, length)].copy()
-
-        window_len = max(0, length - self.sink_size)
-        if self.sliding_window is not None:
-            window_len = min(window_len, self.sliding_window)
-
-        if window_len > 0:
-            w_start = length - window_len
-            w_k = self.k_cache[layer][:, :, w_start:length].copy()
-            w_v = self.v_cache[layer][:, :, w_start:length].copy()
-            full_k = np.concatenate([k, w_k], axis=2)
-            full_v = np.concatenate([v, w_v], axis=2)
+        c = self.cur_len[layer]
+        if self.prefix_set[layer]:
+            full_k = np.concatenate([self.k_prefix[layer], self.k_cache[layer][:, :, :c]], axis=2)
+            full_v = np.concatenate([self.v_prefix[layer], self.v_cache[layer][:, :, :c]], axis=2)
         else:
-            full_k = k
-            full_v = v
+            full_k = self.k_cache[layer][:, :, :c].copy()
+            full_v = self.v_cache[layer][:, :, :c].copy()
         return full_k, full_v
 
     def get(self, layer: int):
@@ -353,6 +330,221 @@ class AttentionSinkKVCache:
 
     def reset(self):
         self.cur_len = [0] * self.num_layers
+        self.prefix_set = [False] * self.num_layers
+
+    def get_seq_len(self, layer: int = 0):
+        return self.cur_len[layer] + (self.prefix_len if self.prefix_set[layer] else 0)
+
+
+class RadixTreeKVCache:
+    def __init__(self, max_seq_len: int, num_layers: int, num_kv_heads: int,
+                 head_dim: int, num_children: int = 16):
+        self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.num_children = num_children
+        self.nodes = [{} for _ in range(num_layers)]
+        self.node_counter = [0] * num_layers
+        self.cur_len = [0] * num_layers
+        self.cur_path = [[] for _ in range(num_layers)]
+        self.k_data = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
+                       for _ in range(num_layers)]
+        self.v_data = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
+                       for _ in range(num_layers)]
+
+    def _get_or_create_node(self, layer: int, parent: int, token_id: int) -> int:
+        key = (parent, token_id)
+        if key in self.nodes[layer]:
+            return self.nodes[layer][key]
+        node_id = self.node_counter[layer]
+        self.node_counter[layer] += 1
+        self.nodes[layer][key] = node_id
+        return node_id
+
+    def update(self, layer: int, new_k: np.ndarray, new_v: np.ndarray, position: int):
+        n = new_k.shape[2]
+        self.k_data[layer][:, :, position:position + n] = new_k
+        self.v_data[layer][:, :, position:position + n] = new_v
+        self.cur_len[layer] = position + n
+        return self._gather(layer)
+
+    def insert_token(self, layer: int, token_id: int):
+        parent = self.cur_path[layer][-1] if self.cur_path[layer] else -1
+        node_id = self._get_or_create_node(layer, parent, token_id)
+        self.cur_path[layer].append(node_id)
+
+    def lookup_prefix_length(self, layer: int, token_ids) -> int:
+        match_len = 0
+        parent = -1
+        for i, tid in enumerate(token_ids):
+            key = (parent, int(tid))
+            if key not in self.nodes[layer]:
+                break
+            parent = self.nodes[layer][key]
+            match_len += 1
+        return match_len
+
+    def _gather(self, layer: int):
+        c = self.cur_len[layer]
+        return (self.k_data[layer][:, :, :c].copy(),
+                self.v_data[layer][:, :, :c].copy())
+
+    def get(self, layer: int):
+        return self._gather(layer)
+
+    def reset(self):
+        self.cur_len = [0] * self.num_layers
+        self.cur_path = [[] for _ in range(self.num_layers)]
+
+    def get_seq_len(self, layer: int = 0):
+        return self.cur_len[layer]
+
+
+class KVQuantizedCache:
+    def __init__(self, max_seq_len: int, num_layers: int, num_kv_heads: int,
+                 head_dim: int, bits: int = 8, group_size: int = 64):
+        self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.bits = bits
+        self.group_size = group_size
+        self.k_cache = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
+                        for _ in range(num_layers)]
+        self.v_cache = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
+                        for _ in range(num_layers)]
+        self.cur_len = [0] * num_layers
+        self.quantized_k = [None] * num_layers
+        self.quantized_v = [None] * num_layers
+        self.scales_k = [None] * num_layers
+        self.scales_v = [None] * num_layers
+
+    def _quantize(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        original_shape = x.shape
+        flat = x.reshape(-1)
+        num_groups = max(1, len(flat) // self.group_size)
+        padded = len(flat) - (len(flat) % self.group_size) if len(flat) % self.group_size != 0 else len(flat)
+        if padded > len(flat):
+            flat = np.pad(flat, (0, padded - len(flat)))
+        groups = flat.reshape(num_groups, -1)
+        scales = np.max(np.abs(groups), axis=1, keepdims=True)
+        scales = np.where(scales == 0, 1.0, scales)
+        quantized = np.clip(np.round(groups / scales * (2 ** (self.bits - 1) - 1)),
+                           -(2 ** (self.bits - 1)), 2 ** (self.bits - 1) - 1)
+        return quantized.astype(np.float32), scales.astype(np.float32)
+
+    def _dequantize(self, quantized: np.ndarray, scales: np.ndarray, original_len: int) -> np.ndarray:
+        flat = (quantized / (2 ** (self.bits - 1) - 1) * scales).flatten()
+        return flat[:original_len]
+
+    def _quantize_full(self, layer: int):
+        k = self.k_cache[layer][:, :, :self.cur_len[layer]]
+        v = self.v_cache[layer][:, :, :self.cur_len[layer]]
+        self.quantized_k[layer], self.scales_k[layer] = self._quantize(k)
+        self.quantized_v[layer], self.scales_v[layer] = self._quantize(v)
+
+    def update(self, layer: int, new_k: np.ndarray, new_v: np.ndarray, position: int):
+        n = new_k.shape[2]
+        self.k_cache[layer][:, :, position:position + n] = new_k
+        self.v_cache[layer][:, :, position:position + n] = new_v
+        self.cur_len[layer] = position + n
+        self._quantize_full(layer)
+        return self._gather(layer)
+
+    def _gather(self, layer: int):
+        c = self.cur_len[layer]
+        if c == 0:
+            return (np.zeros((1, self.num_kv_heads, 0, self.head_dim), dtype=np.float32),
+                    np.zeros((1, self.num_kv_heads, 0, self.head_dim), dtype=np.float32))
+        return (self.k_cache[layer][:, :, :c].copy(),
+                self.v_cache[layer][:, :, :c].copy())
+
+    def get(self, layer: int):
+        return self._gather(layer)
+
+    def reset(self):
+        self.cur_len = [0] * self.num_layers
+        self.quantized_k = [None] * self.num_layers
+        self.quantized_v = [None] * self.num_layers
+
+    def get_seq_len(self, layer: int = 0):
+        return self.cur_len[layer]
+
+    def get_memory_savings(self) -> float:
+        full_bytes = self.num_layers * 2 * self.max_seq_len * self.num_kv_heads * self.head_dim * 4
+        quant_bytes = self.num_layers * 2 * self.max_seq_len * self.num_kv_heads * self.head_dim * (self.bits / 8)
+        return 1.0 - (quant_bytes / full_bytes)
+
+
+class SnapKVCache:
+    def __init__(self, max_seq_len: int, num_layers: int, num_kv_heads: int,
+                 head_dim: int, window_size: int = 64, num_snapshots: int = 16):
+        self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.window_size = window_size
+        self.num_snapshots = num_snapshots
+        self.k_cache = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
+                        for _ in range(num_layers)]
+        self.v_cache = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
+                        for _ in range(num_layers)]
+        self.snap_k = [np.zeros((1, num_kv_heads, num_snapshots, head_dim), dtype=np.float32)
+                       for _ in range(num_layers)]
+        self.snap_v = [np.zeros((1, num_kv_heads, num_snapshots, head_dim), dtype=np.float32)
+                       for _ in range(num_layers)]
+        self.snap_count = [0] * num_layers
+        self.cur_len = [0] * num_layers
+
+    def _compress(self, layer: int):
+        c = self.cur_len[layer]
+        if c <= self.window_size:
+            return
+        start = max(0, c - self.window_size - self.num_snapshots)
+        k_window = self.k_cache[layer][:, :, start:c - self.window_size]
+        v_window = self.v_cache[layer][:, :, start:c - self.window_size]
+        attn_importance = np.abs(k_window).mean(axis=(0, 1, 3))
+        top_indices = np.argsort(attn_importance)[::-1][:self.num_snapshots]
+        top_indices = np.sort(top_indices)
+
+        n_new = min(self.num_snapshots, len(top_indices))
+        self.snap_k[layer][:, :, :n_new] = k_window[:, :, top_indices]
+        self.snap_v[layer][:, :, :n_new] = v_window[:, :, top_indices]
+        self.snap_count[layer] = n_new
+
+    def update(self, layer: int, new_k: np.ndarray, new_v: np.ndarray, position: int):
+        n = new_k.shape[2]
+        self.k_cache[layer][:, :, position:position + n] = new_k
+        self.v_cache[layer][:, :, position:position + n] = new_v
+        self.cur_len[layer] = position + n
+
+        if self.cur_len[layer] > self.window_size + self.num_snapshots:
+            self._compress(layer)
+
+        return self._gather(layer)
+
+    def _gather(self, layer: int):
+        c = self.cur_len[layer]
+        if self.snap_count[layer] > 0:
+            snap_k = self.snap_k[layer][:, :, :self.snap_count[layer]].copy()
+            snap_v = self.snap_v[layer][:, :, :self.snap_count[layer]].copy()
+            window_start = max(0, c - self.window_size)
+            win_k = self.k_cache[layer][:, :, window_start:c].copy()
+            win_v = self.v_cache[layer][:, :, window_start:c].copy()
+            full_k = np.concatenate([snap_k, win_k], axis=2)
+            full_v = np.concatenate([snap_v, win_v], axis=2)
+        else:
+            full_k = self.k_cache[layer][:, :, :c].copy()
+            full_v = self.v_cache[layer][:, :, :c].copy()
+        return full_k, full_v
+
+    def get(self, layer: int):
+        return self._gather(layer)
+
+    def reset(self):
+        self.cur_len = [0] * self.num_layers
+        self.snap_count = [0] * self.num_layers
 
     def get_seq_len(self, layer: int = 0):
         return self.cur_len[layer]
@@ -575,6 +767,361 @@ class Attention(Module):
             l_prev = l_new
 
         return Tensor(output, requires_grad=q.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# Cross Attention (Q from decoder, KV from encoder)
+# ---------------------------------------------------------------------------
+
+class CrossAttention(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** -0.5
+
+        self.wq = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wk = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.wv = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.wo = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+        self.attn_dropout = Dropout(config.dropout) if config.dropout > 0 else None
+
+    def forward(self, x: Tensor, context: Tensor, mask=None,
+                kv_cache=None) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
+        B, L_q, D = x.shape
+        _, L_kv, _ = context.shape
+
+        q = self.wq(x).reshape(B, L_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.wk(context).reshape(B, L_kv, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.wv(context).reshape(B, L_kv, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        kv_out = None
+        if kv_cache is not None:
+            k, v = kv_cache.update(0, k.data, v.data, 0)
+            k = Tensor(k)
+            v = Tensor(v)
+            kv_out = (k, v)
+            L_kv = k.shape[2]
+
+        if self.num_kv_groups > 1:
+            k = Tensor(np.repeat(k.data, self.num_kv_groups, axis=1), requires_grad=k.requires_grad)
+            v = Tensor(np.repeat(v.data, self.num_kv_groups, axis=1), requires_grad=v.requires_grad)
+
+        q_scaled = Tensor(q.data * self.scaling, requires_grad=q.requires_grad)
+        k_t = Tensor(k.data.transpose(0, 1, 3, 2), requires_grad=k.requires_grad)
+        attn = q_scaled.matmul(k_t)
+
+        if mask is not None:
+            attn = Tensor(np.where(mask[None, None, :, :] if mask.ndim == 2 else mask, attn.data, -1e9),
+                           requires_grad=attn.requires_grad)
+
+        attn = attn.softmax(axis=-1)
+        if self.attn_dropout is not None:
+            attn = self.attn_dropout(attn)
+
+        out = attn.matmul(v)
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L_q, self.num_heads * self.head_dim)
+        return self.wo(out), kv_out
+
+
+# ---------------------------------------------------------------------------
+# Linear Attention (Performer FAVOR+)
+# ---------------------------------------------------------------------------
+
+class LinearAttention(Module):
+    def __init__(self, config: TransformerConfig, num_features: int = None):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.num_features = num_features or self.head_dim
+
+        self.wq = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wk = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wv = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wo = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+        self.register_parameter("projection_matrix", None)
+
+    def _get_projection_matrix(self, seq_len: int, device_dtype=np.float32):
+        if self.projection_matrix is not None:
+            return Tensor(self.projection_matrix)
+        dim = self.head_dim
+        num_features = self.num_features
+        projection = np.random.randn(dim, num_features).astype(device_dtype) * (1.0 / np.sqrt(num_features))
+        self.projection_matrix = projection
+        return Tensor(projection)
+
+    def _feature_map(self, x: Tensor) -> Tensor:
+        projection = self._get_projection_matrix(x.shape[-1], x.data.dtype)
+        projected = x.matmul(Tensor(projection.data.T))
+        return projected.elu(alpha=1.0) + 1.0
+
+    def forward(self, x: Tensor, mask=None, kv_cache=None) -> Tuple[Tensor, Optional[Tuple]]:
+        B, L, D = x.shape
+
+        q = self.wq(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.wk(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.wv(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        B_h, H, S, D_h = q.shape
+
+        q_phi = self._feature_map(q)
+        k_phi = self._feature_map(k)
+
+        kv_out = None
+        if kv_cache is not None:
+            k_data, v_data = kv_cache.update(0, k.data, v.data, 0)
+            k = Tensor(k_data)
+            v = Tensor(v_data)
+            k_phi = self._feature_map(k)
+            kv_out = (k, v)
+
+        k_phi_t = Tensor(k_phi.data.transpose(0, 1, 3, 2), requires_grad=k_phi.requires_grad)
+
+        kv = k_phi_t.matmul(v)
+        numerator = q_phi.matmul(kv)
+
+        k_sum = k_phi.sum(axis=2, keepdims=True).permute(0, 1, 3, 2)
+        denominator = q_phi.matmul(k_sum) + 1e-6
+
+        out = Tensor(numerator.data / denominator.data, requires_grad=numerator.requires_grad)
+
+        if mask is not None:
+            mask_expanded = mask[None, None, :, :] if mask.ndim == 2 else mask
+            out = Tensor(out.data * mask_expanded.astype(out.data.dtype), requires_grad=out.requires_grad)
+
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        return self.wo(out), kv_out
+
+
+# ---------------------------------------------------------------------------
+# Cosformer (cosine similarity attention)
+# ---------------------------------------------------------------------------
+
+class Cosformer(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.scaling = self.head_dim ** -0.5
+
+        self.wq = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wk = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wv = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wo = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+        self.attn_dropout = Dropout(config.dropout) if config.dropout > 0 else None
+
+    def _cosine_reweight(self, x: Tensor) -> Tensor:
+        cos_val = x.cos()
+        sin_val = x.sin()
+        return Tensor(cos_val.data + sin_val.data, requires_grad=x.requires_grad)
+
+    def _causal_mask(self, S: int) -> np.ndarray:
+        mask = np.triu(np.ones((S, S), dtype=np.bool_), k=1)
+        return ~mask
+
+    def forward(self, x: Tensor, mask=None, kv_cache=None) -> Tuple[Tensor, Optional[Tuple]]:
+        B, L, D = x.shape
+
+        q = self.wq(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.wk(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.wv(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        S_q = L
+        S_kv = k.shape[2]
+
+        kv_out = None
+        if kv_cache is not None:
+            k_data, v_data = kv_cache.update(0, k.data, v.data, 0)
+            k = Tensor(k_data)
+            v = Tensor(v_data)
+            kv_out = (k, v)
+            S_kv = k.shape[2]
+
+        q_rew = self._cosine_reweight(q)
+        k_rew = self._cosine_reweight(k)
+
+        k_rew_t = Tensor(k_rew.data.transpose(0, 1, 3, 2), requires_grad=k_rew.requires_grad)
+        attn = q_rew.matmul(k_rew_t)
+        attn = Tensor(attn.data * self.scaling, requires_grad=attn.requires_grad)
+
+        causal = self._causal_mask(max(S_q, S_kv))[:S_q, :S_kv]
+        attn = Tensor(np.where(causal[None, None, :, :], attn.data, -1e9),
+                       requires_grad=attn.requires_grad)
+
+        if mask is not None:
+            mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
+            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+                           requires_grad=attn.requires_grad)
+
+        attn = attn.softmax(axis=-1)
+        if self.attn_dropout is not None:
+            attn = self.attn_dropout(attn)
+
+        out = attn.matmul(v)
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        return self.wo(out), kv_out
+
+
+# ---------------------------------------------------------------------------
+# AFT (Attention Free Transformer)
+# ---------------------------------------------------------------------------
+
+class AFT(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.head_dim = config.embed_dim // config.num_heads
+
+        self.wq = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wv = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wo = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+        self.pos_bias = Embedding(config.max_seq_len, self.num_heads)
+        self.alpha = Embedding(config.max_seq_len, self.num_heads)
+
+    def forward(self, x: Tensor, mask=None, kv_cache=None) -> Tuple[Tensor, Optional[Tuple]]:
+        B, L, D = x.shape
+
+        q = self.wq(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.wv(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        B_h, H, S, D_h = q.shape
+
+        with no_grad():
+            positions = Tensor(np.arange(S, dtype=np.int32))
+            pos_bias = self.pos_bias(positions).data
+            alpha_vals = self.alpha(positions).data
+
+        exp_pos_bias = np.zeros((S, S), dtype=np.float32)
+        for i in range(S):
+            for j in range(S):
+                if i >= j:
+                    exp_pos_bias[i, j] = np.exp(-float(pos_bias[i - j, 0]))
+                else:
+                    exp_pos_bias[i, j] = np.exp(-float(pos_bias[j - i, 0]))
+
+        q_np = q.data
+        v_np = v.data
+
+        pos_weighted_v = np.einsum('bhjd,ij->bhid', v_np, exp_pos_bias)
+        denom = exp_pos_bias.sum(axis=1, keepdims=True)
+        pos_weighted_v = pos_weighted_v / (denom[np.newaxis, np.newaxis, :, :] + 1e-6)
+
+        out = Tensor(pos_weighted_v, requires_grad=q.requires_grad)
+
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        return self.wo(out), None
+
+
+# ---------------------------------------------------------------------------
+# Infini-Attention with compressive memory
+# ---------------------------------------------------------------------------
+
+class InfiniAttention(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.scaling = self.head_dim ** -0.5
+
+        self.wq = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wk = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wv = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wo = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+        self.norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        self.gate_linear = Linear(config.embed_dim, 1, bias=config.bias)
+
+        self.memory = None
+        self.memory_normalizer = None
+
+    def _init_memory(self, B, H, D):
+        self.memory = np.zeros((B, H, D, D), dtype=np.float32)
+        self.memory_normalizer = np.zeros((B, H, D), dtype=np.float32)
+
+    def _get_initial_state(self, B, H, D):
+        if self.memory is None:
+            self._init_memory(B, H, D)
+        return self.memory.copy(), self.memory_normalizer.copy()
+
+    def _update_memory(self, k: np.ndarray, v: np.ndarray):
+        new_memory = np.einsum('bhsi,bhsj->bhij', v, k)
+        new_normalizer = k.sum(axis=2)
+        self.memory = self.memory + new_memory
+        self.memory_normalizer = self.memory_normalizer + new_normalizer
+
+    def _memory_attention(self, q: np.ndarray):
+        B, H, S, D = q.shape
+        norm_factor = np.einsum('bhid,bhd->bhi', q, self.memory_normalizer) + 1e-6
+        memory_output = np.einsum('bhde,bhse->bhsd', self.memory, q)
+        memory_output = memory_output / norm_factor[:, :, :, np.newaxis]
+        return memory_output
+
+    def forward(self, x: Tensor, mask=None, kv_cache=None) -> Tuple[Tensor, Optional[Tuple]]:
+        B, L, D = x.shape
+        normed = self.norm(x)
+
+        q = self.wq(normed).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.wk(normed).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.wv(normed).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        gate_input = x.mean(axis=1, keepdims=True)
+        gate = Tensor(np.clip(1.0 / (1.0 + np.exp(-self.gate_linear(gate_input).data)), 0.01, 0.99),
+                       requires_grad=x.requires_grad)
+        beta = float(gate.data.flatten()[0])
+
+        B_h, H, S, D_h = q.shape
+
+        if self.memory is None:
+            self._init_memory(B_h, H, D_h)
+
+        memory_out = self._memory_attention(q.data)
+        self._update_memory(k.data, v.data)
+
+        q_scaled = Tensor(q.data * self.scaling, requires_grad=q.requires_grad)
+        k_t = Tensor(k.data.transpose(0, 1, 3, 2), requires_grad=k.requires_grad)
+        local_attn = q_scaled.matmul(k_t)
+
+        causal_mask = np.zeros((S, S), dtype=np.bool_)
+        for i in range(S):
+            for j in range(S):
+                if j <= i:
+                    causal_mask[i, j] = True
+        local_attn = Tensor(np.where(causal_mask[None, None, :, :], local_attn.data, -1e9),
+                             requires_grad=local_attn.requires_grad)
+
+        local_attn = local_attn.softmax(axis=-1)
+        local_out = local_attn.matmul(v)
+
+        mem_out = Tensor(memory_out, requires_grad=q.requires_grad)
+
+        combined = Tensor(local_out.data * beta + mem_out.data * (1.0 - beta),
+                           requires_grad=local_out.requires_grad)
+
+        out = Tensor(combined.data.transpose(0, 2, 1, 3), requires_grad=combined.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        return self.wo(out), None
+
+    def reset_memory(self):
+        self.memory = None
+        self.memory_normalizer = None
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +1392,364 @@ class TransformerBlock(Module):
 
 
 # ---------------------------------------------------------------------------
+# Post-Norm Transformer Block
+# ---------------------------------------------------------------------------
+
+class PostNormTransformerBlock(Module):
+    def __init__(self, config: TransformerConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+
+        if config.norm_type == "rms":
+            self.norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        else:
+            self.norm = LayerNorm(config.embed_dim)
+
+        self.attn = Attention(config)
+
+        if config.num_experts > 0:
+            self.ffn = MoELayer(config)
+        else:
+            self.ffn = FeedForward(config)
+
+        self.drop = Dropout(config.dropout) if config.dropout > 0 else None
+
+    def forward(self, x: Tensor, mask=None, kv_cache: Optional[KVCache] = None,
+                mla_cache: Optional[MLACache] = None,
+                position: int = 0) -> Tuple[Tensor, Optional[Tuple]]:
+        attn_out, kv_out = self.attn(x, kv_cache, mla_cache, self.layer_idx, position)
+        if self.drop is not None:
+            attn_out = self.drop(attn_out)
+        h = x + attn_out
+
+        ffn_out = self.ffn(h)
+        if self.drop is not None:
+            ffn_out = self.drop(ffn_out)
+        return self.norm(h + ffn_out), kv_out
+
+
+# ---------------------------------------------------------------------------
+# Encoder-Decoder Transformer
+# ---------------------------------------------------------------------------
+
+class EncoderBlock(Module):
+    def __init__(self, config: TransformerConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+
+        if config.norm_type == "rms":
+            self.norm1 = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+            self.norm2 = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        else:
+            self.norm1 = LayerNorm(config.embed_dim)
+            self.norm2 = LayerNorm(config.embed_dim)
+
+        self.attn = Attention(config)
+        self.ffn = FeedForward(config)
+        self.drop = Dropout(config.dropout) if config.dropout > 0 else None
+
+    def forward(self, x: Tensor, mask=None) -> Tuple[Tensor, None]:
+        normed = self.norm1(x)
+        attn_out, _ = self.attn(normed)
+        if self.drop is not None:
+            attn_out = self.drop(attn_out)
+        h = x + attn_out
+
+        normed2 = self.norm2(h)
+        ffn_out = self.ffn(normed2)
+        if self.drop is not None:
+            ffn_out = self.drop(ffn_out)
+        return h + ffn_out, None
+
+
+class DecoderBlock(Module):
+    def __init__(self, config: TransformerConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+
+        if config.norm_type == "rms":
+            self.self_norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+            self.cross_norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+            self.ffn_norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        else:
+            self.self_norm = LayerNorm(config.embed_dim)
+            self.cross_norm = LayerNorm(config.embed_dim)
+            self.ffn_norm = LayerNorm(config.embed_dim)
+
+        self.self_attn = Attention(config)
+        self.cross_attn = CrossAttention(config)
+        self.ffn = FeedForward(config)
+        self.drop = Dropout(config.dropout) if config.dropout > 0 else None
+
+    def forward(self, x: Tensor, encoder_out: Tensor, mask=None, cross_mask=None,
+                kv_cache: Optional[KVCache] = None,
+                mla_cache: Optional[MLACache] = None,
+                position: int = 0) -> Tuple[Tensor, Optional[Tuple]]:
+        normed = self.self_norm(x)
+        self_out, kv_out = self.self_attn(normed, kv_cache, mla_cache, self.layer_idx, position)
+        if self.drop is not None:
+            self_out = self.drop(self_out)
+        h = x + self_out
+
+        normed2 = self.cross_norm(h)
+        cross_out, _ = self.cross_attn(normed2, encoder_out, mask=cross_mask)
+        if self.drop is not None:
+            cross_out = self.drop(cross_out)
+        h = h + cross_out
+
+        normed3 = self.ffn_norm(h)
+        ffn_out = self.ffn(normed3)
+        if self.drop is not None:
+            ffn_out = self.drop(ffn_out)
+        return h + ffn_out, kv_out
+
+
+class EncoderDecoderTransformer(Module):
+    def __init__(self, config: Optional[TransformerConfig] = None):
+        super().__init__()
+        self.config = config or TransformerConfig()
+        c = self.config
+
+        self.embed = Embedding(c.vocab_size, c.embed_dim)
+
+        if c.positional_encoding == "sinusoidal":
+            self.pos_encoding = SinusoidalPE(c.max_seq_len, c.embed_dim)
+        else:
+            self.pos_encoding = None
+
+        self.encoder_layers = ModuleList([
+            EncoderBlock(c, i) for i in range(c.num_layers)
+        ])
+        self.decoder_layers = ModuleList([
+            DecoderBlock(c, i) for i in range(c.num_layers)
+        ])
+
+        if c.norm_type == "rms":
+            self.encoder_norm = NNRMSNorm(c.embed_dim, eps=c.rms_eps)
+            self.decoder_norm = NNRMSNorm(c.embed_dim, eps=c.rms_eps)
+        else:
+            self.encoder_norm = LayerNorm(c.embed_dim)
+            self.decoder_norm = LayerNorm(c.embed_dim)
+
+        self.head = Linear(c.embed_dim, c.vocab_size, bias=False)
+        self.embed_drop = Dropout(c.dropout) if c.dropout > 0 else None
+
+    def _add_pos_encoding(self, x: Tensor, offset: int = 0) -> Tensor:
+        B, L, D = x.shape
+        if self.pos_encoding is not None:
+            with no_grad():
+                pe = Tensor(self.pos_encoding.forward(L + offset), requires_grad=False)
+                pe = Tensor(pe.data[offset:offset + L], requires_grad=False)
+            x = x + pe
+        return x
+
+    def forward(self, src: Tensor, tgt: Tensor, src_mask=None, tgt_mask=None) -> Tensor:
+        if isinstance(src, np.ndarray):
+            src = Tensor(src)
+        if isinstance(tgt, np.ndarray):
+            tgt = Tensor(tgt)
+
+        if src.dtype and src.dtype.name == "INT8":
+            src = src.float()
+        if tgt.dtype and tgt.dtype.name == "INT8":
+            tgt = tgt.float()
+
+        enc_h = self.embed(src)
+        enc_h = self._add_pos_encoding(enc_h)
+
+        if self.embed_drop is not None:
+            enc_h = self.embed_drop(enc_h)
+
+        for layer in self.encoder_layers:
+            enc_h, _ = layer(enc_h, mask=src_mask)
+        enc_h = self.encoder_norm(enc_h)
+
+        dec_h = self.embed(tgt)
+        dec_h = self._add_pos_encoding(dec_h)
+
+        if self.embed_drop is not None:
+            dec_h = self.embed_drop(dec_h)
+
+        for layer in self.decoder_layers:
+            dec_h, _ = layer(dec_h, enc_h, mask=tgt_mask, cross_mask=src_mask)
+        dec_h = self.decoder_norm(dec_h)
+
+        logits = self.head(dec_h)
+
+        if self.config.logit_softcap > 0:
+            logits = Tensor(np.tanh(logits.data / self.config.logit_softcap) * self.config.logit_softcap,
+                            requires_grad=logits.requires_grad)
+
+        return logits
+
+
+# ---------------------------------------------------------------------------
+# DeepSeekMoE (fine-grained experts with shared expert)
+# ---------------------------------------------------------------------------
+
+class DeepSeekMoE(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_shared = max(1, config.num_shared_experts)
+        self.num_routed = max(1, config.num_experts)
+        self.num_experts_per_tok = config.num_experts_per_tok
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.head = Linear(config.embed_dim, config.vocab_size, bias=False)
+
+        self.gate = Linear(config.embed_dim, self.num_routed, bias=False)
+
+        self.shared_experts = ModuleList([
+            FeedForward(config) for _ in range(self.num_shared)
+        ])
+        self.routed_experts = ModuleList([
+            FeedForward(config) for _ in range(self.num_routed)
+        ])
+
+        self.norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        self.load_balance_loss = Tensor(np.float32(0.0))
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        if isinstance(x, np.ndarray):
+            x = Tensor(x)
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        residual = x
+
+        normed = self.norm(x)
+        x_flat = normed.reshape(B * L, D)
+
+        router_logits = self.gate(x_flat)
+        router_probs = router_logits.softmax(axis=-1)
+
+        out = np.zeros((x_flat.shape[0], D), dtype=np.float32)
+
+        if self.num_routed <= 1:
+            for e in range(self.num_routed):
+                expert_out = self.routed_experts[e](x_flat)
+                out = expert_out.data
+        else:
+            k = min(self.num_experts_per_tok, self.num_routed)
+            topk_vals, topk_idx = router_probs.topk(k, dim=-1)
+            for e in range(self.num_routed):
+                mask_e = (topk_idx.data == e).any(axis=-1)
+                if not mask_e.any():
+                    continue
+                idx = np.where(mask_e)[0]
+                x_e = Tensor(x_flat.data[idx])
+                expert_out = self.routed_experts[e](x_e)
+                for j in range(k):
+                    mask = (topk_idx.data[:, j] == e) & mask_e
+                    if mask.any():
+                        w = topk_vals.data[mask, j:j+1]
+                        n = mask.sum()
+                        out[mask] += (expert_out.data[:n] * w).astype(np.float32)
+
+        shared_out = x_flat.data.copy()
+        for se in self.shared_experts:
+            shared_out = se(Tensor(shared_out)).data
+
+        combined = out + shared_out
+        result = Tensor(combined.reshape(B, L, D), requires_grad=x.requires_grad)
+        return self.head(self.norm(residual + result))
+
+    def compute_load_balance_loss(self, router_probs: Tensor, total_tokens: int):
+        probs_mean = router_probs.mean(axis=0)
+        k = min(self.num_experts_per_tok, self.num_routed)
+        _, topk_idx = router_probs.topk(k, dim=-1)
+        expert_counts = np.zeros(self.num_routed, dtype=np.float32)
+        for e in range(self.num_routed):
+            expert_counts[e] = (topk_idx.data == e).sum()
+        freq = expert_counts / (total_tokens * k)
+        aux_loss = self.num_routed * (probs_mean.data * freq).sum()
+        self.load_balance_loss = Tensor(np.float32(aux_loss))
+
+
+# ---------------------------------------------------------------------------
+# Mixture of Depths (MoD)
+# ---------------------------------------------------------------------------
+
+class MixtureOfDepths(Module):
+    def __init__(self, config: TransformerConfig, threshold: float = 0.5):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.threshold = threshold
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.head = Linear(config.embed_dim, config.vocab_size, bias=False)
+
+        self.router = Linear(config.embed_dim, 1, bias=False)
+
+        if config.norm_type == "rms":
+            self.norm1 = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+            self.norm2 = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+            self.final_norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        else:
+            self.norm1 = LayerNorm(config.embed_dim)
+            self.norm2 = LayerNorm(config.embed_dim)
+            self.final_norm = LayerNorm(config.embed_dim)
+
+        self.attn = Attention(config)
+        self.ffn = FeedForward(config)
+        self.drop = Dropout(config.dropout) if config.dropout > 0 else None
+
+        self.total_tokens = 0
+        self.active_tokens = 0
+
+    def _compute_routing(self, x: Tensor) -> Tuple[np.ndarray, np.ndarray]:
+        router_logits = self.router(x)
+        router_probs = 1.0 / (1.0 + np.exp(-router_logits.data))
+        selected = (router_probs >= self.threshold).astype(np.float32)
+        return router_probs, selected
+
+    def forward(self, x: Tensor, mask=None, kv_cache: Optional[KVCache] = None,
+                mla_cache: Optional[MLACache] = None,
+                position: int = 0) -> Tensor:
+        if isinstance(x, np.ndarray):
+            x = Tensor(x)
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        residual = x
+
+        normed = self.norm1(x)
+        routing_probs, selected = self._compute_routing(normed)
+
+        self.total_tokens += B * L
+        self.active_tokens += selected.sum()
+
+        attn_out, kv_out = self.attn(normed, kv_cache, mla_cache, 0, position)
+        if self.drop is not None:
+            attn_out = self.drop(attn_out)
+
+        selected_expanded = Tensor(np.broadcast_to(selected, (B, L, D)), requires_grad=x.requires_grad)
+        h = x + attn_out * selected_expanded
+
+        normed2 = self.norm2(h)
+        ffn_out = self.ffn(normed2)
+        if self.drop is not None:
+            ffn_out = self.drop(ffn_out)
+        result = h + ffn_out * selected_expanded
+        return self.head(self.final_norm(result))
+
+    def get_utilization(self) -> float:
+        if self.total_tokens == 0:
+            return 0.0
+        return self.active_tokens / self.total_tokens
+
+    def reset_counters(self):
+        self.total_tokens = 0
+        self.active_tokens = 0
+
+
+# ---------------------------------------------------------------------------
 # Transformer
 # ---------------------------------------------------------------------------
 
@@ -871,6 +1776,10 @@ class Transformer(Module):
             self.norm = LayerNorm(c.embed_dim)
 
         self.head = Linear(c.embed_dim, c.vocab_size, bias=False)
+
+        if c.tie_embeddings:
+            self.head.weight = self.embed.weight
+
         self.embed_drop = Dropout(c.dropout) if c.dropout > 0 else None
 
         self._kv_cache = None
