@@ -1,3 +1,1 @@
-#!/bin/bash
-cd "$(dirname "$0")/.."
-python3 -m cli.main "$@"
+#!/bin/bash\npython3 "$(dirname "$0")/../cli/main.py" "$@"\n

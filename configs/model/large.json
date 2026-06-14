@@ -1,0 +1,1 @@
+{"hidden_size":2048,"num_layers":24,"num_heads":16,"num_kv_heads":4,"head_dim":128,"intermediate_size":5504,"num_experts":8,"vocab_size":32000,"max_seq_len":4096}

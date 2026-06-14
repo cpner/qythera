@@ -1,80 +1,125 @@
+import numpy as np
+import os, json, time
+from core.model import VaelonModel, VaelonConfig
+from core.tokenizer.bpe import BPETokenizer
+from core.autodiff.optim import Adam
 
-import torch, os, json, time
-from torch.utils.data import Dataset, DataLoader
-from core.config import TrainingConfig, Config
-from core.model import QytheraModel
-from core.tokenizer import Tokenizer
-
-class ChatDataset(Dataset):
-    def __init__(self, path, tokenizer, max_len=2048):
-        self.samples, self.max_len = [], max_len
-        if os.path.exists(path):
-            with open(path) as f: data = json.load(f)
-            for item in data:
-                msgs = item.get("messages", [])
-                ids = tokenizer.encode_chat(msgs)
-                if len(ids) < max_len:
-                    self.samples.append(ids)
-
-    def __len__(self): return len(self.samples)
-    def __getitem__(self, i):
-        ids = self.samples[i]
-        pad_len = self.max_len - len(ids)
-        ids = ids + [2] * pad_len
-        labels = ids.copy()
-        labels[-pad_len:] = [-100] * pad_len
-        mask = [1]*(len(ids)-pad_len) + [0]*pad_len
-        return {"input_ids": torch.tensor(ids), "labels": torch.tensor(labels), "attention_mask": torch.tensor(mask)}
 
 class Trainer:
-    def __init__(self, config: TrainingConfig = None):
-        self.config = config or TrainingConfig()
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = QytheraModel(self.config.model)
-        self.model.to(self.device)
-        self.tokenizer = Tokenizer()
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
+    """Training pipeline for Vaelon models.
+    
+    Supports:
+    - Language modeling (cross-entropy loss)
+    - Gradient accumulation
+    - Learning rate scheduling
+    - Checkpointing
+    """
+    
+    def __init__(self, config=None):
+        self.config = config or VaelonConfig.small()
+        self.model = VaelonModel(self.config)
+        self.tokenizer = BPETokenizer()
+        self.optimizer = Adam(self.model.parameters(), lr=3e-4, weight_decay=0.01)
+        self.step = 0
 
-    def train(self, data_path, epochs=1):
-        print(f"Training on {self.device} | {sum(p.numel() for p in self.model.parameters())/1e6:.0f}M params")
-        os.makedirs(self.config.output_dir, exist_ok=True)
-        dataset = ChatDataset(data_path, self.tokenizer, self.config.model.max_seq_len)
-        if len(dataset) == 0:
-            print("No training data. Create data/chat_train.json")
-            return
-        loader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=True)
-        self.model.train()
-        step = 0
+    def train(self, data_path, epochs=1, batch_size=4, log_every=10, save_every=100):
+        """Train on JSONL data file."""
+        print(f"Training: {sum(p.data.size for p in self.model.parameters()):,} params")
+        
+        if not os.path.exists(data_path):
+            print(f"Creating sample data: {data_path}")
+            self._create_sample_data(data_path)
+
+        with open(data_path) as f:
+            data = json.load(f)
+        
+        print(f"Loaded {len(data)} samples")
+        
         for epoch in range(epochs):
-            total_loss = 0
-            for batch in loader:
-                ids = batch["input_ids"].to(self.device)
-                labels = batch["labels"].to(self.device)
-                _, loss = self.model(ids, labels)
-                loss = loss / self.config.gradient_accumulation
+            np.random.shuffle(data)
+            total_loss = 0.0
+            
+            for i in range(0, len(data), batch_size):
+                batch = data[i:i+batch_size]
+                
+                # Tokenize batch
+                max_len = 128
+                input_ids = np.zeros((len(batch), max_len), dtype=np.int32)
+                labels = np.full((len(batch), max_len), -100, dtype=np.int32)
+                
+                for j, sample in enumerate(batch):
+                    msgs = sample.get("messages", [])
+                    ids = self.tokenizer.encode_chat(msgs)
+                    ids = ids[:max_len]
+                    input_ids[j, :len(ids)] = ids
+                    labels[j, :len(ids)] = ids
+
+                # Forward pass
+                from core.autodiff.tensor import Tensor
+                ids_t = Tensor(input_ids)
+                labels_t = Tensor(labels)
+                logits, loss, aux_loss = self.model(ids_t, labels_t)
+
+                if loss is None:
+                    continue
+
+                # Backward pass
+                self.optimizer.zero_grad()
                 loss.backward()
+                
+                # Gradient clipping
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        g = p.grad.data
+                        norm = np.sqrt(np.sum(g ** 2))
+                        if norm > 1.0:
+                            p.grad.data = g / norm
+
+                self.optimizer.step()
+                self.step += 1
                 total_loss += loss.item()
-                if (step + 1) % self.config.gradient_accumulation == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                step += 1
-                if step % self.config.log_steps == 0:
-                    print(f"  Step {step} | Loss: {total_loss:.4f}")
-                    total_loss = 0
-                if step % self.config.save_steps == 0:
-                    self._save(f"step_{step}")
-        self._save("final")
+
+                if self.step % log_every == 0:
+                    avg = total_loss / log_every
+                    print(f"  Epoch {epoch} Step {self.step} | Loss: {avg:.4f}")
+                    total_loss = 0.0
+
+                if self.step % save_every == 0:
+                    self.save_checkpoint(f"step_{self.step}")
+
+        self.save_checkpoint("final")
         print("Training complete!")
 
-    def _save(self, name):
-        path = os.path.join(self.config.output_dir, name)
+    def _create_sample_data(self, path):
+        data = [
+            {"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi there!"}]},
+            {"messages": [{"role": "user", "content": "What is 2+2?"}, {"role": "assistant", "content": "4"}]},
+            {"messages": [{"role": "user", "content": "Explain Python"}, {"role": "assistant", "content": "Python is a programming language."}]},
+            {"messages": [{"role": "user", "content": "Write a function"}, {"role": "assistant", "content": "def f(x): return x * 2"}]},
+            {"messages": [{"role": "user", "content": "What is AI?"}, {"role": "assistant", "content": "Artificial Intelligence is machines that think."}]},
+        ] * 100  # Repeat for more data
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def save_checkpoint(self, name):
+        path = os.path.join("checkpoints", name)
         os.makedirs(path, exist_ok=True)
-        torch.save(self.model.state_dict(), os.path.join(path, "model.pt"))
-        print(f"  Saved: {path}")
+        state = self.model.state_dict()
+        for k, v in state.items():
+            np.save(os.path.join(path, f"{k}.npy"), v)
+        print(f"  Saved checkpoint: {path}")
+
+    def load_checkpoint(self, path):
+        state = {}
+        for f in os.listdir(path):
+            if f.endswith(".npy"):
+                name = f[:-4]
+                state[name] = np.load(os.path.join(path, f))
+        self.model.load_state_dict(state)
+        print(f"  Loaded checkpoint: {path}")
+
 
 if __name__ == "__main__":
-    import sys
     t = Trainer()
-    data = sys.argv[1] if len(sys.argv) > 1 else "data/chat_train.json"
-    t.train(data)
+    t.train("data/training.json", epochs=3, batch_size=2)

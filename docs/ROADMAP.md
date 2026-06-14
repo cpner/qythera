@@ -1,28 +1,23 @@
-# Qythera Roadmap
+# Roadmap
 
-## Phase 1: Foundation (Current)
-- [x] Vaelon model architecture
+## Phase 1 (Current)
+- [x] Custom autodiff engine
+- [x] Vaelon transformer with MoE
+- [x] BPE tokenizer
 - [x] Training pipeline
 - [x] Inference server
+- [x] Memory system
+- [x] Safety filters
 - [x] Web UI
 - [x] CLI
-- [x] Memory system
 
-## Phase 2: Enhancement
-- [ ] 70B model weights release
-- [ ] Vision-language model
-- [ ] Audio understanding
-- [ ] Tool-use optimization
+## Phase 2
+- [ ] WebAssembly compilation for mobile
+- [ ] Distributed training
+- [ ] Vision encoder
+- [ ] Audio encoder
+
+## Phase 3
+- [ ] Plugin system
 - [ ] Multi-agent collaboration
-
-## Phase 3: Scale
-- [ ] Distributed training across clusters
-- [ ] Model parallelism for 120B+
 - [ ] Real-time learning
-- [ ] Custom expert training
-
-## Phase 4: Ecosystem
-- [ ] Plugin marketplace
-- [ ] Model hub
-- [ ] Enterprise SSO
-- [ ] Compliance certifications

@@ -1,7 +1,0 @@
-name: WildChat
-hf_id: lldwd/wildchat
-split: train
-fields:
-  conversation: conversation
-max_length: 4096
-description: Real-world user-ChatGPT conversations

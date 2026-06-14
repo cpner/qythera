@@ -1,4 +1,3 @@
-
 'use client';
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -40,9 +39,9 @@ export default function Home() {
           <motion.div initial={{x:-280}} animate={{x:0}} exit={{x:-280}} className="sidebar w-[280px] h-full flex flex-col">
             <div className="p-4"><button className="btn w-full" onClick={() => setMsgs([])}>+ New Chat</button></div>
             <div className="flex-1 overflow-y-auto p-2 text-sm text-white/50">
-              <p className="px-3 py-2">Your conversations appear here</p>
+              {msgs.length > 0 && <div className="px-3 py-2 rounded-lg bg-white/5 mb-1">Current conversation</div>}
             </div>
-            <div className="p-4 border-t border-white/5 text-xs text-white/30">Qythera v0.1.0</div>
+            <div className="p-4 border-t border-white/5 text-xs text-white/30">Qythera v0.1.0 - Vaelon Model</div>
           </motion.div>
         )}
       </AnimatePresence>
@@ -89,7 +88,7 @@ export default function Home() {
               placeholder="Message Qythera..." rows={1} className="flex-1 bg-transparent text-white placeholder-white/30 outline-none resize-none text-sm py-1" />
             <button onClick={send} disabled={!input.trim()||loading} className="p-2 rounded-xl bg-gradient-to-br from-q-500 to-blue-500 text-white disabled:opacity-30 transition">➤</button>
           </div>
-          <p className="text-center text-xs text-white/15 mt-1.5">Qythera AI - Vaelon Model</p>
+          <p className="text-center text-xs text-white/15 mt-1.5">Qythera AI - Powered by Vaelon Model</p>
         </div>
       </div>
     </div>

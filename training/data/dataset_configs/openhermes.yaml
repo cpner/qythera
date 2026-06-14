@@ -1,7 +1,0 @@
-name: OpenHermes 2.5
-hf_id: teknium/OpenHermes-2.5
-split: train
-fields:
-  messages: messages
-max_length: 2048
-description: Multi-domain conversational dataset

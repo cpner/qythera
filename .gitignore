@@ -1,1 +1,1 @@
-__pycache__/\n*.pyc\n.venv/\nnode_modules/\n.next/\noutputs/\ndata/\nmodels/\n*.pt\n*.bin\n.env\n.DS_Store\n
+__pycache__/\n*.pyc\n.venv/\nnode_modules/\n.next/\noutputs/\ndata/\nmodels/\n*.pt\n*.npy\n.env\n.DS_Store\ncheckpoints/\n

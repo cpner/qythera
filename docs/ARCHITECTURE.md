@@ -1,43 +1,25 @@
-# Qythera Architecture
+# Vaelon Architecture
 
-## Overview
+## Model Design
+Vaelon is a decoder-only transformer with Mixture of Experts.
 
-Qythera is built on the **Vaelon** model architecture - a decoder-only transformer with Mixture of Experts (MoE).
+### Components
+1. **Token Embedding**: Maps token IDs to dense vectors
+2. **Decoder Layers** (x N):
+   - RMSNorm -> Multi-Head Attention (GQA + RoPE) -> Residual
+   - RMSNorm -> MoE FFN -> Residual
+3. **Final RMSNorm**
+4. **LM Head**: Projects to vocabulary
 
-## Model Architecture (Vaelon)
+### Mixture of Experts
+- Gate network routes tokens to top-k experts
+- Each expert is a SwiGLU FFN
+- Load balancing loss encourages均匀 routing
 
-```
-Input Tokens
-    |
-[Token Embeddings] + [RoPE Position Embeddings]
-    |
-[VaelonDecoderLayer] x N layers
-    |-- RMSNorm
-    |-- Grouped Query Attention (GQA) with FlashAttention
-    |-- Residual Connection
-    |-- RMSNorm
-    |-- Mixture of Experts (MoE) FFN
-    |-- Residual Connection
-    |
-[RMSNorm]
-    |
-[LM Head] -> Logits
-```
+### Grouped Query Attention
+- Shares KV heads across query groups
+- Reduces memory usage for long sequences
 
-### Key Components
-
-1. **Grouped Query Attention (GQA)**: Reduces KV-cache by sharing key-value heads across query groups
-2. **Rotary Position Embeddings (RoPE)**: Position encoding without learned parameters
-3. **Mixture of Experts (MoE)**: Routes tokens to top-k experts for efficient scaling
-4. **RMSNorm**: More stable normalization than LayerNorm
-5. **SwiGLU**: Gated activation function for FFN layers
-
-## System Components
-
-- **Training**: DeepSpeed ZeRO-3, LoRA/QLoRA, DPO/PPO
-- **Inference**: vLLM with AWQ/GPTQ quantization
-- **Memory**: FAISS vector store + episodic memory
-- **Agent**: ReAct reasoning loop with tool use
-- **Safety**: Toxicity, jailbreak, and PII filtering
-- **Web UI**: Next.js 14 with glassmorphism design
-- **CLI**: Click-based with Rich terminal UI
+### RoPE (Rotary Position Embeddings)
+- Encodes position information in query/key vectors
+- Supports arbitrary sequence lengths

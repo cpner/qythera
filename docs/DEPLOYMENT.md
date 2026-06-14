@@ -1,27 +1,15 @@
-# Deployment Guide
+# Deployment
 
-## Docker Compose (Recommended)
-
+## Docker
 ```bash
-docker compose -f infra/docker-compose.yml up -d
+docker build -t qythera -f inference/Dockerfile .
+docker run --gpus all -p 8000:8000 qythera
 ```
 
-## Kubernetes
+## Cloud
+- AWS: Use g5.xlarge instances
+- GCP: Use a2-highgpu-1g
+- Azure: Use NC6s_v3
 
-```bash
-kubectl apply -f infra/kubernetes/
-```
-
-## Cloud (Terraform)
-
-```bash
-cd infra/terraform
-terraform init
-terraform apply
-```
-
-## Environment Variables
-
-- `VAELEN_API_URL` - Inference server URL (default: http://localhost:8000)
-- `VAELEN_MODEL_PATH` - Path to model weights
-- `NEXT_PUBLIC_API_URL` - Frontend API URL
+## Mobile Access
+The web UI works on any device via browser. Heavy computation runs on GPU server.

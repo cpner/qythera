@@ -1,4 +1,3 @@
-
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -45,21 +44,23 @@ def cmd_web():
     webbrowser.open("http://localhost:3000")
     proc.wait()
 
+def cmd_train():
+    from training.trainer import Trainer
+    t = Trainer()
+    t.train("data/training.json")
+
 def cmd_info():
-    import torch
+    import numpy as np
     print(BANNER)
-    print(f"  PyTorch: {torch.__version__}")
-    print(f"  CUDA: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_mem/1e9:.1f}GB")
-    print(f"  Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+    print(f"  NumPy: {np.__version__}")
+    print(f"  Backend: Custom autodiff engine")
+    print(f"  Model: Vaelon (custom transformer)")
 
 def main():
     if len(sys.argv) < 2: cmd_chat(); return
-    cmds = {"chat": cmd_chat, "serve": cmd_serve, "web": cmd_web, "info": cmd_info}
+    cmds = {"chat": cmd_chat, "serve": cmd_serve, "web": cmd_web, "train": cmd_train, "info": cmd_info}
     cmd = sys.argv[1]
     if cmd in cmds: cmds[cmd]()
-    else: print(f"Unknown: {cmd}. Use: chat, serve, web, info")
+    else: print(f"Unknown: {cmd}. Use: chat, serve, web, train, info")
 
 if __name__ == "__main__": main()

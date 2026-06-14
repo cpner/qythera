@@ -1,2 +1,0 @@
-"""swift parser 1905"""
-def parse(code): return {"lang":"swift","id":1905}
