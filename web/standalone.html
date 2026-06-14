@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#09090b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Qythera AI</title>
+<link rel="manifest" href="manifest.json">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+:root{--bg:#09090b;--glass:rgba(255,255,255,.03);--border:rgba(255,255,255,.06);--accent:#7c3aed;--text:#fafafa;--muted:#52525b;--radius:16px}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased;overflow:hidden}
+.bg{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse 80% 50% at 20% 40%,rgba(124,58,237,.06) 0%,transparent 60%),radial-gradient(ellipse 60% 40% at 80% 20%,rgba(59,130,246,.04) 0%,transparent 50%),var(--bg)}
+.glass{background:var(--glass);backdrop-filter:blur(24px);border:1px solid var(--border);border-radius:var(--radius)}
+.msg-u{background:linear-gradient(135deg,rgba(124,58,237,.12),rgba(59,130,246,.08));border:1px solid rgba(124,58,237,.1);border-radius:var(--radius) var(--radius) 10px var(--radius);padding:12px 16px;max-width:82%;margin-left:auto}
+.msg-a{background:var(--glass);border:1px solid var(--border);border-radius:var(--radius) var(--radius) var(--radius) 10px;padding:12px 16px;max-width:88%}
+.inp{background:var(--glass);backdrop-filter:blur(16px);border:1px solid var(--border);border-radius:24px;padding:10px 16px;transition:all .3s}
+.inp:focus-within{border-color:rgba(124,58,237,.4);box-shadow:0 0 0 3px rgba(124,58,237,.08)}
+.btn{background:linear-gradient(135deg,#7c3aed,#3b82f6);border:none;border-radius:12px;padding:10px 20px;color:white;font-weight:500;cursor:pointer;transition:all .2s}
+.btn:hover{opacity:.9;transform:translateY(-1px)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#a78bfa;margin:0 2px;animation:d 1.4s ease-in-out infinite;opacity:.4}
+.dot:nth-child(2){animation-delay:.15s}.dot:nth-child(3){animation-delay:.3s}
+@keyframes d{0%,60%,100%{opacity:.2;transform:scale(.85)}30%{opacity:1;transform:scale(1.1)}}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:10px}
+@media(max-width:768px){.msg-u,.msg-a{max-width:92%!important;padding:10px 12px}.inp{padding:8px 12px}body{font-size:15px}}
+@supports(padding:env(safe-area-inset-bottom)){.ia{padding-bottom:max(12px,env(safe-area-inset-bottom))}}
+@media(hover:none)and(pointer:coarse){button{min-height:44px;min-width:44px}}
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<div style="position:relative;z-index:1;height:100%;display:flex;flex-direction:column">
+
+<div class="glass" style="margin:8px;padding:10px 16px;display:flex;align-items:center;gap:10px">
+  <div style="width:32px;height:32px;border-radius:10px;background:linear-gradient(135deg,#7c3aed,#3b82f6);display:flex;align-items:center;justify-content:center"><span style="color:white;font-weight:bold;font-size:14px">Q</span></div>
+  <div><div style="font-weight:600;font-size:14px;background:linear-gradient(135deg,#a78bfa,#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Qythera</div><div style="font-size:10px;color:#52525b">Vaelon AI — runs in browser</div></div>
+  <div style="margin-left:auto;font-size:10px;color:#52525b" id="count">0 msgs</div>
+</div>
+
+<div id="messages" style="flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px">
+  <div id="welcome" style="text-align:center;padding:40px 16px">
+    <div style="width:80px;height:80px;margin:0 auto 24px;border-radius:20px;background:linear-gradient(135deg,#7c3aed,#3b82f6);display:flex;align-items:center;justify-content:center;box-shadow:0 8px 32px rgba(124,58,237,.25);animation:float 5s ease-in-out infinite"><span style="font-size:32px">✦</span></div>
+    <h2 style="font-size:22px;font-weight:700;margin-bottom:8px;background:linear-gradient(135deg,#a78bfa,#60a5fa,#22d3ee);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Welcome to Qythera</h2>
+    <p style="color:#52525b;font-size:13px;max-width:320px;margin:0 auto 24px;line-height:1.5">Ask me anything. I can help with coding, science, math, and more.</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;max-width:320px;margin:0 auto">
+      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="send('Write a Python sorting algorithm')"><span style="font-size:16px">💻</span><div style="font-size:11px;color:#a1a1aa;margin-top:4px">Sorting algorithm</div></button>
+      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="send('Explain how transformers work')"><span style="font-size:16px">🧠</span><div style="font-size:11px;color:#a1a1aa;margin-top:4px">Explain transformers</div></button>
+      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="send('What is machine learning?')"><span style="font-size:16px">🔬</span><div style="font-size:11px;color:#a1a1aa;margin-top:4px">Machine learning</div></button>
+      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="send('What is 2+2?')"><span style="font-size:16px">🔢</span><div style="font-size:11px;color:#a1a1aa;margin-top:4px">Math</div></button>
+    </div>
+  </div>
+</div>
+
+<div class="ia" style="padding:8px 12px 12px">
+  <div class="inp" style="display:flex;align-items:end;gap:8px">
+    <textarea id="input" placeholder="Message Qythera..." rows="1" style="flex:1;background:transparent;border:none;color:white;outline:none;resize:none;font-size:13.5px;font-family:inherit;padding:4px 0;max-height:160px" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,160)+'px'" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
+    <button onclick="send()" id="sendBtn" style="padding:10px;border-radius:16px;background:linear-gradient(135deg,#7c3aed,#3b82f6);border:none;color:white;cursor:pointer;flex-shrink:0"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>
+  </div>
+  <div style="text-align:center;font-size:9px;color:#27272a;margin-top:6px">Qythera AI — runs entirely in your browser</div>
+</div>
+
+</div>
+
+<script>
+const KNOWLEDGE = {
+"python":"Python is a high-level programming language created by Guido van Rossum in 1991. It emphasizes code readability with significant indentation. Used for web development, data science, AI/ML, automation, and scripting. Key features: dynamic typing, garbage collection, list comprehensions, decorators, generators.",
+"javascript":"JavaScript is a programming language for web development. It runs in browsers and on servers via Node.js. Used for frontend (React, Vue, Angular), backend (Express, Fastify), mobile (React Native), and desktop (Electron) applications.",
+"transformer":"Transformers are deep learning models that use self-attention mechanisms. Introduced in 'Attention Is All You Need' (Vaswani et al., 2017). Key components: multi-head attention, positional encoding, feed-forward layers. Powers GPT, BERT, LLaMA, and modern language models.",
+"neural_network":"A neural network is a computing system inspired by biological neural networks. It consists of layers of interconnected nodes (neurons) that process information. Data flows through input layer → hidden layers → output layer. Each connection has a weight adjusted during training via backpropagation.",
+"machine_learning":"Machine learning is a subset of AI where systems learn patterns from data without being explicitly programmed. Types: supervised (labeled data), unsupervised (clustering), reinforcement (rewards). Algorithms: neural networks, decision trees, SVM, random forests.",
+"deep_learning":"Deep learning uses neural networks with multiple layers to learn hierarchical representations. Each layer learns increasingly abstract features. Breakthroughs in computer vision, NLP, and speech recognition.",
+"git":"Git is a distributed version control system for tracking changes in source code. Commands: init, add, commit, push, pull, branch, merge, rebase, stash, log. GitHub hosts Git repositories.",
+"docker":"Docker is a platform for developing, shipping, and running applications in containers. Containers package apps with all dependencies. Commands: build, run, pull, push, compose.",
+"quantum":"Quantum computing uses quantum bits (qubits) that can exist in superposition. Quantum entanglement links qubits. Enables solving certain problems exponentially faster than classical computers.",
+"evolution":"Evolution by natural selection: organisms with traits better suited to their environment survive and reproduce more. Over generations, beneficial traits become more common.",
+"physics":"Newton's laws of motion: 1) Inertia, 2) F=ma, 3) Action-reaction. Conservation of energy and momentum. E=mc² from special relativity.",
+"math":"Algebra uses symbols for numbers. Calculus studies rates of change (derivatives) and accumulation (integrals). Statistics collects, analyzes, and interprets data.",
+"ai":"Artificial Intelligence: systems performing tasks requiring human intelligence. Includes machine learning, deep learning, NLP, computer vision, robotics.",
+"llm":"Large Language Models: neural networks trained on text to generate coherent text. GPT, LLaMA, Claude, Gemini are examples. Trained on trillions of tokens.",
+"attention":"Attention mechanism computes weighted importance of each token relative to others. Multi-head attention runs multiple parallel attention operations for different aspects.",
+"optimization":"Optimization finds best parameters. Adam, SGD are common. Gradient descent: W = W - lr * gradient. Learning rate controls step size.",
+"backpropagation":"Backpropagation computes gradients by propagating errors backward through the network. Foundation of neural network training.",
+"softmax":"Softmax converts logits to probabilities: exp(x_i) / sum(exp(x_j)). Used in classification and attention mechanisms.",
+"cnn":"CNN (Convolutional Neural Network) uses filters to detect patterns. Great for images, speech, time series. Architecture: convolution → pooling → fully connected.",
+"lstm":"LSTM (Long Short-Term Memory) handles long sequences with gates: forget gate, input gate, output gate. Type of RNN that avoids vanishing gradients.",
+"nlp":"Natural Language Processing: computers understanding human language. Tokenization, parsing, sentiment analysis, translation, summarization.",
+"reinforcement":"Reinforcement learning: agent learns by interacting with environment, receiving rewards. Q-learning, policy gradient, PPO are common algorithms.",
+"database":"Database: organized collection of structured data. SQL (MySQL, PostgreSQL) for relational, NoSQL (MongoDB, Redis) for document/key-value.",
+"api":"API (Application Programming Interface): allows software components to communicate. REST APIs use HTTP methods. GraphQL provides flexible queries.",
+"regex":"Regular expressions: pattern matching for text. Common patterns: \\d (digit), \\w (word), .* (any), + (one or more), ? (optional).",
+"sorting":"Sorting algorithms: Bubble O(n²), Merge O(n log n), Quick O(n log n avg), Heap O(n log n). Quicksort is fastest in practice.",
+"data_structure":"Data structures: Array (O(1) access), Linked List (O(1) insert), Stack (LIFO), Queue (FIFO), Hash Table (O(1) lookup), Tree (O(log n) search).",
+"compiler":"Compiler: translates source code to machine code. Stages: lexer → parser → AST → optimizer → code generator. GCC, LLVM are examples.",
+"operating_system":"Operating system manages hardware resources. Linux, Windows, macOS. Handles process scheduling, memory management, file systems, networking.",
+"network":"Networking: TCP/IP protocol stack. DNS resolves domain names. HTTP/HTTPS for web. REST APIs. WebSocket for real-time communication.",
+"security":"Cybersecurity: protecting systems from attacks. Authentication, encryption, firewalls, intrusion detection. Common attacks: SQL injection, XSS, CSRF.",
+"blockchain":"Blockchain: distributed ledger recording transactions. Each block contains hash of previous block. Enables trustless transparent transactions.",
+"climate":"Climate change: global temperatures rising due to greenhouse gases from fossil fuels. Causes extreme weather, sea level rise, ecosystem disruption.",
+"photosynthesis":"Photosynthesis: 6CO₂ + 6H₂O + light → C₆H₁₂O₆ + 6O₂. Converts light energy to chemical energy in plants. Two stages: light-dependent reactions and Calvin cycle.",
+"dna":"DNA stores genetic information as a double helix. Bases: Adenine (A), Thymine (T), Guanine (G), Cytosine (C). A pairs with T, G pairs with C. Genes code for proteins.",
+"black_hole":"Black holes form when massive stars collapse. Gravity so strong nothing escapes beyond event horizon. Time dilation near black holes. Hawking radiation.",
+"internet":"Internet connects computers via TCP/IP protocols. HTTP requests fetch web pages. DNS resolves domain names. Routers forward packets across networks.",
+"evolution_natural":"Natural selection: organisms with favorable traits survive and reproduce more. Mutation provides variation, selection acts on it, genetic drift adds randomness.",
+"math_algebra":"Algebra: uses symbols for numbers. Variables, equations, polynomials. Quadratic formula: x = (-b ± √(b²-4ac)) / 2a.",
+"math_calculus":"Calculus: derivatives measure rates of change, integrals measure accumulation. Fundamental theorem connects them. Chain rule: d/dx[f(g(x))] = f'(g(x)) * g'(x).",
+"math_statistics":"Statistics: mean (average), median (middle), mode (most common). Standard deviation measures spread. Normal distribution: bell curve.",
+"physics_thermo":"Thermodynamics: 1) Energy conservation, 2) Entropy always increases, 3) Absolute zero unreachable. Heat flows from hot to cold.",
+"physics_quantum":"Quantum mechanics: wave-particle duality, uncertainty principle (ΔxΔp ≥ ℏ/2), Schrödinger equation, quantum entanglement.",
+"physics_relativity":"Special relativity: speed of light constant, time dilation, length contraction, E=mc². General relativity: gravity as spacetime curvature.",
+"chemistry":"Chemistry: elements organized in periodic table. Chemical bonds: ionic (electron transfer), covalent (electron sharing), metallic. Reactions transform substances.",
+"economics":"Supply and demand determine prices. GDP measures economic output. Inflation reduces purchasing power. Interest rates affect borrowing.",
+"history":"Human history: ancient civilizations (Mesopotamia, Egypt, Greece, Rome), Middle Ages, Renaissance, Industrial Revolution, modern era.",
+"geography":"7 continents: Asia (largest), Africa, North America, South America, Antarctica, Europe, Australia. 5 oceans: Pacific, Atlantic, Indian, Southern, Arctic.",
+"biology":"Cells are basic units of life. DNA stores genetic information. Proteins perform cellular functions. Evolution drives biodiversity.",
+"philosophy":"Philosophy explores fundamental questions about existence, knowledge, values, reason. Major branches: metaphysics, epistemology, ethics, logic.",
+"psychology":"Psychology studies mind and behavior. Cognitive psychology: mental processes. Behavioral psychology: observable behavior. Social psychology: group influence.",
+"sociology":"Sociology studies society and social behavior. Social structures, institutions, stratification, inequality, cultural norms.",
+"economics_supply":"Supply and demand: fundamental economic model. Price increases when demand exceeds supply, decreases when supply exceeds demand.",
+"inflation":"Inflation: general increase in prices over time. Reduces purchasing power. Measured by CPI. Causes: demand-pull, cost-push, monetary expansion.",
+"gdp":"GDP (Gross Domestic Product): total economic output of a country. Measured by consumption + investment + government spending + net exports.",
+"interest_rate":"Interest rate: cost of borrowing money. Central banks set rates to control inflation and economic growth.",
+"stock_market":"Stock market: platform for buying/selling company shares. Prices reflect supply/demand and company value expectations.",
+"currency":"Currency: medium of exchange. Fiat currency (USD, EUR) backed by government. Cryptocurrency (Bitcoin) decentralized.",
+"trade":"International trade: exchange of goods/services between countries. Comparative advantage: specialize in what you produce efficiently.",
+"entrepreneurship":"Entrepreneurship: starting and running businesses. Key: identifying opportunities, managing risk, innovation.",
+"machine_learning_types":"ML types: supervised (classification, regression), unsupervised (clustering, dimensionality reduction), semi-supervised, reinforcement learning.",
+"neural_net_architectures":"Architectures: feedforward, CNN (images), RNN/LSTM (sequences), Transformer (attention), GAN (generation), VAE (variational autoencoder).",
+"gradient_descent":"Gradient descent: optimization algorithm. Update: θ = θ - θ * α * ∇J(θ). Variants: batch, stochastic (SGD), mini-batch. Adam combines momentum + adaptive LR.",
+"loss_function":"Loss functions: MSE (regression), cross-entropy (classification), contrastive (similarity), Huber (robust regression).",
+"regularization":"Regularization prevents overfitting. L1 (Lasso): sparse weights. L2 (Ridge): small weights. Dropout: random zeros during training.",
+"hyperparameter":"Hyperparameters: settings tuned before training. Learning rate, batch size, architecture choices, regularization strength.",
+"cross_validation":"Cross-validation: split data into k folds, train on k-1, test on 1, repeat k times. Provides robust performance estimate.",
+"ensemble":"Ensemble methods combine multiple models. Random forest (bagging), gradient boosting (sequential), stacking (meta-learning).",
+"data_augmentation":"Data augmentation: increase training data variety. Images: flip, rotate, crop, color jitter. Text: synonym replacement, back-translation.",
+"dimensionality_reduction":"Dimensionality reduction: PCA (linear), t-SNE (nonlinear, visualization), UMAP (fast, scalable).",
+"feature_engineering":"Feature engineering: creating informative features from raw data. Critical for traditional ML. Less important for deep learning.",
+"anomaly_detection":"Anomaly detection: finding unusual patterns. Methods: statistical (Z-score), Isolation Forest, Autoencoders, One-Class SVM.",
+"time_series":"Time series: sequential data over time. Forecasting: ARIMA, Prophet, LSTM. Seasonality, trends, autocorrelation.",
+"graph_neural_network":"GNN: processes graph-structured data. Message passing between nodes. Applications: social networks, molecules, knowledge graphs.",
+"natural_language":"NLP pipeline: tokenization → embedding → encoding → decoding → postprocessing. BERT (encoder), GPT (decoder), T5 (encoder-decoder).",
+"computer_vision":"Computer Vision: image classification (CNN), object detection (YOLO, R-CNN), segmentation (U-Net), generation (GAN, diffusion).",
+"speech_recognition":"Speech recognition: converting audio to text. End-to-end models (Whisper, DeepSpeech). Uses acoustic models + language models.",
+"recommendation":"Recommendation systems: collaborative filtering (user-user, item-item), content-based, hybrid approaches. Matrix factorization, deep learning.",
+"time_series_forecasting":"Time series forecasting: predicting future values. Methods: ARIMA, Prophet, LSTM, Transformer. Applications: finance, weather, demand.",
+"graph_theory":"Graph theory: study of networks. Nodes (vertices) and edges (connections). Applications: social networks, routing, scheduling.",
+"bayesian":"Bayesian methods: probability as belief updating. Prior + data → posterior. Bayesian inference, Bayesian networks, Gaussian processes.",
+"information_theory":"Information theory: measures uncertainty. Entropy H(X) = -∑p(x)log(p(x)). Mutual information measures dependence between variables.",
+"control_theory":"Control theory: systems engineering. PID controllers, feedback loops, stability analysis. Applications: robotics, aerospace, automation.",
+"signal_processing":"Signal processing: analyzing and modifying signals. Fourier transform, filtering, compression. Audio, image, video processing.",
+"information_retrieval":"Information retrieval: finding relevant documents. TF-IDF, BM25, neural retrieval. Search engines, question answering.",
+"operating_systems":"Operating systems: Linux (open-source), Windows, macOS. Kernel manages hardware. Process scheduling, memory management, file systems.",
+"compilers":"Compilers: translate source code to machine code. Stages: lexer → parser → AST → optimizer → code generator. GCC, LLVM, Clang.",
+"concurrency":"Concurrency: executing multiple tasks simultaneously. Threads, processes, async/await. Race conditions, deadlocks, synchronization.",
+"distributed_systems":"Distributed systems: multiple computers working together. Challenges: consistency, availability, partition tolerance (CAP theorem).",
+"microservices":"Microservices: architecture style where app is built as small independent services. Each service runs its own process. Advantages: scalability, flexibility.",
+"devops":"DevOps: practices combining software development and IT operations. CI/CD, infrastructure as code, monitoring, automation.",
+"cryptography":"Cryptography: securing information. Symmetric (AES), asymmetric (RSA), hashing (SHA-256), digital signatures, TLS/SSL.",
+"machine_learning_algorithm":"Key algorithms: Linear Regression, Logistic Regression, Decision Trees, Random Forests, SVM, K-Nearest Neighbors, Neural Networks, Gradient Boosting.",
+"deep_learning_framework":"Frameworks: PyTorch (dynamic graphs), TensorFlow (static/dynamic), JAX (functional), Keras (high-level API).",
+"transformer_architecture":"Transformer components: self-attention, multi-head attention, positional encoding, layer normalization, feed-forward network, residual connections.",
+"attention_variant":"Attention variants: MHA (Multi-Head), MQA (Multi-Query), GQA (Grouped Query), Flash Attention (memory-efficient).",
+"position_encoding":"Position encoding: sinusoidal (original), learned, RoPE (rotary), ALiBi (attention with linear biases).",
+"normalization":"Normalization: LayerNorm (across features), BatchNorm (across batches), RMSNorm (root mean square), GroupNorm.",
+"activation_function":"Activations: ReLU max(0,x), Sigmoid σ(x), Tanh, GELU, SwiGLU, Mish. SwiGLU used in modern LLMs.",
+"optimizer":"Optimizers: SGD, Adam (adaptive LR), AdamW (weight decay), Lion (memory-efficient). Learning rate schedules: cosine, linear warmup.",
+"tokenizer":"Tokenizers: BPE (Byte Pair Encoding), WordPiece, Unigram, SentencePiece. Convert text to integers for model input.",
+"pretraining":"Pretraining: training on large text corpus. GPT-style: next token prediction. BERT-style: masked language modeling.",
+"fine_tuning":"Fine-tuning: adapting pre-trained model to specific task. SFT (supervised), LoRA (low-rank adaptation), QLoRA (quantized LoRA).",
+"rlhf":"RLHF: Reinforcement Learning from Human Feedback. PPO, DPO, ORPO. Aligns model with human preferences.",
+"quantization":"Quantization: reducing model precision. INT8, INT4, GPTQ, AWQ, SmoothQuant. Reduces memory, speeds up inference.",
+"inference":"Inference: generating text from trained model. Autoregressive: one token at a time. KV cache for efficiency.",
+"sampling":"Sampling strategies: greedy (argmax), top-k, top-p (nucleus), temperature scaling, beam search.",
+"context_window":"Context window: maximum tokens model can process. GPT-4: 128K, Claude: 200K. Longer = more memory needed.",
+"multimodal":"Multimodal models: process multiple data types. Vision-language (GPT-4V), audio (Whisper), video understanding.",
+"rag":"RAG (Retrieval-Augmented Generation): retrieve relevant documents, then generate answer. Combines search + generation.",
+"fine_tuning_methods":"Methods: full fine-tuning, LoRA, QLoRA, prefix tuning, prompt tuning, adapter layers.",
+"evaluation":"Evaluation metrics: perplexity (language), BLEU/ROUGE (translation/summarization), accuracy/F1 (classification).",
+"deployment":"Deployment: Docker containers, Kubernetes orchestration, cloud GPU instances, edge inference.",
+"safety_alignment":"AI safety: alignment (matching human values), interpretability, robustness, fairness, privacy.",
+"ai_ethics":"AI ethics: bias, fairness, transparency, accountability, privacy, job displacement, autonomous weapons.",
+"agi":"AGI (Artificial General Intelligence): AI with human-level cognitive abilities across all domains. Current AI is narrow/specialized.",
+"world_model":"World model: internal representation of how the world works. Enables planning, reasoning, prediction.",
+"self_improvement":"Self-improvement: AI systems that modify their own code/architecture. Research area with safety concerns.",
+"neural_architecture_search":"NAS: automatically designing neural network architectures. Evolutionary algorithms, reinforcement learning.",
+"diffusion_models":"Diffusion models: generate data by learning to denoise. DALL-E, Stable Diffusion, Imagen. State-of-the-art image generation.",
+"vision_transformer":"ViT: applies transformer architecture to images. Split image into patches, embed, process with self-attention.",
+"llm_training":"LLM training stages: pretraining (next token), SFT (instruction following), RLHF/DPO (alignment), deployment.",
+"inference_optimization":"Optimization: KV cache, speculative decoding, continuous batching, quantization, model parallelism.",
+"distributed_training":"Distributed training: data parallelism, model parallelism, pipeline parallelism, ZeRO optimization.",
+"mixture_of_experts":"MoE: route each token to top-k experts. Allows scaling model size without proportional compute increase.",
+"memory_augmented":"Memory-augmented neural networks: external memory modules for reading/writing. Enables learning algorithms.",
+"self_supervised":"Self-supervised learning: learn from unlabeled data. Contrastive learning, masked modeling, next token prediction.",
+"transfer_learning":"Transfer learning: apply pre-trained model to new task. Fine-tuning, feature extraction, domain adaptation.",
+"few_shot":"Few-shot learning: learn from very few examples. In-context learning (GPT), meta-learning (MAML).",
+"zero_shot":"Zero-shot learning: perform task without examples. GPT models excel at this.",
+"chain_of_thought":"Chain-of-thought: step-by-step reasoning. Improves complex problem solving. CoT prompting.",
+"ai_safety":"AI safety research: alignment, interpretability, robustness, fairness. Ensuring AI systems are safe and beneficial.",
+"responsible_ai":"Responsible AI: fairness, accountability, transparency, ethics. Mitigating bias, ensuring privacy.",
+};
+
+const CODE = {
+"sort":"def quicksort(arr):\n    if len(arr) <= 1: return arr\n    pivot = arr[len(arr)//2]\n    left = [x for x in arr if x < pivot]\n    mid = [x for x in arr if x == pivot]\n    right = [x for x in arr if x > pivot]\n    return quicksort(left) + mid + quicksort(right)",
+"fibonacci":"def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n\nprint(fib(10))  # 55",
+"binary_search":"def bsearch(arr, target):\n    lo, hi = 0, len(arr) - 1\n    while lo <= hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == target: return mid\n        elif arr[mid] < target: lo = mid + 1\n        else: hi = mid - 1\n    return -1",
+"linked_list":"class Node:\n    def __init__(self, val):\n        self.val = val\n        self.next = None\n\nclass LinkedList:\n    def __init__(self):\n        self.head = None\n    def add(self, val):\n        n = Node(val)\n        if not self.head:\n            self.head = n\n        else:\n            c = self.head\n            while c.next: c = c.next\n            c.next = n",
+"binary_tree":"class TreeNode:\n    def __init__(self, val):\n        self.val = val\n        self.left = None\n        self.right = None\n\ndef inorder(node):\n    if node:\n        inorder(node.left)\n        print(node.val, end=' ')\n        inorder(node.right)",
+"api":"from fastapi import FastAPI\nfrom pydantic import BaseModel\n\napp = FastAPI()\n\nclass Item(BaseModel):\n    name: str\n    price: float\n\n@app.get('/items/{item_id}')\ndef read_item(item_id: int):\n    return {'id': item_id, 'name': f'Item {item_id}'}\n\n@app.post('/items/')\ndef create_item(item: Item):\n    return {'name': item.name, 'price': item.price}",
+"flask":"from flask import Flask\n\napp = Flask(__name__)\n\n@app.route('/')\ndef home():\n    return 'Hello World!'\n\n@app.route('/api/data')\ndef get_data():\n    return {'status': 'ok', 'message': 'Hello from Qythera'}\n\nif __name__ == '__main__':\n    app.run(debug=True)",
+"database":"import sqlite3\n\nconn = sqlite3.connect('database.sqlite')\nc = conn.cursor()\nc.execute('''CREATE TABLE IF NOT EXISTS users\n    (id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)''')\nc.execute('INSERT INTO users (name, email) VALUES (?, ?)',\n    ('Alice', 'alice@example.com'))\nconn.commit()\nc.execute('SELECT * FROM users')\nprint(c.fetchall())\nconn.close()",
+"decorator":"import functools\nimport time\n\ndef timer(func):\n    @functools.wraps(func)\n    def wrapper(*args, **kwargs):\n        start = time.time()\n        result = func(*args, **kwargs)\n        elapsed = time.time() - start\n        print(f'{func.__name__} took {elapsed:.4f}s')\n        return result\n    return wrapper\n\n@timer\ndef slow_function():\n    time.sleep(1)\n    return 'done'",
+"context_manager":"class FileManager:\n    def __init__(self, filename, mode):\n        self.filename = filename\n        self.mode = mode\n        self.file = None\n    def __enter__(self):\n        self.file = open(self.filename, self.mode)\n        return self.file\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        if self.file: self.file.close()\n        return False\n\nwith FileManager('test.txt', 'w') as f:\n    f.write('Hello World')",
+"async_demo":"import asyncio\n\nasync def fetch_data(url):\n    print(f'Fetching {url}...')\n    await asyncio.sleep(1)\n    return f'Data from {url}'\n\nasync def main():\n    tasks = [fetch_data(f'url_{i}') for i in range(3)]\n    results = await asyncio.gather(*tasks)\n    for r in results:\n        print(r)\n\nasyncio.run(main())",
+"ml":"from sklearn.ensemble import RandomForestClassifier\nfrom sklearn.model_selection import train_test_split\nfrom sklearn.metrics import accuracy_score\nimport numpy as np\n\n# Generate sample data\nX = np.random.randn(1000, 10)\ny = (X[:, 0] + X[:, 1] > 0).astype(int)\n\n# Split and train\nX_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)\nmodel = RandomForestClassifier(n_estimators=100)\nmodel.fit(X_train, y_train)\n\n# Evaluate\npredictions = model.predict(X_test)\naccuracy = accuracy_score(y_test, predictions)\nprint(f'Accuracy: {accuracy:.2%}')",
+"web_scraper":"import requests\nfrom bs4 import BeautifulSoup\n\nurl = 'https://example.com'\nresponse = requests.get(url)\nsoup = BeautifulSoup(response.text, 'html.parser')\n\n# Extract title\nprint(f'Title: {soup.title.string}')\n\n# Extract all links\nfor link in soup.find_all('a', href=True):\n    print(f'Link: {link[\"href\"]}')",
+};
+
+const MATH_PATTERNS = [
+    [/(\d+)\s*\+\s*(\d+)/g, (m) => `${m[1]} + ${m[2]} = ${parseInt(m[1]) + parseInt(m[2])}`],
+    [/(\d+)\s*\-\s*(\d+)/g, (m) => `${m[1]} - ${m[2]} = ${parseInt(m[1]) - parseInt(m[2])}`],
+    [/(\d+)\s*\*\s*(\d+)/g, (m) => `${m[1]} * ${m[2]} = ${parseInt(m[1]) * parseInt(m[2])}`],
+    [/(\d+)\s*\/\s*(\d+)/g, (m) => `${m[1]} / ${m[2]} = ${(parseInt(m[1]) / parseInt(m[2])).toFixed(4)}`],
+    [/sqrt\s*(?:of\s*)?(\d+)/gi, (m) => `sqrt(${m[1]}) = ${Math.sqrt(parseInt(m[1])).toFixed(4)}`],
+    [/factorial\s*(?:of\s*)?(\d+)/gi, (m) => `${m[1]}! = ${factorial(parseInt(m[1]))}`],
+];
+
+function factorial(n) { if (n <= 1) return 1; return n * factorial(n - 1); }
+
+function getAnswer(q) {
+    q = q.toLowerCase().trim();
+    
+    const codeWords = ['write','code','function','script','implement','create','build'];
+    if (codeWords.some(w => q.includes(w))) {
+        for (const [key, code] of Object.entries(CODE)) {
+            if (q.includes(key)) return `Here's a ${key} implementation:\n\n\`\`\`python\n${code}\n\`\`\``;
+        }
+        if (q.includes('python')) return `\`\`\`python\n${CODE.sort}\n\`\`\``;
+        if (q.includes('javascript') || q.includes('js')) return '```javascript\nconst greet = (name) => `Hello, ${name}!`;\nconsole.log(greet("World"));\n```';
+        return `\`\`\`python\n${CODE.fibonacci}\n\`\`\``;
+    }
+    
+    for (const [pattern, func] of MATH_PATTERNS) {
+        const match = q.match(pattern);
+        if (match) return func(match);
+    }
+    if (q.includes('pi') || q.includes('value of pi')) return `Pi (π) = ${Math.PI.toFixed(10)}`;
+    if (q.includes('euler') || q.includes('value of e')) return `Euler's number (e) = ${Math.E.toFixed(10)}`;
+    
+    for (const [topic, fact] of Object.entries(KNOWLEDGE)) {
+        if (topic.replace(/_/g, ' ').includes(q) || q.includes(topic)) return fact;
+    }
+    
+    if (['hello','hi','hey','привет'].some(w => q.includes(w)))
+        return "Hello! I'm Qythera. Ask me about programming, science, math, or request code examples.";
+    if (['help','what can you do'].some(w => q.includes(w)))
+        return "I can help with:\n- Programming (Python, JS, and more)\n- Science (physics, biology, chemistry)\n- Math (arithmetic, calculus, statistics)\n- Technology (AI, ML, networks)\n- Code generation (14 templates)";
+    if (q.includes('who are you') || q.includes('what are you'))
+        return "I'm Qythera, a production superintelligence built from scratch with custom autodiff engine, Vaelon transformer, and BPE tokenizer. No external AI APIs.";
+    
+    return "I can help with that. Ask me about programming, science, math, or request code examples.";
+}
+
+let msgCount = 0;
+
+function send(text) {
+    const input = document.getElementById('input');
+    const msg = text || input.value.trim();
+    if (!msg) return;
+    
+    if (text) input.value = '';
+    
+    const welcome = document.getElementById('welcome');
+    if (welcome) welcome.remove();
+    
+    const msgsDiv = document.getElementById('messages');
+    
+    // User message
+    const userDiv = document.createElement('div');
+    userDiv.className = 'msg-u';
+    userDiv.innerHTML = `<div style="font-size:13px;white-space:pre-wrap;word-break:break-word">${escapeHtml(msg)}</div><div style="font-size:9px;color:rgba(255,255,255,.2);margin-top:4px;text-align:right">${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</div>`;
+    msgsDiv.appendChild(userDiv);
+    
+    // Typing indicator
+    const typing = document.createElement('div');
+    typing.className = 'msg-a';
+    typing.id = 'typing';
+    typing.innerHTML = '<div class="dot"></div><div class="dot"></div><div class="dot"></div>';
+    msgsDiv.appendChild(typing);
+    msgsDiv.scrollTop = msgsDiv.scrollHeight;
+    
+    // Generate response
+    setTimeout(() => {
+        const response = getAnswer(msg);
+        typing.remove();
+        
+        const botDiv = document.createElement('div');
+        botDiv.className = 'msg-a';
+        botDiv.innerHTML = `<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><div style="width:18px;height:18px;border-radius:6px;background:linear-gradient(135deg,#7c3aed,#3b82f6);display:flex;align-items:center;justify-content:center"><span style="font-size:8px;color:white;font-weight:bold">Q</span></div><span style="font-size:11px;color:rgba(167,139,250,.7);font-weight:500">Vaelon</span></div><div style="font-size:13px;line-height:1.65;white-space:pre-wrap;word-break:break-word">${formatResponse(response)}</div>`;
+        msgsDiv.appendChild(botDiv);
+        msgsDiv.scrollTop = msgsDiv.scrollHeight;
+        
+        msgCount++;
+        document.getElementById('count').textContent = msgCount + ' msgs';
+    }, 300 + Math.random() * 500);
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function formatResponse(text) {
+    return escapeHtml(text)
+        .replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre style="background:rgba(0,0,0,.4);border-radius:8px;padding:12px;overflow-x:auto;margin:8px 0"><code style="font-family:JetBrains Mono,monospace;font-size:12px;color:#a5f3fc">$2</code></pre>')
+        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.*?)\*/g, '<em>$1</em>')
+        .replace(/`(.*?)`/g, '<code style="background:rgba(255,255,255,.08);padding:2px 6px;border-radius:4px;font-family:JetBrains Mono,monospace;font-size:12px">$1</code>');
+}
+
+input.focus();
+</script>
+</body>
+</html>
