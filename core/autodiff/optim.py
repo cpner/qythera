@@ -1,5 +1,4 @@
 import numpy as np
-from typing import List
 from core.autodiff.tensor import Tensor
 
 
@@ -18,9 +17,29 @@ class Optimizer:
     @staticmethod
     def _to_numpy(x):
         if isinstance(x, Tensor):
-            return x.data
+            data = x.data
+            if isinstance(data, np.ndarray) and data.dtype == object:
+                # Extract numeric values from object arrays
+                result = np.zeros_like(data, dtype=np.float32)
+                for idx in np.ndindex(data.shape):
+                    val = data[idx]
+                    if isinstance(val, Tensor):
+                        result[idx] = float(val.data.flat[0]) if val.data.size > 0 else 0.0
+                    elif isinstance(val, (int, float)):
+                        result[idx] = float(val)
+                return result
+            return data.astype(np.float32).copy() if isinstance(data, np.ndarray) else np.array(data, dtype=np.float32)
         if isinstance(x, np.ndarray):
-            return x
+            if x.dtype == object:
+                result = np.zeros_like(x, dtype=np.float32)
+                for idx in np.ndindex(x.shape):
+                    val = x[idx]
+                    if isinstance(val, Tensor):
+                        result[idx] = float(val.data.flat[0]) if val.data.size > 0 else 0.0
+                    elif isinstance(val, (int, float)):
+                        result[idx] = float(val)
+                return result
+            return x.astype(np.float32).copy()
         return np.array(x, dtype=np.float32)
 
 
@@ -35,13 +54,13 @@ class SGD(Optimizer):
         for i, p in enumerate(self.params):
             if p.grad is None:
                 continue
-            g = self._to_numpy(p.grad).copy()
+            g = self._to_numpy(p.grad)
             if self.weight_decay > 0:
-                g = g + self.weight_decay * p.data
+                g = g + self.weight_decay * self._to_numpy(p.data)
             if self.momentum > 0:
                 self.velocities[i] = self.momentum * self.velocities[i] + g
                 g = self.velocities[i]
-            p.data = p.data - self.lr * g
+            p.data = self._to_numpy(p.data) - self.lr * g
 
 
 class Adam(Optimizer):
@@ -59,14 +78,17 @@ class Adam(Optimizer):
         for i, p in enumerate(self.params):
             if p.grad is None:
                 continue
-            g = self._to_numpy(p.grad).copy()
+            g = self._to_numpy(p.grad)
             if self.weight_decay > 0:
-                g = g + self.weight_decay * p.data
+                g = g + self.weight_decay * self._to_numpy(p.data)
+
             self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * g
-            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * g ** 2
-            m_hat = self.m[i] / (1 - self.beta1 ** self.t)
-            v_hat = self.v[i] / (1 - self.beta2 ** self.t)
-            p.data = p.data - self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (g * g)
+
+            m_hat = self.m[i] / (1.0 - self.beta1 ** self.t)
+            v_hat = self.v[i] / (1.0 - self.beta2 ** self.t)
+
+            p.data = self._to_numpy(p.data) - self.lr * m_hat / (np.sqrt(v_hat + self.eps))
 
 
 class AdamW(Adam):
@@ -75,11 +97,15 @@ class AdamW(Adam):
         for i, p in enumerate(self.params):
             if p.grad is None:
                 continue
-            g = self._to_numpy(p.grad).copy()
+            g = self._to_numpy(p.grad)
+
             self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * g
-            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * g ** 2
-            m_hat = self.m[i] / (1 - self.beta1 ** self.t)
-            v_hat = self.v[i] / (1 - self.beta2 ** self.t)
-            p.data = p.data - self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (g * g)
+
+            m_hat = self.m[i] / (1.0 - self.beta1 ** self.t)
+            v_hat = self.v[i] / (1.0 - self.beta2 ** self.t)
+
+            p.data = self._to_numpy(p.data) - self.lr * m_hat / (np.sqrt(v_hat + self.eps))
+
             if self.weight_decay > 0:
-                p.data = p.data - self.lr * self.weight_decay * p.data
+                p.data = self._to_numpy(p.data) - self.lr * self.weight_decay * self._to_numpy(p.data)
