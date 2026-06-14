@@ -1,0 +1,22 @@
+model:
+  name: vaelon-translation
+  base: vaelon-7b
+task: translation
+training:
+  output_dir: ./outputs/translation
+  num_epochs: 3
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  learning_rate: 2e-4
+  warmup_ratio: 0.03
+  lr_scheduler: cosine
+  max_seq_len: 2048
+  bf16: true
+  lora:
+    r: 64
+    alpha: 128
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+data:
+  format: chatml
+  max_length: 2048
+  min_length: 10

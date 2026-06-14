@@ -1,0 +1,1 @@
+"""Qythera Discord Integration"""

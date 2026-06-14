@@ -1,0 +1,20 @@
+preset: enterprise
+description: "Qythera Enterprise configuration"
+model:
+  name: vaelon-7b
+  quantization: none
+  max_tokens: 4096
+inference:
+  backend: gpu
+  batch_size: 8
+  timeout: 120
+memory:
+  enabled: true
+  vector_store: qdrant
+safety:
+  toxicity: true
+  jailbreak: true
+  pii: true
+logging:
+  level: INFO
+  wandb: true

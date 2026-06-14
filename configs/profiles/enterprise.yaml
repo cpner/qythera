@@ -1,0 +1,19 @@
+profile: enterprise
+description: "Enterprise-grade configuration with maximum safety"
+capabilities:
+  - general_assistant
+  - data_analysis
+  - reporting
+  - compliance
+system_prompt: |
+  You are a professional enterprise assistant. Follow company policies,
+  maintain data privacy, and provide accurate, compliant responses.
+  Never expose sensitive information or bypass safety measures.
+safety:
+  toxicity: true
+  jailbreak: true
+  pii: true
+  content_filter: strict
+audit:
+  enabled: true
+  log_all_interactions: true
