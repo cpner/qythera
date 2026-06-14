@@ -42,10 +42,13 @@ class MultiHeadAttention:
         q = self._apply_rope(q, self.freqs)
         k = self._apply_rope(k, self.freqs)
         
+        # KV cache BEFORE repeat_interleave
         if kv_cache is not None:
             k = np.concatenate([kv_cache[0], k], axis=2)
             v = np.concatenate([kv_cache[1], v], axis=2)
+        new_cache = (k.copy(), v.copy())
         
+        # Repeat for GQA
         if self.num_queries_per_kv > 1:
             k = np.repeat(k, self.num_queries_per_kv, axis=1)
             v = np.repeat(v, self.num_queries_per_kv, axis=1)
@@ -54,13 +57,8 @@ class MultiHeadAttention:
         attn = (q @ k.transpose(0, 1, 3, 2)) / scale
         total_len = k.shape[2]
         mask = np.triu(np.full((L, total_len), -1e9), k=total_len - L + 1)
-        attn = F.softmax(attn + mask, axis=-1) if 'F' in dir() else np.exp(attn + mask - (attn + mask).max(axis=-1, keepdims=True))
+        attn = np.exp(attn + mask - (attn + mask).max(axis=-1, keepdims=True))
         attn = attn / (attn.sum(axis=-1, keepdims=True) + 1e-8)
         
         out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, L, -1) @ self.wo
-        return out, (k, v)
-
-
-class GQAAttention(MultiHeadAttention):
-    """Grouped Query Attention - shares KV heads across query groups."""
-    pass
+        return out, new_cache

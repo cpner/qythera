@@ -1,4 +1,4 @@
-from core.layers.attention import MultiHeadAttention, GQAAttention
+from core.layers.attention import MultiHeadAttention
 from core.layers.norm import RMSNorm
 from core.layers.ffn import SwiGLU, GeGLU
 from core.layers.embedding import TokenEmbedding, PositionalEncoding
