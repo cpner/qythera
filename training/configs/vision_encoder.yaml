@@ -1,0 +1,11 @@
+model:
+  type: vision_encoder
+  arch: siglip
+  pretrained: google/siglip-so400m-patch14-384
+  projection_dim: 4096
+training:
+  output_dir: ./outputs/vision-encoder
+  num_epochs: 10
+  batch_size: 32
+  learning_rate: 1e-4
+  image_size: 384

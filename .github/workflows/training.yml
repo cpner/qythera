@@ -1,0 +1,25 @@
+name: Training
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "Training config"
+        required: true
+        default: "training/configs/7b_lora.yaml"
+      gpus:
+        description: "Number of GPUs"
+        required: true
+        default: "1"
+
+jobs:
+  train:
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Train model
+        run: |
+          torchrun --nproc_per_node=${{ inputs.gpus }} \
+            training/pretrain/train_pretrain.py \
+            --config ${{ inputs.config }}

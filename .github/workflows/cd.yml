@@ -1,0 +1,19 @@
+name: CD
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t qythera:${{ github.ref_name }} -f inference/Dockerfile.vllm .
+
+      - name: Push to registry
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          docker push qythera:${{ github.ref_name }}
