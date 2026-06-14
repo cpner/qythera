@@ -2,7 +2,7 @@
 import torch, os, json, time
 from torch.utils.data import Dataset, DataLoader
 from core.config import TrainingConfig, Config
-from core.model import QytheraModel
+from core.model import VaelonModel
 from core.tokenizer import Tokenizer
 
 class ChatDataset(Dataset):
@@ -30,7 +30,7 @@ class Trainer:
     def __init__(self, config: TrainingConfig = None):
         self.config = config or TrainingConfig()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = QytheraModel(self.config.model)
+        self.model = VaelonModel(self.config.model)
         self.model.to(self.device)
         self.tokenizer = Tokenizer()
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)

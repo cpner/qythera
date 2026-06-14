@@ -1,3 +1,3 @@
-from core.model import QytheraModel
+from core.model import VaelonModel, VaelonConfig
 from core.config import Config
-__all__=["QytheraModel","Config"]
+__all__=["VaelonModel","VaelonConfig","Config"]

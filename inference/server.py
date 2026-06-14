@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from core.config import Config, InferenceConfig
-from core.model import QytheraModel
+from core.model import VaelonModel
 from core.tokenizer import Tokenizer
 from core.safety import SafetyModerator
 
@@ -13,7 +13,7 @@ class QytheraServer:
     def __init__(self, config=None):
         self.config = config or Config()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = QytheraModel(self.config.model)
+        self.model = VaelonModel(self.config.model)
         self.model.to(self.device).eval()
         self.tokenizer = Tokenizer()
         self.safety = SafetyModerator()
