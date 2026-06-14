@@ -43,6 +43,12 @@ class TransformerConfig:
     sandwich_norm: bool = False
     logit_softcap: float = 0.0
     sliding_window: Optional[int] = None
+    use_flash: bool = True
+    flash_block_size: int = 64
+    use_mla: bool = False
+    mla_latent_dim: int = 64
+    moe_routing: str = "topk"
+    switch_capacity_factor: float = 1.25
 
     def __post_init__(self):
         if self.rope_dim is None:
@@ -110,6 +116,276 @@ class KVCache:
         return self.cur_len[layer]
 
 
+class PagedKVCache:
+    def __init__(self, max_seq_len: int, num_layers: int, num_kv_heads: int,
+                 head_dim: int, page_size: int = 16):
+        self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.page_size = page_size
+        self.num_pages = max_seq_len // page_size
+        self.k_pages = [np.zeros((self.num_pages, page_size, num_kv_heads, head_dim), dtype=np.float32)
+                        for _ in range(num_layers)]
+        self.v_pages = [np.zeros((self.num_pages, page_size, num_kv_heads, head_dim), dtype=np.float32)
+                        for _ in range(num_layers)]
+        self.free_list = [list(range(self.num_pages)) for _ in range(num_layers)]
+        self.page_tables = [{} for _ in range(num_layers)]
+        self.cur_len = [0] * num_layers
+        self.attention_scores = [np.zeros(self.num_pages * page_size, dtype=np.float32)
+                                 for _ in range(num_layers)]
+
+    def _allocate_page(self, layer: int) -> int:
+        if not self.free_list[layer]:
+            return -1
+        return self.free_list[layer].pop(0)
+
+    def _free_page(self, layer: int, page_idx: int):
+        self.free_list[layer].append(page_idx)
+        self.page_tables[layer].pop(page_idx, None)
+
+    def update(self, layer: int, new_k: np.ndarray, new_v: np.ndarray, position: int):
+        n = new_k.shape[2]
+        for i in range(n):
+            pos = position + i
+            page_idx = pos // self.page_size
+            offset = pos % self.page_size
+            if page_idx not in self.page_tables[layer]:
+                alloc = self._allocate_page(layer)
+                if alloc == -1:
+                    continue
+                self.page_tables[layer][page_idx] = alloc
+            physical = self.page_tables[layer][page_idx]
+            self.k_pages[layer][physical, offset] = new_k[0, :, i, :]
+            self.v_pages[layer][physical, offset] = new_v[0, :, i, :]
+        self.cur_len[layer] = position + n
+        return self._gather(layer)
+
+    def _gather(self, layer: int) -> Tuple[np.ndarray, np.ndarray]:
+        length = self.cur_len[layer]
+        if length == 0:
+            return (np.zeros((1, self.num_kv_heads, 0, self.head_dim), dtype=np.float32),
+                    np.zeros((1, self.num_kv_heads, 0, self.head_dim), dtype=np.float32))
+        k_out = np.zeros((1, self.num_kv_heads, length, self.head_dim), dtype=np.float32)
+        v_out = np.zeros((1, self.num_kv_heads, length, self.head_dim), dtype=np.float32)
+        for pos in range(length):
+            p = pos // self.page_size
+            o = pos % self.page_size
+            if p in self.page_tables[layer]:
+                phys = self.page_tables[layer][p]
+                k_out[0, :, pos, :] = self.k_pages[layer][phys, o]
+                v_out[0, :, pos, :] = self.v_pages[layer][phys, o]
+        return k_out, v_out
+
+    def get(self, layer: int):
+        return self._gather(layer)
+
+    def reset(self):
+        self.cur_len = [0] * self.num_layers
+        for l in range(self.num_layers):
+            self.free_list[l] = list(range(self.num_pages))
+            self.page_tables[l].clear()
+
+    def get_seq_len(self, layer: int = 0):
+        return self.cur_len[layer]
+
+    def evict_page(self, layer: int) -> bool:
+        if not self.page_tables[layer]:
+            return False
+        target_page = max(self.page_tables[layer].keys())
+        physical = self.page_tables[layer][target_page]
+        self._free_page(layer, physical)
+        return True
+
+
+class H2OKVCache:
+    def __init__(self, max_seq_len: int, num_layers: int, num_kv_heads: int,
+                 head_dim: int, sink_size: int = 4, reserve_size: int = 4):
+        self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.sink_size = sink_size
+        self.reserve_size = reserve_size
+        self.k_cache = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
+                        for _ in range(num_layers)]
+        self.v_cache = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
+                        for _ in range(num_layers)]
+        self.cur_len = [0] * num_layers
+        self.attention_accum = [np.zeros(max_seq_len, dtype=np.float32) for _ in range(num_layers)]
+        self.window_len = max_seq_len - sink_size - reserve_size
+
+    def update(self, layer: int, new_k: np.ndarray, new_v: np.ndarray,
+               position: int, attn_scores: Optional[np.ndarray] = None):
+        n = new_k.shape[2]
+        end = position + n
+
+        if end <= self.max_seq_len:
+            self.k_cache[layer][:, :, position:end] = new_k
+            self.v_cache[layer][:, :, position:end] = new_v
+            if attn_scores is not None:
+                self.attention_accum[layer][position:end] += attn_scores.flatten()[:n]
+        else:
+            self._evict_h2o(layer)
+
+        if end <= self.max_seq_len:
+            self.k_cache[layer][:, :, position:end] = new_k
+            self.v_cache[layer][:, :, position:end] = new_v
+            if attn_scores is not None:
+                self.attention_accum[layer][position:end] += attn_scores.flatten()[:n]
+
+        self.cur_len[layer] = min(end, self.max_seq_len)
+        return self._gather(layer)
+
+    def _evict_h2o(self, layer: int):
+        k = self.sink_size
+        total = self.cur_len[layer]
+        window = self.attention_accum[layer][k:total]
+
+        if len(window) == 0:
+            return
+
+        keep_count = min(self.reserve_size, len(window))
+        top_indices = np.argpartition(window, -keep_count)[-keep_count:]
+        top_indices = np.sort(top_indices) + k
+
+        sink_k = self.k_cache[layer][:, :, :k].copy()
+        sink_v = self.v_cache[layer][:, :, :k].copy()
+        top_k = self.k_cache[layer][:, :, top_indices].copy()
+        top_v = self.v_cache[layer][:, :, top_indices].copy()
+
+        self.k_cache[layer] *= 0
+        self.v_cache[layer] *= 0
+
+        new_len = k + keep_count
+        self.k_cache[layer][:, :, :k] = sink_k
+        self.v_cache[layer][:, :, :k] = sink_v
+        self.k_cache[layer][:, :, k:k + keep_count] = top_k
+        self.v_cache[layer][:, :, k:k + keep_count] = top_v
+
+        self.attention_accum[layer][:k] = 0
+        self.attention_accum[layer][k:k + keep_count] = self.attention_accum[layer][top_indices]
+        self.attention_accum[layer][k + keep_count:] = 0
+        self.cur_len[layer] = new_len
+
+    def _gather(self, layer: int):
+        c = self.cur_len[layer]
+        return (self.k_cache[layer][:, :, :c].copy(),
+                self.v_cache[layer][:, :, :c].copy())
+
+    def get(self, layer: int):
+        return self._gather(layer)
+
+    def reset(self):
+        self.cur_len = [0] * self.num_layers
+        for l in range(self.num_layers):
+            self.attention_accum[l][:] = 0
+
+    def get_seq_len(self, layer: int = 0):
+        return self.cur_len[layer]
+
+
+class AttentionSinkKVCache:
+    def __init__(self, max_seq_len: int, num_layers: int, num_kv_heads: int,
+                 head_dim: int, sink_size: int = 4, sliding_window: Optional[int] = None):
+        self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.sink_size = sink_size
+        self.sliding_window = sliding_window
+        self.k_cache = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
+                        for _ in range(num_layers)]
+        self.v_cache = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.float32)
+                        for _ in range(num_layers)]
+        self.cur_len = [0] * num_layers
+        self.k_sink = [np.zeros((1, num_kv_heads, sink_size, head_dim), dtype=np.float32)
+                       for _ in range(num_layers)]
+        self.v_sink = [np.zeros((1, num_kv_heads, sink_size, head_dim), dtype=np.float32)
+                       for _ in range(num_layers)]
+
+    def update(self, layer: int, new_k: np.ndarray, new_v: np.ndarray, position: int):
+        n = new_k.shape[2]
+        total = position + n
+
+        if self.sliding_window is not None:
+            window_start = max(self.sink_size, total - self.sliding_window)
+            slot = window_start + (total - window_start) % self.sliding_window
+        else:
+            slot = position
+
+        sink_end = min(n, self.sink_size)
+        if sink_end > 0:
+            self.k_sink[layer][:, :, :sink_end] = new_k[:, :, :sink_end]
+            self.v_sink[layer][:, :, :sink_end] = new_v[:, :, :sink_end]
+
+        remaining = n - sink_end
+        if remaining > 0:
+            start = max(self.sink_size, slot)
+            self.k_cache[layer][:, :, start:start + remaining] = new_k[:, :, sink_end:]
+            self.v_cache[layer][:, :, start:start + remaining] = new_v[:, :, sink_end:]
+
+        self.cur_len[layer] = total
+        return self._gather(layer)
+
+    def _gather(self, layer: int):
+        length = self.cur_len[layer]
+        k = self.k_sink[layer][:, :, :min(self.sink_size, length)].copy()
+        v = self.v_sink[layer][:, :, :min(self.sink_size, length)].copy()
+
+        window_len = max(0, length - self.sink_size)
+        if self.sliding_window is not None:
+            window_len = min(window_len, self.sliding_window)
+
+        if window_len > 0:
+            w_start = length - window_len
+            w_k = self.k_cache[layer][:, :, w_start:length].copy()
+            w_v = self.v_cache[layer][:, :, w_start:length].copy()
+            full_k = np.concatenate([k, w_k], axis=2)
+            full_v = np.concatenate([v, w_v], axis=2)
+        else:
+            full_k = k
+            full_v = v
+        return full_k, full_v
+
+    def get(self, layer: int):
+        return self._gather(layer)
+
+    def reset(self):
+        self.cur_len = [0] * self.num_layers
+
+    def get_seq_len(self, layer: int = 0):
+        return self.cur_len[layer]
+
+
+class MLACache:
+    def __init__(self, max_seq_len: int, num_layers: int, latent_dim: int,
+                 num_heads: int, head_dim: int):
+        self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
+        self.latent_dim = latent_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.latent_cache = [np.zeros((1, max_seq_len, latent_dim), dtype=np.float32)
+                             for _ in range(num_layers)]
+        self.cur_len = [0] * num_layers
+
+    def update(self, layer: int, new_latent: np.ndarray, position: int):
+        n = new_latent.shape[1]
+        self.latent_cache[layer][:, position:position + n] = new_latent
+        self.cur_len[layer] = position + n
+        return self.latent_cache[layer][:, :self.cur_len[layer]].copy()
+
+    def get(self, layer: int):
+        return self.latent_cache[layer][:, :self.cur_len[layer]].copy()
+
+    def reset(self):
+        self.cur_len = [0] * self.num_layers
+
+    def get_seq_len(self, layer: int = 0):
+        return self.cur_len[layer]
+
+
 # ---------------------------------------------------------------------------
 # Attention
 # ---------------------------------------------------------------------------
@@ -124,10 +400,26 @@ class Attention(Module):
         self.head_dim = config.embed_dim // config.num_heads
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.scaling = self.head_dim ** -0.5
+        self.use_flash = config.use_flash
+        self.flash_block_size = config.flash_block_size
+        self.use_mla = config.use_mla
+        self.mla_latent_dim = config.mla_latent_dim
 
         self.q_proj = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
-        self.k_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
-        self.v_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+
+        if self.use_mla:
+            self.w_dkv = Linear(self.embed_dim, self.mla_latent_dim, bias=config.bias)
+            self.w_uk = Linear(self.mla_latent_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+            self.w_uv = Linear(self.mla_latent_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+            self.k_proj = None
+            self.v_proj = None
+        else:
+            self.k_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+            self.v_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+            self.w_dkv = None
+            self.w_uk = None
+            self.w_uv = None
+
         self.o_proj = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
         self.attn_dropout = Dropout(config.dropout) if config.dropout > 0 else None
 
@@ -141,11 +433,23 @@ class Attention(Module):
             self.alibi = ALiBi(config.num_heads, max_seq_len=config.max_seq_len)
 
     def forward(self, x: Tensor, kv_cache: Optional[KVCache] = None,
+                mla_cache: Optional[MLACache] = None,
                 layer_idx: int = 0, position: int = 0) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         B, L, D = x.shape
         q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        kv_out = None
+        if self.use_mla:
+            c_kv = self.w_dkv(x)
+            k = self.w_uk(c_kv).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+            v = self.w_uv(c_kv).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+            if mla_cache is not None:
+                latent = mla_cache.update(layer_idx, c_kv.data, position)
+                kv_out = (Tensor(latent), None)
+        else:
+            k = self.k_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+            v = self.v_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
 
         if self.rope is not None:
             with no_grad():
@@ -156,8 +460,7 @@ class Attention(Module):
             q = Tensor(q_rot.data, requires_grad=q.requires_grad)
             k = Tensor(k_rot.data, requires_grad=k.requires_grad)
 
-        kv_out = None
-        if kv_cache is not None:
+        if not self.use_mla and kv_cache is not None:
             k, v = kv_cache.update(layer_idx, k.data, v.data, position)
             k = Tensor(k)
             v = Tensor(v)
@@ -170,7 +473,10 @@ class Attention(Module):
             k = Tensor(np.repeat(k.data, self.num_kv_groups, axis=1), requires_grad=k.requires_grad)
             v = Tensor(np.repeat(v.data, self.num_kv_groups, axis=1), requires_grad=v.requires_grad)
 
-        attn = self._compute_attention(q, k, v, B, S_q, S_kv, position, layer_idx)
+        if self.use_flash:
+            attn = self._flash_attention_tiled(q, k, v, B, S_q, S_kv, position, layer_idx)
+        else:
+            attn = self._compute_attention(q, k, v, B, S_q, S_kv, position, layer_idx)
 
         attn = Tensor(attn.data.transpose(0, 2, 1, 3), requires_grad=attn.requires_grad)
         attn = attn.reshape(B, L, self.num_heads * self.head_dim)
@@ -218,6 +524,57 @@ class Attention(Module):
                 if j <= i + offset:
                     mask[i, j] = True
         return mask
+
+    def _flash_attention_tiled(self, q, k, v, B, S_q, S_kv, position, layer_idx):
+        block_size = self.flash_block_size
+        n_heads = self.num_heads
+        d = self.head_dim
+
+        q_np = q.data
+        k_np = k.data
+        v_np = v.data
+
+        output = np.zeros((B, n_heads, S_q, d), dtype=np.float32)
+        m_prev = np.full((B, n_heads, S_q, 1), -1e9, dtype=np.float32)
+        l_prev = np.zeros((B, n_heads, S_q, 1), dtype=np.float32)
+
+        for j_start in range(0, S_kv, block_size):
+            j_end = min(j_start + block_size, S_kv)
+            k_block = k_np[:, :, j_start:j_end, :]
+            v_block = v_np[:, :, j_start:j_end, :]
+
+            scale = self.scaling
+            scores = np.einsum('bhid,bhjd->bhij', q_np * scale, k_block)
+
+            causal_mask = np.ones((S_q, j_end - j_start), dtype=np.bool_)
+            for i in range(S_q):
+                for jj in range(j_start, j_end):
+                    if jj <= i + position:
+                        causal_mask[i, jj - j_start] = True
+                    else:
+                        causal_mask[i, jj - j_start] = False
+            scores = np.where(causal_mask[None, None, :, :], scores, -1e9)
+
+            if self.config.sliding_window is not None:
+                sw_start = max(0, S_kv - self.config.sliding_window)
+                sw_mask = np.ones((S_q, j_end - j_start), dtype=np.bool_)
+                for i in range(S_q):
+                    end_pos = min(sw_start + i + 1, S_kv)
+                    for jj in range(j_start, j_end):
+                        if jj < sw_start or jj >= end_pos:
+                            sw_mask[i, jj - j_start] = False
+                scores = np.where(sw_mask[None, None, :, :], scores, -1e9)
+
+            m_curr = scores.max(axis=-1, keepdims=True)
+            m_new = np.maximum(m_prev, m_curr)
+            exp_scores = np.exp(scores - m_new)
+            l_new = l_prev * np.exp(m_prev - m_new) + exp_scores.sum(axis=-1, keepdims=True)
+            output = output * (l_prev * np.exp(m_prev - m_new) / l_new) + \
+                     np.einsum('bhij,bhjd->bhid', exp_scores, v_block) / l_new
+            m_prev = m_new
+            l_prev = l_new
+
+        return Tensor(output, requires_grad=q.requires_grad)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +652,9 @@ class MoELayer(Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.num_shared_experts = config.num_shared_experts
         self.expert_dim = config.ffn_dim
+        self.moe_routing = config.moe_routing
+        self.switch_capacity_factor = config.switch_capacity_factor
+        self.expert_capacity = None
 
         self.gate = Linear(config.embed_dim, self.num_experts, bias=False)
         self.experts = ModuleList([
@@ -314,28 +674,12 @@ class MoELayer(Module):
         router_logits = self.gate(x_flat)
         router_probs = router_logits.softmax(axis=-1)
 
-        k = min(self.num_experts_per_tok, self.num_experts)
-        topk_vals, topk_idx = router_probs.topk(k, dim=-1)
-
-        out = np.zeros((B * L, D), dtype=np.float32)
-        expert_mask = np.zeros((self.num_experts, B * L), dtype=np.bool_)
-        for e in range(self.num_experts):
-            expert_mask[e] = (topk_idx.data == e).any(axis=-1)
-
-        topk_vals_data = topk_vals.data
-        topk_idx_data = topk_idx.data
-
-        for e in range(self.num_experts):
-            if not expert_mask[e].any():
-                continue
-            idx = np.where(expert_mask[e])[0]
-            x_e = Tensor(x_flat.data[idx])
-            expert_out = self.experts[e](x_e)
-            for j in range(k):
-                mask = (topk_idx_data[:, j] == e) & expert_mask[e]
-                if mask.any():
-                    w = topk_vals_data[mask, j:j+1]
-                    out[mask] += (expert_out.data[:mask.sum()] * w).astype(np.float32) if expert_out.data[:mask.sum()].shape == w.shape else expert_out.data[:mask.sum()] * w
+        if self.moe_routing == "switch":
+            out = self._switch_routing(x_flat, router_probs, B, L, D)
+        elif self.moe_routing == "expert_choice":
+            out = self._expert_choice_routing(x_flat, router_probs, B, L, D)
+        else:
+            out = self._topk_routing(x_flat, router_probs, B, L, D)
 
         if self.shared_experts is not None:
             shared_out = x_flat
@@ -347,6 +691,80 @@ class MoELayer(Module):
             self._compute_load_balance_loss(router_probs, B * L)
 
         return Tensor(out.reshape(B, L, D), requires_grad=x.requires_grad)
+
+    def _topk_routing(self, x_flat, router_probs, B, L, D):
+        num_experts = self.num_experts
+        k = min(self.num_experts_per_tok, num_experts)
+
+        out = np.zeros((x_flat.shape[0], D), dtype=np.float32)
+
+        if num_experts <= 1:
+            expert_out = self.experts[0](Tensor(x_flat.data))
+            out = expert_out.data
+        else:
+            topk_vals, topk_idx = router_probs.topk(k, dim=-1)
+            topk_vals_data = topk_vals.data
+            topk_idx_data = topk_idx.data
+
+            for e in range(num_experts):
+                mask_e = (topk_idx_data == e).any(axis=-1)
+                if not mask_e.any():
+                    continue
+                idx = np.where(mask_e)[0]
+                x_e = Tensor(x_flat.data[idx])
+                expert_out = self.experts[e](x_e)
+                for j in range(k):
+                    mask = (topk_idx_data[:, j] == e) & mask_e
+                    if mask.any():
+                        w = topk_vals_data[mask, j:j+1]
+                        n = mask.sum()
+                        out[mask] += (expert_out.data[:n] * w).astype(np.float32)
+        return out
+
+    def _switch_routing(self, x_flat, router_probs, B, L, D):
+        total_tokens = x_flat.shape[0]
+        num_experts = self.num_experts
+        k = min(1, num_experts)
+        topk_vals, topk_idx = router_probs.topk(k, dim=-1)
+
+        capacity = int(total_tokens * self.switch_capacity_factor / self.num_experts)
+        self.expert_capacity = capacity
+
+        out = np.zeros((total_tokens, D), dtype=np.float32)
+        expert_counts = np.zeros(self.num_experts, dtype=np.int32)
+
+        for t in range(total_tokens):
+            e = int(topk_idx.data[t, 0])
+            if expert_counts[e] < capacity:
+                expert_counts[e] += 1
+                x_t = Tensor(x_flat.data[t:t+1])
+                expert_out = self.experts[e](x_t)
+                w = topk_vals.data[t, 0]
+                out[t] = expert_out.data[0] * w
+        return out
+
+    def _expert_choice_routing(self, x_flat, router_probs, B, L, D):
+        total_tokens = x_flat.shape[0]
+        capacity_per_expert = int(total_tokens * self.switch_capacity_factor / self.num_experts)
+        self.expert_capacity = capacity_per_expert
+
+        out = np.zeros((total_tokens, D), dtype=np.float32)
+        token_weight_sum = np.zeros((total_tokens, 1), dtype=np.float32)
+
+        for e in range(self.num_experts):
+            probs_e = router_probs.data[:, e]
+            top_indices = np.argsort(probs_e)[::-1][:capacity_per_expert]
+            if len(top_indices) == 0:
+                continue
+            x_e = Tensor(x_flat.data[top_indices])
+            expert_out = self.experts[e](x_e)
+            weights = probs_e[top_indices]
+            weights = weights / (weights.sum() + 1e-8)
+            for i, t_idx in enumerate(top_indices):
+                out[t_idx] += expert_out.data[i] * weights[i]
+                token_weight_sum[t_idx] += weights[i]
+
+        return out
 
     def _compute_load_balance_loss(self, router_probs, total_tokens):
         probs_mean = router_probs.mean(axis=0)
@@ -395,10 +813,11 @@ class TransformerBlock(Module):
         self.drop = Dropout(config.dropout) if config.dropout > 0 else None
 
     def forward(self, x: Tensor, kv_cache: Optional[KVCache] = None,
+                mla_cache: Optional[MLACache] = None,
                 position: int = 0) -> Tuple[Tensor, Optional[Tuple]]:
         if self.config.parallel_attn_ffn:
             normed = self.attn_norm(x)
-            attn_out, kv_out = self.attn(normed, kv_cache, self.layer_idx, position)
+            attn_out, kv_out = self.attn(normed, kv_cache, mla_cache, self.layer_idx, position)
             ffn_out = self.ffn(self.ffn_norm(x))
             if self.config.sandwich_norm:
                 attn_out = self.post_attn_norm(attn_out)
@@ -409,7 +828,7 @@ class TransformerBlock(Module):
             return x + attn_out + ffn_out, kv_out
         else:
             normed = self.attn_norm(x)
-            attn_out, kv_out = self.attn(normed, kv_cache, self.layer_idx, position)
+            attn_out, kv_out = self.attn(normed, kv_cache, mla_cache, self.layer_idx, position)
             if self.config.sandwich_norm:
                 attn_out = self.post_attn_norm(attn_out)
             if self.drop is not None:
@@ -455,9 +874,10 @@ class Transformer(Module):
         self.embed_drop = Dropout(c.dropout) if c.dropout > 0 else None
 
         self._kv_cache = None
+        self._mla_cache = None
 
     def forward(self, x: Tensor, kv_cache: Optional[KVCache] = None,
-                position: int = 0) -> Tensor:
+                mla_cache: Optional[MLACache] = None, position: int = 0) -> Tensor:
         if isinstance(x, np.ndarray):
             x = Tensor(x)
 
@@ -479,9 +899,9 @@ class Transformer(Module):
         if self.embed_drop is not None:
             h = self.embed_drop(h)
 
-        use_cache = kv_cache is not None
+        use_cache = kv_cache is not None or mla_cache is not None
         for i, layer in enumerate(self.layers):
-            h, _ = layer(h, kv_cache=kv_cache, position=position)
+            h, _ = layer(h, kv_cache=kv_cache, mla_cache=mla_cache, position=position)
 
         h = self.norm(h)
         logits = self.head(h)
@@ -497,15 +917,24 @@ class Transformer(Module):
         if isinstance(prompt_ids, np.ndarray):
             prompt_ids = Tensor(prompt_ids)
         ids = list(prompt_ids.data.flatten().astype(int))
-        kv_cache = KVCache(
-            self.config.max_seq_len, self.config.num_layers,
-            self.config.num_kv_heads, self.config.embed_dim // self.config.num_heads,
-            sliding_window=self.config.sliding_window
-        )
+
+        if self.config.use_mla:
+            cache = MLACache(
+                self.config.max_seq_len, self.config.num_layers,
+                self.config.mla_latent_dim,
+                self.config.num_heads, self.config.embed_dim // self.config.num_heads
+            )
+        else:
+            cache = KVCache(
+                self.config.max_seq_len, self.config.num_layers,
+                self.config.num_kv_heads, self.config.embed_dim // self.config.num_heads,
+                sliding_window=self.config.sliding_window
+            )
 
         with no_grad():
             inp = Tensor(np.array([ids], dtype=np.int32))
-            logits = self.forward(inp, kv_cache=kv_cache, position=0)
+            logits = self.forward(inp, kv_cache=cache if not self.config.use_mla else None,
+                                  mla_cache=cache if self.config.use_mla else None, position=0)
 
         generated = []
         for _ in range(max_tokens):
@@ -531,25 +960,36 @@ class Transformer(Module):
             generated.append(next_id)
             ids.append(next_id)
 
-            pos = kv_cache.get_seq_len() if kv_cache else len(ids) - 1
+            pos = cache.get_seq_len() if cache else len(ids) - 1
             with no_grad():
                 inp = Tensor(np.array([[next_id]], dtype=np.int32))
-                logits = self.forward(inp, kv_cache=kv_cache, position=pos)
+                logits = self.forward(inp, kv_cache=cache if not self.config.use_mla else None,
+                                      mla_cache=cache if self.config.use_mla else None, position=pos)
 
-        kv_cache.reset()
+        cache.reset()
         return ids
 
     def init_kv_cache(self):
-        self._kv_cache = KVCache(
-            self.config.max_seq_len, self.config.num_layers,
-            self.config.num_kv_heads, self.config.embed_dim // self.config.num_heads,
-            sliding_window=self.config.sliding_window
-        )
-        return self._kv_cache
+        if self.config.use_mla:
+            self._mla_cache = MLACache(
+                self.config.max_seq_len, self.config.num_layers,
+                self.config.mla_latent_dim,
+                self.config.num_heads, self.config.embed_dim // self.config.num_heads
+            )
+            return self._mla_cache
+        else:
+            self._kv_cache = KVCache(
+                self.config.max_seq_len, self.config.num_layers,
+                self.config.num_kv_heads, self.config.embed_dim // self.config.num_heads,
+                sliding_window=self.config.sliding_window
+            )
+            return self._kv_cache
 
     def clear_kv_cache(self):
         if self._kv_cache is not None:
             self._kv_cache.reset()
+        if self._mla_cache is not None:
+            self._mla_cache.reset()
 
     def count_parameters(self) -> int:
         total = 0

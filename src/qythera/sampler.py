@@ -281,3 +281,246 @@ def sample_with_strategies(
         elif isinstance(strategy, Sampler):
             return strategy.sample(logits)
     return int(np.argmax(logits))
+
+
+class SpeculativeDecoder:
+    def __init__(self, draft_model, target_model, draft_tokens: int = 5,
+                 temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0):
+        self.draft_model = draft_model
+        self.target_model = target_model
+        self.draft_tokens = draft_tokens
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
+
+    def _sample_from_logits(self, logits: np.ndarray) -> int:
+        if self.temperature > 0:
+            logits = logits / max(self.temperature, 0.01)
+        if self.top_k > 0:
+            threshold = np.sort(logits)[-min(self.top_k, len(logits))]
+            logits = logits.copy()
+            logits[logits < threshold] = -np.inf
+        if self.top_p < 1.0:
+            sorted_idx = np.argsort(logits)[::-1]
+            sorted_logits = logits[sorted_idx].copy()
+            cum_probs = np.cumsum(softmax(sorted_logits))
+            mask = cum_probs > self.top_p
+            mask[1:] = mask[:-1]
+            mask[0] = False
+            sorted_logits[mask] = -np.inf
+            logits[sorted_idx] = sorted_logits
+        probs = softmax(logits)
+        return int(np.random.choice(len(probs), p=probs))
+
+    def generate(self, prompt_ids: List[int], max_new_tokens: int = 128) -> List[int]:
+        from qythera.tensor import Tensor
+        import numpy as np
+        ids = list(prompt_ids)
+        generated = []
+
+        while len(generated) < max_new_tokens:
+            remaining = max_new_tokens - len(generated)
+            k = min(self.draft_tokens, remaining)
+
+            draft_ids = []
+            draft_probs = []
+            draft_cache = self.draft_model.init_kv_cache()
+
+            inp = Tensor(np.array([ids], dtype=np.int32))
+            draft_logits = self.draft_model.forward(inp, kv_cache=draft_cache, position=0)
+            pos = draft_cache.get_seq_len()
+
+            for _ in range(k):
+                last = draft_logits.data[0, -1]
+                token = self._sample_from_logits(last)
+                draft_ids.append(token)
+                probs = softmax(last / max(self.temperature, 0.01))
+                draft_probs.append(probs)
+
+                inp = Tensor(np.array([[token]], dtype=np.int32))
+                draft_logits = self.draft_model.forward(inp, kv_cache=draft_cache, position=pos)
+                pos = draft_cache.get_seq_len()
+
+            draft_cache.reset()
+
+            all_ids = ids + draft_ids
+            inp = Tensor(np.array([all_ids], dtype=np.int32))
+            target_cache = self.target_model.init_kv_cache()
+            target_logits = self.target_model.forward(inp, kv_cache=target_cache, position=0)
+            target_cache.reset()
+
+            accepted = 0
+            for i in range(k):
+                t = target_logits.data[0, len(ids) + i - 1]
+                t_prob = softmax(t / max(self.temperature, 0.01))
+                p_draft = draft_probs[i][draft_ids[i]]
+                p_target = t_prob[draft_ids[i]]
+                ratio = min(1.0, p_target / max(p_draft, 1e-10))
+
+                if np.random.random() < ratio:
+                    generated.append(draft_ids[i])
+                    ids.append(draft_ids[i])
+                else:
+                    sampled = self._sample_from_logits(t)
+                    generated.append(sampled)
+                    ids.append(sampled)
+                    break
+            else:
+                last_t = target_logits.data[0, -1]
+                bonus = self._sample_from_logits(last_t)
+                generated.append(bonus)
+                ids.append(bonus)
+
+        return ids[:len(prompt_ids) + max_new_tokens]
+
+
+class MedusaHeads:
+    def __init__(self, vocab_size: int, hidden_dim: int, num_heads: int = 4,
+                 top_k: int = 10):
+        from qythera.nn import Linear, Module, ModuleList
+        self.num_heads = num_heads
+        self.top_k = top_k
+        self.vocab_size = vocab_size
+        self.heads = ModuleList([Linear(hidden_dim, vocab_size, bias=False)
+                                 for _ in range(num_heads)])
+        self._head_weights = [np.ones(1, dtype=np.float32) for _ in range(num_heads)]
+
+    def predict(self, hidden_states: np.ndarray, temperature: float = 1.0,
+                top_k: Optional[int] = None) -> List[List[int]]:
+        top_k = top_k or self.top_k
+        candidates = []
+        from qythera.tensor import Tensor
+        for i in range(self.num_heads):
+            inp = Tensor(hidden_states)
+            logits = self.heads[i](inp).data[0, -1]
+            if temperature > 0:
+                logits = logits / max(temperature, 0.01)
+            topk_idx = np.argsort(logits)[-top_k:][::-1]
+            candidates.append(topk_idx.tolist())
+        return candidates
+
+    def tree_attention(self, candidates: List[List[int]],
+                       hidden_states: np.ndarray) -> np.ndarray:
+        num_heads = len(candidates)
+        max_depth = min(num_heads, 3)
+        paths = [[]]
+        for depth in range(max_depth):
+            new_paths = []
+            for path in paths:
+                for token in candidates[depth][:self.top_k]:
+                    new_paths.append(path + [token])
+            paths = new_paths
+            if len(paths) > 64:
+                paths = paths[:64]
+
+        path_scores = np.zeros(len(paths), dtype=np.float32)
+        from qythera.tensor import Tensor
+        for i in range(num_heads):
+            inp = Tensor(hidden_states)
+            logits = self.heads[i](inp).data[0, -1]
+            probs = softmax(logits / max(1.0, 0.01))
+            for j, path in enumerate(paths):
+                if i < len(path):
+                    path_scores[j] += np.log(probs[path[i]] + 1e-10)
+
+        sorted_idx = np.argsort(path_scores)[::-1]
+        return np.array([paths[i] for i in sorted_idx[:self.top_k]])
+
+    def reset(self):
+        pass
+
+
+class ContinuousBatcher:
+    def __init__(self, max_batch_size: int = 32, max_seq_len: int = 2048,
+                 pad_token_id: int = 0):
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
+        self.pad_token_id = pad_token_id
+        self.slots: Dict[int, Dict[str, Any]] = {}
+        self._slot_counter = 0
+        self._kv_caches: Dict[int, Any] = {}
+        self._positions: Dict[int, int] = {}
+        self._completed: Dict[int, List[int]] = {}
+        self._prompt_lengths: Dict[int, int] = {}
+
+    def add_request(self, token_ids: List[int]) -> int:
+        slot_id = self._slot_counter
+        self._slot_counter += 1
+        self.slots[slot_id] = {
+            "input_ids": token_ids,
+            "status": "prefill",
+            "max_new_tokens": 1024,
+            "generated": [],
+        }
+        self._positions[slot_id] = 0
+        self._prompt_lengths[slot_id] = len(token_ids)
+        return slot_id
+
+    def remove_request(self, slot_id: int):
+        self.slots.pop(slot_id, None)
+        self._kv_caches.pop(slot_id, None)
+        self._positions.pop(slot_id, None)
+        self._completed.pop(slot_id, None)
+        self._prompt_lengths.pop(slot_id, None)
+
+    def is_complete(self, slot_id: int) -> bool:
+        slot = self.slots.get(slot_id)
+        if slot is None:
+            return True
+        return len(slot["generated"]) >= slot.get("max_new_tokens", 1024)
+
+    def get_active_slots(self) -> List[int]:
+        return [sid for sid in self.slots if not self.is_complete(sid)]
+
+    def prepare_batch(self) -> Optional[Tuple[np.ndarray, List[int]]]:
+        active = self.get_active_slots()
+        if not active:
+            return None
+        active = active[:self.max_batch_size]
+
+        batch_ids = []
+        for sid in active:
+            slot = self.slots[sid]
+            if slot["status"] == "prefill":
+                batch_ids.append(slot["input_ids"])
+            else:
+                last = slot["generated"][-1] if slot["generated"] else slot["input_ids"][-1]
+                batch_ids.append([last])
+
+        max_len = max(len(ids) for ids in batch_ids)
+        padded = np.full((len(batch_ids), max_len), self.pad_token_id, dtype=np.int32)
+        attention_mask = np.zeros((len(batch_ids), max_len), dtype=np.float32)
+
+        for i, ids in enumerate(batch_ids):
+            padded[i, max_len - len(ids):] = ids
+            attention_mask[i, max_len - len(ids):] = 1.0
+
+        return padded, attention_mask
+
+    def update_with_output(self, slot_ids: List[int], token_ids: List[int]):
+        for sid, token_id in zip(slot_ids, token_ids):
+            if sid not in self.slots:
+                continue
+            slot = self.slots[sid]
+            if slot["status"] == "prefill":
+                slot["status"] = "decode"
+                self._positions[sid] = self._prompt_lengths[sid]
+            slot["generated"].append(int(token_id))
+            self._positions[sid] += 1
+
+            if self.is_complete(sid):
+                self._completed[sid] = list(slot["generated"])
+
+    def get_completed(self) -> Dict[int, List[int]]:
+        result = dict(self._completed)
+        self._completed.clear()
+        return result
+
+    def get_batch_stats(self) -> Dict[str, Any]:
+        active = self.get_active_slots()
+        return {
+            "total_slots": len(self.slots),
+            "active_slots": len(active),
+            "completed_slots": len(self._completed),
+            "utilization": len(active) / max(self.max_batch_size, 1),
+        }

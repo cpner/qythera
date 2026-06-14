@@ -186,10 +186,71 @@ class BPETokenizer:
         self._encode_cache = lru_cache(maxsize=2**16)(self._encode_inner)
         self._decode_cache = lru_cache(maxsize=2**16)(self._decode_inner)
 
-    def encode(self, text):
+    def _encode_bpe_dropout(self, text, p=0.1):
+        import random
+        tokens = []
+        for ch in text:
+            bs = ch.encode('utf-8')
+            tokens.append(self._bytes_to_unicode(bs))
+        for pair in self.merges:
+            i = 0
+            while i < len(tokens) - 1:
+                if tokens[i] == pair[0] and tokens[i + 1] == pair[1]:
+                    if random.random() >= p:
+                        tokens[i] = pair[0] + pair[1]
+                        tokens.pop(i + 1)
+                    else:
+                        i += 1
+                else:
+                    i += 1
+        return [self.vocab.get(t, 0) for t in tokens]
+
+    def _sample_segmentation(self, text, temperature=1.0):
+        import random
+        tokens = []
+        for ch in text:
+            bs = ch.encode('utf-8')
+            tokens.append(self._bytes_to_unicode(bs))
+        if len(tokens) <= 1:
+            return tokens
+        merge_rank = {pair: idx for idx, pair in enumerate(self.merges)}
+        for _ in range(len(self.merges)):
+            candidates = []
+            i = 0
+            while i < len(tokens) - 1:
+                pair = (tokens[i], tokens[i + 1])
+                if pair in merge_rank:
+                    rank = merge_rank[pair]
+                    weight = 1.0 / (rank + 1)
+                    candidates.append((i, pair, weight))
+                i += 1
+            if not candidates:
+                break
+            if temperature != 1.0:
+                adjusted = [(pos, pair, w ** (1.0 / temperature)) for pos, pair, w in candidates]
+            else:
+                adjusted = candidates
+            total = sum(w for _, _, w in adjusted)
+            probs = [w / total for _, _, w in adjusted]
+            idx = random.choices(range(len(adjusted)), weights=probs, k=1)[0]
+            pos, pair, _ = adjusted[idx]
+            tokens[pos] = pair[0] + pair[1]
+            tokens.pop(pos + 1)
+        return tokens
+
+    def encode(self, text, dropout=None, temperature=None):
+        if dropout is not None and 0 <= dropout < 1:
+            return self._encode_bpe_dropout(text, p=dropout)
+        if temperature is not None and temperature > 0:
+            tokens = self._sample_segmentation(text, temperature=temperature)
+            return [self.vocab.get(t, 0) for t in tokens]
         if self._encode_cache is None:
             self._setup_cache()
         return self._encode_cache(text)
+
+    def encode_sample(self, text, temperature=1.0):
+        tokens = self._sample_segmentation(text, temperature=temperature)
+        return [self.vocab.get(t, 0) for t in tokens]
 
     def decode(self, ids):
         if self._decode_cache is None:

@@ -429,6 +429,34 @@ class BatchNorm(Module):
         return Tensor(x_norm, requires_grad=x.requires_grad)
 
 
+
+
+class PowerNorm(Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True):
+        super().__init__()
+        self.eps = eps
+        self.momentum = momentum
+        import numpy as np
+        if affine:
+            self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
+            self.register_parameter('bias', Tensor(np.zeros(num_features, dtype=np.float32)))
+        self.register_buffer('running_mean_x2', Tensor(np.ones(num_features, dtype=np.float32)))
+
+    def forward(self, x):
+        import numpy as np
+        if self.training:
+            mean_x2 = np.mean(x.data ** 2, axis=0)
+            self.running_mean_x2.data = (1 - self.momentum) * self.running_mean_x2.data + self.momentum * mean_x2
+            x_norm = x.data / np.sqrt(self.running_mean_x2.data + self.eps)
+        else:
+            x_norm = x.data / np.sqrt(self.running_mean_x2.data + self.eps)
+        if hasattr(self, 'weight') and self.weight is not None:
+            x_norm = x_norm * self.weight.data
+        if hasattr(self, 'bias') and self.bias is not None:
+            x_norm = x_norm + self.bias.data
+        return Tensor(x_norm, requires_grad=x.requires_grad)
+
+
 class GroupNorm(Module):
     def __init__(self, num_groups, num_channels, eps=1e-5, affine=True):
         super().__init__()
@@ -659,16 +687,23 @@ class Conv3d(Module):
         H_out = (H + 2 * PH - DH * (KH - 1) - 1) // SH + 1
         W_out = (W + 2 * PW - DW * (KW - 1) - 1) // SW + 1
         x_padded = np.pad(x.data, ((0,0),(0,0),(PD,PD),(PH,PH),(PW,PW))) if any(p>0 for p in self.padding) else x.data
-        out = np.zeros((B, self.out_channels, D_out, H_out, W_out))
-        for kd in range(KD):
-            for kh in range(KH):
-                for kw in range(KW):
-                    d_s = kd * DD
-                    h_s = kh * DH
-                    w_s = kw * DW
-                    slab = x_padded[:, :, d_s:d_s+D_out*SD:SD, h_s:h_s+H_out*SH:SH, w_s:w_s+W_out*SW:SW]
-                    for co in range(self.out_channels):
-                        out[:, co] += np.sum(slab * self.weight.data[co], axis=(1,2,3)) if slab.ndim > 4 else np.einsum('bijk,ijk->bi', slab, self.weight.data[co])
+        cols = np.zeros((B, self.in_channels // self.groups, KD, KH, KW, D_out, H_out, W_out))
+        for i in range(KD):
+            for j in range(KH):
+                for k in range(KW):
+                    d_start = i * DD
+                    h_start = j * DH
+                    w_start = k * DW
+                    cols[:, :, i, j, k, :, :, :] = x_padded[:, :, d_start:d_start+D_out*SD:SD, h_start:h_start+H_out*SH:SH, w_start:w_start+W_out*SW:SW]
+        G = self.groups
+        Cg = self.in_channels // G
+        Og = self.out_channels // G
+        cols = cols.reshape(B, G, Cg * KD * KH * KW, D_out * H_out * W_out)
+        out = np.zeros((B, self.out_channels, D_out * H_out * W_out))
+        for g in range(G):
+            w = self.weight.data[g * Og:(g + 1) * Og].reshape(Og, -1)
+            out[:, g * Og:(g + 1) * Og] = np.einsum('ij,bjk->bik', w, cols[:, g])
+        out = out.reshape(B, self.out_channels, D_out, H_out, W_out)
         if self.bias is not None:
             out = out + self.bias.data.reshape(1, -1, 1, 1, 1)
         return Tensor(out, requires_grad=x.requires_grad)
@@ -742,15 +777,21 @@ class ConvTransposed2d(Module):
         H_out = (H_in - 1) * SH - 2 * PH + KH + self.output_padding
         W_out = (W_in - 1) * SW - 2 * PW + KW + self.output_padding
         out = np.zeros((B, self.out_channels, H_out, W_out))
-        x_t = x.data.reshape(B, self.groups, -1, H_in, W_in)
+        G = self.groups
+        Cg = C // G
+        Og = self.out_channels // G
         for ki in range(KH):
             for kj in range(KW):
+                w_slice = self.weight.data[:, :, ki, kj]
                 for hi in range(H_in):
                     for wi in range(W_in):
                         ho = hi * SH - PH + ki
                         wo = wi * SW - PW + kj
                         if 0 <= ho < H_out and 0 <= wo < W_out:
-                            out[:, :, ho, wo] += np.einsum('bgc,goc->bo', x_t[:, :, :, hi, wi], self.weight.data[:, :, ki, kj])
+                            for g in range(G):
+                                x_col = x.data[:, g*Cg:(g+1)*Cg, hi, wi]
+                                w_g = w_slice[g*Cg:(g+1)*Cg, g*Og:(g+1)*Og]
+                                out[:, g*Og:(g+1)*Og, ho, wo] += x_col @ w_g
         if self.bias is not None:
             out = out + self.bias.data.reshape(1, -1, 1, 1)
         return Tensor(out, requires_grad=x.requires_grad)
@@ -787,6 +828,26 @@ class ConvTransposed3d(Module):
         H_out = (H_in - 1) * SH - 2 * PH + KH + self.output_padding
         W_out = (W_in - 1) * SW - 2 * PW + KW + self.output_padding
         out = np.zeros((B, self.out_channels, D_out, H_out, W_out))
+        G = self.groups
+        Cg = C // G
+        Og = self.out_channels // G
+        for kd in range(KD):
+            for kh in range(KH):
+                for kw in range(KW):
+                    w_slice = self.weight.data[:, :, kd, kh, kw]
+                    for di in range(D_in):
+                        for hi in range(H_in):
+                            for wi in range(W_in):
+                                do = di * SD - PD + kd
+                                ho = hi * SH - PH + kh
+                                wo = wi * SW - PW + kw
+                                if 0 <= do < D_out and 0 <= ho < H_out and 0 <= wo < W_out:
+                                    for g in range(G):
+                                        x_col = x.data[:, g*Cg:(g+1)*Cg, di, hi, wi]
+                                        w_g = w_slice[g*Cg:(g+1)*Cg, g*Og:(g+1)*Og]
+                                        out[:, g*Og:(g+1)*Og, do, ho, wo] += x_col @ w_g
+        if self.bias is not None:
+            out = out + self.bias.data.reshape(1, -1, 1, 1, 1)
         return Tensor(out, requires_grad=x.requires_grad)
 
 
@@ -1217,3 +1278,76 @@ class LogSoftmax(Module):
         self.dim = dim
     def forward(self, x):
         return x.log_softmax(self.dim)
+
+
+# ---------------------------------------------------------------------------
+# Sparsemax and Entmax
+# ---------------------------------------------------------------------------
+
+class Sparsemax(Module):
+    def __init__(self, dim=-1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        import numpy as np
+        data = x.data
+        if self.dim != -1 and self.dim != len(data.shape) - 1:
+            data = np.moveaxis(data, self.dim, -1)
+        shape = data.shape
+        data_2d = data.reshape(-1, shape[-1])
+        sorted_data = np.sort(data_2d, axis=-1)[:, ::-1]
+        cumsum = np.cumsum(sorted_data, axis=-1)
+        k = np.arange(1, shape[-1] + 1, dtype=np.float32)
+        threshold = (cumsum - 1.0) / k
+        mask = sorted_data > threshold
+        k_idx = np.sum(mask, axis=-1, keepdims=True) - 1
+        threshold_val = np.take_along_axis(threshold, k_idx, axis=-1)
+        out = np.maximum(data_2d - threshold_val, 0.0)
+        out = out.reshape(shape)
+        if self.dim != -1 and self.dim != len(shape) - 1:
+            out = np.moveaxis(out, -1, self.dim)
+        return Tensor(out, requires_grad=x.requires_grad)
+
+class Entmax(Module):
+    def __init__(self, alpha=1.5, dim=-1):
+        super().__init__()
+        self.alpha = alpha
+        self.dim = dim
+
+    def forward(self, x):
+        import numpy as np
+        if self.alpha == 1.0:
+            return x.softmax(self.dim)
+        if self.alpha == 2.0:
+            sparsemax = Sparsemax(self.dim)
+            return sparsemax(x)
+
+        data = x.data
+        if self.dim != -1 and self.dim != len(data.shape) - 1:
+            data = np.moveaxis(data, self.dim, -1)
+        shape = data.shape
+        data_2d = data.reshape(-1, shape[-1])
+        alpha = self.alpha
+        p = np.zeros_like(data_2d)
+
+        for i in range(data_2d.shape[0]):
+            z = data_2d[i]
+            z_sorted = np.sort(z)[::-1]
+            cumsum = np.cumsum(z_sorted)
+            k = np.arange(1, len(z) + 1, dtype=np.float32)
+            support = z_sorted - (cumsum - 1.0) / k
+            support = support > 0
+            if not np.any(support):
+                p[i] = 0.0
+                continue
+            k_star = np.sum(support)
+            z_k_star = z_sorted[k_star - 1]
+            tau = (cumsum[k_star - 1] - 1.0) / k_star
+            p[i] = np.maximum(z - tau, 0.0) ** (alpha - 1.0)
+
+        p = p / np.sum(p, axis=-1, keepdims=True) if np.all(np.sum(p, axis=-1, keepdims=True) > 0) else p
+        out = p.reshape(shape)
+        if self.dim != -1 and self.dim != len(shape) - 1:
+            out = np.moveaxis(out, -1, self.dim)
+        return Tensor(out, requires_grad=x.requires_grad)

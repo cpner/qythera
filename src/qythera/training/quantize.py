@@ -1182,6 +1182,153 @@ class KVCacheQuantization:
 
 
 # ---------------------------------------------------------------------------
+# QuaRot: Random Rotation Quantization
+# ---------------------------------------------------------------------------
+
+class QuaRot:
+    """QuaRot: apply random orthogonal rotation to weights before quantization.
+
+    Reduces quantization error by rotating weights into a space where they
+    are more uniformly distributed (incoherence principle). The rotation
+    matrix Q is generated via QR decomposition of a random Gaussian matrix.
+    """
+
+    def __init__(self, dim: int):
+        self.dim = dim
+        rng = np.random.RandomState(42)
+        H = rng.randn(dim, dim).astype(np.float32)
+        self.Q, _ = np.linalg.qr(H)
+        self.Q = self.Q.astype(np.float32)
+
+    def rotate(self, weight: np.ndarray) -> np.ndarray:
+        return self.Q @ weight.astype(np.float32)
+
+    def quantize(
+        self,
+        weight: np.ndarray,
+        bits: int = 4,
+        group_size: int = 128,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        weight = weight.astype(np.float32)
+        rotated = self.Q @ weight
+        quantized, meta = quantize_tensor(rotated, bits, group_size)
+        metadata = {
+            "method": "QuaRot",
+            "bits": bits,
+            "group_size": group_size,
+            "original_shape": weight.shape,
+            "quantized_shape": quantized.shape,
+            "Q": self.Q,
+            "quantizer_metadata": meta,
+        }
+        return quantized, metadata
+
+    def dequantize(self, quantized: np.ndarray, metadata: Dict[str, Any]) -> np.ndarray:
+        meta = metadata["quantizer_metadata"]
+        Q = metadata["Q"]
+        dequantized = dequantize_tensor(quantized, meta)
+        return Q.T @ dequantized
+
+    def get_compression_ratio(self) -> float:
+        return 32.0 / 4.0
+
+
+# ---------------------------------------------------------------------------
+# EXL2: Mixed-Precision Per-Layer Quantization
+# ---------------------------------------------------------------------------
+
+class EXL2:
+    """EXL2: mixed-precision quantization with per-layer bit allocation.
+
+    Analyzes weight distributions across model layers and assigns per-layer
+    bit-widths based on importance (variance) to meet a target average bitrate.
+    """
+
+    def __init__(self, model: Optional[Dict[str, np.ndarray]] = None, target_bits: float = 3.5):
+        self.target_bits = target_bits
+        self._weights: Dict[str, np.ndarray] = {}
+        self._layer_bits: Dict[str, int] = {}
+        self._quantized_layers: Dict[str, Tuple[np.ndarray, Dict[str, Any]]] = {}
+        if model is not None:
+            self._analyze_model(model)
+
+    def _analyze_model(self, model: Dict[str, np.ndarray]) -> None:
+        self._weights = {k: v.astype(np.float32) for k, v in model.items()}
+
+    def _layer_importance(self, weight: np.ndarray) -> float:
+        return float(np.var(weight))
+
+    def _allocate_bits(self, layer_stats: List[Tuple[str, np.ndarray, float]]) -> Dict[str, int]:
+        n_layers = len(layer_stats)
+        total_params = sum(w.size for _, w, _ in layer_stats)
+        total_budget = self.target_bits * total_params
+        importances = np.array([imp for _, _, imp in layer_stats])
+        max_imp = np.max(importances) + 1e-8
+        norm_imp = importances / max_imp
+        allocations = {}
+        bits_used = 0
+        sorted_layers = sorted(enumerate(layer_stats), key=lambda x: -x[1][2])
+        for idx, (name, weight, imp) in sorted_layers:
+            remaining_layers = n_layers - len(allocations)
+            remaining_budget = total_budget - bits_used
+            if remaining_layers > 0:
+                bits_per_param = remaining_budget / remaining_layers / weight.size
+            else:
+                bits_per_param = self.target_bits
+            base_bits = int(round(np.clip(bits_per_param, 2, 8)))
+            imp_boost = int(round(norm_imp[idx] * 2))
+            layer_bits = int(np.clip(base_bits + imp_boost, 2, 8))
+            allocations[name] = layer_bits
+            bits_used += layer_bits * weight.size
+        return allocations
+
+    def quantize(
+        self,
+        weights: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Dict[str, Tuple[np.ndarray, Dict[str, Any]]]:
+        if weights is not None:
+            self._analyze_model(weights)
+        layer_stats = []
+        for name, weight in self._weights.items():
+            importance = self._layer_importance(weight)
+            layer_stats.append((name, weight, importance))
+        self._layer_bits = self._allocate_bits(layer_stats)
+        results = {}
+        for name, weight, _ in layer_stats:
+            bits = self._layer_bits[name]
+            quantized, meta = quantize_tensor(weight, bits, group_size=128)
+            layer_meta = {
+                "method": f"EXL2-{bits}bit",
+                "bits": bits,
+                "group_size": 128,
+                "original_shape": weight.shape,
+                "quantized_shape": quantized.shape,
+                "quantizer_metadata": meta,
+            }
+            results[name] = (quantized, layer_meta)
+        self._quantized_layers = results
+        return results
+
+    def dequantize(self) -> Dict[str, np.ndarray]:
+        results = {}
+        for name, (quantized, meta) in self._quantized_layers.items():
+            qmeta = meta["quantizer_metadata"]
+            results[name] = dequantize_tensor(quantized, qmeta)
+        return results
+
+    def get_compression_ratio(self) -> float:
+        if not self._layer_bits:
+            return 32.0 / self.target_bits
+        total_params = 0
+        total_bits = 0
+        for name, bits in self._layer_bits.items():
+            w = self._weights[name]
+            total_params += w.size
+            total_bits += bits * w.size
+        return 32.0 / (total_bits / total_params)
+
+
+# ---------------------------------------------------------------------------
 # Module exports
 # ---------------------------------------------------------------------------
 
@@ -1195,6 +1342,8 @@ __all__ = [
     "SmoothQuant",
     "LLM_int8",
     "KVCacheQuantization",
+    "QuaRot",
+    "EXL2",
     "quantize_tensor",
     "dequantize_tensor",
     "measure_quantization_error",

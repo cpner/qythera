@@ -13,3 +13,4 @@ models/*/model.npz
 dist/
 build/
 .venv/
+checkpoints/

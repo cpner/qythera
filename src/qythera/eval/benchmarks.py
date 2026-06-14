@@ -306,3 +306,473 @@ class ArenaELO:
 
     def get_rating(self, model: str) -> float:
         return self.ratings.get(model, self.initial)
+
+
+# ---------------------------------------------------------------------------
+# HellaSwag: Sentence Completion
+# ---------------------------------------------------------------------------
+
+class HellaSwag:
+    """HellaSwag: commonsense natural language inference.
+
+    Evaluates sentence completion with 4 candidate endings.
+    Uses log-likelihood scoring to select the best completion.
+    """
+
+    def __init__(self):
+        self._choice_tokens = ["A", "B", "C", "D"]
+
+    def evaluate(
+        self,
+        log_likelihoods: List[List[float]],
+        targets: List[int],
+    ) -> dict:
+        """Evaluate HellaSwag accuracy.
+
+        Args:
+            log_likelihoods: list of lists, each with 4 log-likelihoods per option
+            targets: list of correct answer indices (0-3)
+        """
+        correct = 0
+        total = len(targets)
+        details = []
+        for ll, target in zip(log_likelihoods, targets):
+            predicted = int(np.argmax(ll))
+            is_correct = predicted == target
+            if is_correct:
+                correct += 1
+            details.append({
+                "predicted": self._choice_tokens[predicted],
+                "target": self._choice_tokens[target],
+                "correct": is_correct,
+                "log_likelihoods": ll,
+            })
+        return {
+            "accuracy": correct / total if total > 0 else 0.0,
+            "correct": correct,
+            "total": total,
+            "details": details,
+        }
+
+    def compute_log_likelihood(
+        self,
+        prompt: str,
+        completions: List[str],
+        token_log_probs: Callable[[str], List[float]],
+    ) -> List[float]:
+        """Compute sum of log-probs for each completion given the prompt."""
+        results = []
+        for completion in completions:
+            full_text = prompt + " " + completion
+            log_probs = token_log_probs(full_text)
+            results.append(sum(log_probs))
+        return results
+
+
+# ---------------------------------------------------------------------------
+# TruthfulQA
+# ---------------------------------------------------------------------------
+
+class TruthfulQA:
+    """TruthfulQA: measuring truthfulness in language models.
+
+    Supports MC1 (truthful + informative) and MC2 (truthful only) variants.
+    """
+
+    def __init__(self, variant: str = "MC1"):
+        if variant not in ("MC1", "MC2"):
+            raise ValueError(f"Variant must be MC1 or MC2, got {variant}")
+        self.variant = variant
+
+    def evaluate(
+        self,
+        log_likelihoods: List[List[float]],
+        targets: List[List[int]],
+    ) -> dict:
+        """Evaluate TruthfulQA accuracy.
+
+        Args:
+            log_likelihoods: list of lists, each with log-likelihoods per option
+            targets: list of lists of correct answer indices
+        """
+        correct = 0
+        total = len(targets)
+        details = []
+        for ll, target_set in zip(log_likelihoods, targets):
+            if self.variant == "MC1":
+                predicted = int(np.argmax(ll))
+                is_correct = predicted in target_set
+            else:
+                max_ll = max(ll)
+                predicted = [i for i, v in enumerate(ll) if v == max_ll]
+                is_correct = any(p in target_set for p in predicted)
+            if is_correct:
+                correct += 1
+            details.append({
+                "predicted": predicted,
+                "targets": target_set,
+                "correct": is_correct,
+                "log_likelihoods": ll,
+            })
+        return {
+            "accuracy": correct / total if total > 0 else 0.0,
+            "variant": self.variant,
+            "correct": correct,
+            "total": total,
+            "details": details,
+        }
+
+
+# ---------------------------------------------------------------------------
+# ARC: AI2 Reasoning Challenge
+# ---------------------------------------------------------------------------
+
+class ARC:
+    """ARC: science questions with multiple choice answers.
+
+    Supports Easy and Challenging subsets.
+    """
+
+    def __init__(self, subset: str = "easy"):
+        if subset not in ("easy", "challenging"):
+            raise ValueError(f"Subset must be 'easy' or 'challenging', got {subset}")
+        self.subset = subset
+        self._choice_tokens = ["A", "B", "C", "D", "E"]
+
+    def evaluate(
+        self,
+        predictions: List[str],
+        targets: List[str],
+    ) -> dict:
+        """Evaluate ARC accuracy.
+
+        Args:
+            predictions: list of predicted answers
+            targets: list of correct answers
+        """
+        correct = 0
+        total = len(targets)
+        details = []
+        for pred, target in zip(predictions, targets):
+            pred_clean = self._extract_choice(pred)
+            target_clean = target.strip().upper()[:1]
+            is_correct = pred_clean == target_clean
+            if is_correct:
+                correct += 1
+            details.append({
+                "predicted": pred_clean,
+                "target": target_clean,
+                "correct": is_correct,
+            })
+        return {
+            "accuracy": correct / total if total > 0 else 0.0,
+            "subset": self.subset,
+            "correct": correct,
+            "total": total,
+            "details": details,
+        }
+
+    def _extract_choice(self, text: str) -> str:
+        text = text.strip()
+        if text and text[0].upper() in "ABCDE":
+            return text[0].upper()
+        m = re.search(r"\b([ABCDE])\b", text.upper())
+        return m.group(1) if m else "A"
+
+
+class ARC_Easy(ARC):
+    """ARC Easy: science questions with multiple choice answers (easy subset)."""
+
+    def __init__(self):
+        super().__init__(subset="easy")
+
+
+class ARC_Challenging(ARC):
+    """ARC Challenging: science questions with multiple choice answers (challenging subset)."""
+
+    def __init__(self):
+        super().__init__(subset="challenging")
+
+
+# ---------------------------------------------------------------------------
+# WinoGrande: Pronoun Resolution
+# ---------------------------------------------------------------------------
+
+class WinoGrande:
+    """WinoGrande: binary choice pronoun resolution benchmark."""
+
+    def __init__(self):
+        self._choice_tokens = ["A", "B"]
+
+    def evaluate(
+        self,
+        predictions: List[str],
+        targets: List[str],
+    ) -> dict:
+        """Evaluate WinoGrande accuracy.
+
+        Args:
+            predictions: list of predicted choices ('A' or 'B')
+            targets: list of correct choices ('A' or 'B')
+        """
+        correct = 0
+        total = len(targets)
+        details = []
+        for pred, target in zip(predictions, targets):
+            pred_clean = pred.strip().upper()[:1]
+            if pred_clean not in "AB":
+                pred_clean = "A"
+            target_clean = target.strip().upper()[:1]
+            is_correct = pred_clean == target_clean
+            if is_correct:
+                correct += 1
+            details.append({
+                "predicted": pred_clean,
+                "target": target_clean,
+                "correct": is_correct,
+            })
+        return {
+            "accuracy": correct / total if total > 0 else 0.0,
+            "correct": correct,
+            "total": total,
+            "details": details,
+        }
+
+
+# ---------------------------------------------------------------------------
+# MBPP: Mostly Basic Python Problems
+# ---------------------------------------------------------------------------
+
+class MBPP:
+    """MBPP: Python code generation and evaluation benchmark."""
+
+    def __init__(self):
+        pass
+
+    def evaluate(
+        self,
+        generated_code: List[str],
+        test_cases: List[List[str]],
+    ) -> dict:
+        """Evaluate MBPP code generation.
+
+        Args:
+            generated_code: list of generated Python code strings
+            test_cases: list of lists of test case strings
+        """
+        pass_count = 0
+        total = len(generated_code)
+        details = []
+        for code, tests in zip(generated_code, test_cases):
+            all_pass = True
+            for test in tests:
+                try:
+                    namespace = {}
+                    exec(code, namespace)
+                    exec(test, namespace)
+                except Exception:
+                    all_pass = False
+                    break
+            if all_pass:
+                pass_count += 1
+            details.append({"passed": all_pass})
+        return {
+            "pass_rate": pass_count / total if total > 0 else 0.0,
+            "passed": pass_count,
+            "total": total,
+            "details": details,
+        }
+
+
+# ---------------------------------------------------------------------------
+# BERTScore
+# ---------------------------------------------------------------------------
+
+class BERTScore:
+    """BERTScore: token embedding cosine similarity F1."""
+
+    def __init__(self, embedding_dim: int = 768):
+        self.embedding_dim = embedding_dim
+
+    def _get_embeddings(self, tokens: List[str], seed: int = 0) -> np.ndarray:
+        rng = np.random.RandomState(seed)
+        return rng.randn(len(tokens), self.embedding_dim).astype(np.float32)
+
+    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        if norm_a < 1e-8 or norm_b < 1e-8:
+            return 0.0
+        return float(np.dot(a, b) / (norm_a * norm_b))
+
+    def compute(
+        self,
+        predictions: List[str],
+        references: List[str],
+    ) -> float:
+        """Compute BERTScore F1 between predictions and references.
+
+        Args:
+            predictions: list of predicted strings
+            references: list of reference strings
+
+        Returns:
+            Average F1 score across all pairs
+        """
+        result = self.evaluate(predictions, references)
+        return result["bertscore_f1"]
+
+    def evaluate(
+        self,
+        predictions: List[str],
+        references: List[str],
+    ) -> dict:
+        """Evaluate BERTScore between predictions and references.
+
+        Args:
+            predictions: list of predicted strings
+            references: list of reference strings
+        """
+        f1_scores = []
+        for pred, ref in zip(predictions, references):
+            pred_tokens = pred.lower().split()
+            ref_tokens = ref.lower().split()
+            if not pred_tokens or not ref_tokens:
+                f1_scores.append(0.0)
+                continue
+            pred_emb = self._get_embeddings(pred_tokens, seed=0)
+            ref_emb = self._get_embeddings(ref_tokens, seed=1)
+            precision_scores = []
+            for i, pe in enumerate(pred_emb):
+                max_sim = max(self._cosine_similarity(pe, re_emb) for re_emb in ref_emb)
+                precision_scores.append(max_sim)
+            recall_scores = []
+            for j, re_emb in enumerate(ref_emb):
+                max_sim = max(self._cosine_similarity(re_emb, pe) for pe in pred_emb)
+                recall_scores.append(max_sim)
+            precision = np.mean(precision_scores) if precision_scores else 0.0
+            recall = np.mean(recall_scores) if recall_scores else 0.0
+            if precision + recall > 0:
+                f1 = 2 * precision * recall / (precision + recall)
+            else:
+                f1 = 0.0
+            f1_scores.append(float(f1))
+        return {
+            "bertscore_f1": float(np.mean(f1_scores)) if f1_scores else 0.0,
+            "per_sample_f1": f1_scores,
+        }
+
+
+# ---------------------------------------------------------------------------
+# DiversityMetrics
+# ---------------------------------------------------------------------------
+
+class DiversityMetrics:
+    """DiversityMetrics: distinct-n token diversity for response diversity."""
+
+    def __init__(self, max_n: int = 2):
+        self.max_n = max_n
+
+    def compute(self, responses: List[str]) -> dict:
+        """Compute diversity metrics.
+
+        Args:
+            responses: list of generated response strings
+
+        Returns:
+            Dictionary with distinct_1 and distinct_2 scores
+        """
+        result = self.evaluate(responses)
+        return {
+            "distinct_1": result["distinct_1"],
+            "distinct_2": result["distinct_2"]
+        }
+
+    def evaluate(self, responses: List[str]) -> dict:
+        """Compute distinct-1 and distinct-2 metrics.
+
+        Args:
+            responses: list of generated response strings
+        """
+        all_tokens = []
+        all_bigrams = []
+        for response in responses:
+            tokens = response.lower().split()
+            all_tokens.extend(tokens)
+            all_bigrams.extend([(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)])
+        distinct_1 = len(set(all_tokens)) / max(len(all_tokens), 1)
+        distinct_2 = len(set(all_bigrams)) / max(len(all_bigrams), 1) if all_bigrams else 0.0
+        return {
+            "distinct_1": float(distinct_1),
+            "distinct_2": float(distinct_2),
+            "total_tokens": len(all_tokens),
+            "total_bigrams": len(all_bigrams),
+            "unique_tokens": len(set(all_tokens)),
+            "unique_bigrams": len(set(all_bigrams)),
+        }
+
+
+# ---------------------------------------------------------------------------
+# PassAtK: Unbiased Estimator
+# ---------------------------------------------------------------------------
+
+class PassAtK:
+    """PassAtK: unbiased pass@k estimator via combination formula."""
+
+    def __init__(self):
+        pass
+
+    def _combination(self, n: int, k: int) -> float:
+        if k > n:
+            return 0.0
+        if k == 0 or k == n:
+            return 1.0
+        if k > n - k:
+            k = n - k
+        result = 1.0
+        for i in range(k):
+            result = result * (n - i) / (i + 1)
+        return result
+
+    def _pass_at_k(self, n: int, c: int, k: int) -> float:
+        if n - c < k:
+            return 1.0
+        return 1.0 - self._combination(n - c, k) / self._combination(n, k)
+
+    def compute(self, n: int, c: int, k: int) -> float:
+        """Compute unbiased pass@k for a single problem.
+
+        Args:
+            n: total number of samples
+            c: number of correct samples
+            k: number of samples to evaluate
+
+        Returns:
+            pass@k score
+        """
+        return self._pass_at_k(n, c, k)
+
+    def evaluate(
+        self,
+        n_total: List[int],
+        n_correct: List[int],
+        k: int = 1,
+    ) -> dict:
+        """Compute unbiased pass@k for each problem.
+
+        Args:
+            n_total: list of total samples per problem
+            n_correct: list of correct samples per problem
+            k: number of samples to evaluate
+        """
+        per_problem = []
+        for n, c in zip(n_total, n_correct):
+            score = self._pass_at_k(n, c, k)
+            per_problem.append(score)
+        avg = float(np.mean(per_problem)) if per_problem else 0.0
+        return {
+            "pass@k": avg,
+            "k": k,
+            "n_problems": len(per_problem),
+            "per_problem": per_problem,
+        }
