@@ -3,7 +3,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from core.knowledge import answer
 from core.safety import Safety
 
-HTML = os.path.join(os.path.dirname(__file__), "ui.html")
+BASE = os.path.dirname(__file__)
 safety = Safety()
 srv = None
 
@@ -14,25 +14,46 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
         self.send_header("Access-Control-Allow-Headers","Content-Type")
         self.end_headers(); self.wfile.write(json.dumps(d).encode())
-    def _h(self, c, s=200):
-        self.send_response(s); self.send_header("Content-Type","text/html;charset=utf-8")
+    def _h(self, c, s=200, ct="text/html"):
+        self.send_response(s); self.send_header("Content-Type", ct)
         self.send_header("Access-Control-Allow-Origin","*")
-        self.end_headers(); self.wfile.write(c.encode("utf-8"))
+        self.end_headers(); self.wfile.write(c.encode("utf-8") if isinstance(c, str) else c)
+    def _f(self, path, ct):
+        try:
+            with open(path, "rb") as f: data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+        except: self._j({"error":"not found"}, 404)
+
     def do_OPTIONS(self):
-        self.send_response(200); self.send_header("Access-Control-Allow-Origin","*")
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin","*")
         self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers","Content-Type"); self.end_headers()
+        self.send_header("Access-Control-Allow-Headers","Content-Type")
+        self.end_headers()
+
     def do_GET(self):
         p = self.path.split("?")[0]
         if p in ("/", "/index.html"):
             try:
-                with open(HTML) as f: self._h(f.read())
-            except: self._h("<h1>Qythera</h1><p>Server running. API at /v1/chat/completions</p>")
+                with open(os.path.join(BASE, "ui.html")) as f: self._h(f.read())
+            except: self._h("<h1>Qythera</h1><p>Server running.</p>")
+        elif p == "/manifest.json":
+            self._f(os.path.join(BASE, "manifest.json"), "application/json")
+        elif p == "/sw.js":
+            self._f(os.path.join(BASE, "sw.js"), "application/javascript")
+        elif p.startswith("/icon-") and p.endswith(".png"):
+            self._f(os.path.join(BASE, p.lstrip("/")), "image/png")
         elif p == "/health":
             self._j({"status":"ok","model":"vaelon","uptime":round(time.time()-srv.t,1),"requests":srv.rc})
         elif p == "/v1/models":
             self._j({"data":[{"id":"vaelon","object":"model"}]})
         else: self._j({"error":"not found"}, 404)
+
     def do_POST(self):
         ln = int(self.headers.get("Content-Length",0))
         body = json.loads(self.rfile.read(ln)) if ln else {}
@@ -64,7 +85,7 @@ def run(port=8000):
         for p2 in range(port, port+100):
             try: s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("0.0.0.0",p2)); s.close(); p=p2; break
             except: continue
-    print(f"\n  Qythera Server: http://localhost:{p}")
+    print(f"\n  Qythera: http://localhost:{p}")
     srv = type('S',(),{'rc':0,'t':time.time()})()
     httpd = HTTPServer(("0.0.0.0",p), H)
     try: httpd.serve_forever()

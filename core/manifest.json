@@ -1,0 +1,34 @@
+{
+  "name": "Qythera AI",
+  "short_name": "Qythera",
+  "description": "Production Superintelligence - ask anything about coding, science, math",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#09090b",
+  "theme_color": "#7c3aed",
+  "scope": "/",
+  "lang": "en",
+  "dir": "ltr",
+  "id": "/",
+  "categories": ["productivity", "developer tools", "education"],
+  "shortcuts": [
+    {"name": "New Chat", "short_name": "Chat", "url": "/?action=chat", "description": "Start a new conversation"},
+    {"name": "Math", "short_name": "Math", "url": "/?q=calculate", "description": "Quick math calculation"}
+  ],
+  "icons": [
+    {"src": "/icon-72.png", "sizes": "72x72", "type": "image/png", "purpose": "any"},
+    {"src": "/icon-96.png", "sizes": "96x96", "type": "image/png", "purpose": "any"},
+    {"src": "/icon-128.png", "sizes": "128x128", "type": "image/png", "purpose": "any"},
+    {"src": "/icon-144.png", "sizes": "144x144", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/icon-152.png", "sizes": "152x152", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/icon-384.png", "sizes": "384x384", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ],
+  "screenshots": [
+    {"src": "/screenshot-wide.png", "sizes": "1280x720", "type": "image/png", "form_factor": "wide", "label": "Qythera Desktop"},
+    {"src": "/screenshot-narrow.png", "sizes": "390x844", "type": "image/png", "form_factor": "narrow", "label": "Qythera Mobile"}
+  ],
+  "prefer_related_applications": false
+}

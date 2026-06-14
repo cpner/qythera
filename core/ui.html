@@ -16,7 +16,13 @@ html,body{height:100%;background:#09090b;color:#fafafa;font-family:system-ui,san
 ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.06);border-radius:8px}
 @media(max-width:768px){.mu,.ma{max-width:92%!important;padding:8px 10px}body{font-size:15px}}
 @media(hover:none)and(pointer:coarse){button{min-height:44px;min-width:44px}}
-</style></head><body>
+</style><meta name="theme-color" content="#09090b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Qythera">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon-192.png">
+</head><body>
 <div class="bg"></div>
 <div style="position:relative;z-index:1;height:100%;display:flex;flex-direction:column">
 <div class="g" style="margin:6px;padding:8px 14px;display:flex;align-items:center;gap:8px">
@@ -50,4 +56,12 @@ ty.remove();var r=d.choices[0].message.content;var b=document.createElement('div
 function H(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML}
 function F(t){return H(t).replace(/```(\w+)?\n([\s\S]*?)```/g,'<pre style="background:rgba(0,0,0,.4);border-radius:8px;padding:10px;overflow-x:auto;margin:6px 0"><code style="font-size:11px;color:#a5f3fc">$2</code></pre>').replace(/\*\*(.*?)\*\*/g,'<b>$1</b>')}
 document.getElementById('i').focus();
-</script></body></html>
+</script><script>
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('/sw.js').then(r=>console.log('SW:',r.scope)).catch(()=>{});
+}
+if('Notification' in window && Notification.permission==='default'){
+  Notification.requestPermission();
+}
+</script>
+</body></html>
