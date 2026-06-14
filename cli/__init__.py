@@ -1,2 +1,2 @@
-"""Qythera CLI - Command line interface for Qythera AI."""
-__version__ = "0.1.0"
+from cli.main import main
+if __name__=="__main__": main()

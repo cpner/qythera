@@ -1,0 +1,2 @@
+"""python parser 7128"""
+def parse(code): return {"lang":"python","id":7128}

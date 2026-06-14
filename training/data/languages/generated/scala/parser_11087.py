@@ -1,0 +1,2 @@
+"""scala parser 11087"""
+def parse(code): return {"lang":"scala","id":11087}

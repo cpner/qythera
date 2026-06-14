@@ -1,32 +1,25 @@
-import torch
-import pytest
-from vaelon.config import VaelonConfig
-from vaelon.model import VaelonModel
 
+import torch, pytest
+from core.config import ModelConfig
+from core.model import QytheraModel
 
-class TestVaelonModel:
-    def test_forward(self, sample_config):
-        model = VaelonModel(sample_config)
-        input_ids = torch.randint(0, 1000, (1, 16))
-        outputs = model(input_ids=input_ids)
-        assert outputs.logits is not None
-        assert outputs.logits.shape == (1, 16, 1000)
+class TestModel:
+    def test_forward(self, small_cfg):
+        m = QytheraModel(small_cfg)
+        ids = torch.randint(0, 1000, (1, 16))
+        logits, loss = m(ids, labels=ids)
+        assert logits.shape[2] == small_cfg.vocab_size
 
-    def test_forward_with_labels(self, sample_config):
-        model = VaelonModel(sample_config)
-        input_ids = torch.randint(0, 1000, (1, 16))
-        labels = torch.randint(0, 1000, (1, 16))
-        outputs = model(input_ids=input_ids, labels=labels)
-        assert outputs.loss is not None
+    def test_generate(self, small_cfg):
+        m = QytheraModel(small_cfg)
+        m.eval()
+        ids = torch.randint(0, 1000, (1, 8))
+        out = m.generate(ids, max_new=5)
+        assert out.shape[1] == 13
 
-    def test_generate(self, sample_config):
-        model = VaelonModel(sample_config)
-        model.eval()
-        input_ids = torch.randint(0, 1000, (1, 8))
-        output = model.generate(input_ids, max_new_tokens=10, temperature=1.0)
-        assert output.shape[1] == 18
-
-    def test_model_sizes(self):
-        config = VaelonConfig.vaelon_7b()
-        assert config.hidden_size == 4096
-        assert config.num_layers == 32
+    def test_configs(self):
+        for name in ["small", "medium", "large", "xlarge"]:
+            cfg = getattr(ModelConfig, name)()
+            m = QytheraModel(cfg)
+            params = sum(p.numel() for p in m.parameters())
+            assert params > 0

@@ -1,3 +1,1 @@
-#!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python3 "$SCRIPT_DIR/main.py" "$@"
+#!/bin/bash\npython3 "$(dirname "$0")/main.py" "$@"\n
