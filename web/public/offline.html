@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#09090b">
+  <title>Qythera — Offline</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      min-height: 100vh; min-height: 100dvh;
+      background: #09090b;
+      color: #fafafa;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+      text-align: center;
+    }
+    .card {
+      max-width: 400px;
+      background: rgba(255,255,255,0.03);
+      backdrop-filter: blur(24px);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 20px;
+      padding: 40px 32px;
+    }
+    .icon {
+      width: 72px; height: 72px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, #7c3aed, #3b82f6);
+      display: flex; align-items: center; justify-content: center;
+      margin: 0 auto 24px;
+      box-shadow: 0 8px 32px rgba(124,58,237,0.3);
+      font-size: 32px; font-weight: 800; color: white;
+    }
+    h1 {
+      font-size: 20px; font-weight: 600; margin-bottom: 8px;
+      background: linear-gradient(135deg, #a78bfa, #60a5fa, #22d3ee);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    p { color: #a1a1aa; font-size: 14px; line-height: 1.6; margin-bottom: 24px; }
+    .btn {
+      display: inline-block; padding: 12px 28px;
+      background: linear-gradient(135deg, #7c3aed, #3b82f6);
+      border: none; border-radius: 12px; color: white;
+      font-family: inherit; font-weight: 500; font-size: 14px;
+      cursor: pointer; text-decoration: none;
+      transition: all 0.2s;
+    }
+    .btn:hover { opacity: 0.9; transform: translateY(-1px); box-shadow: 0 4px 20px rgba(124,58,237,0.4); }
+    .features { margin-top: 24px; text-align: left; }
+    .feature { display: flex; gap: 10px; align-items: start; margin-bottom: 12px; }
+    .feature-icon { font-size: 16px; margin-top: 1px; }
+    .feature-text { font-size: 13px; color: #71717a; }
+    @media (prefers-color-scheme: light) {
+      body { background: #fafafa; color: #18181b; }
+      .card { background: rgba(255,255,255,0.8); border-color: rgba(0,0,0,0.08); }
+      p, .feature-text { color: #52525b; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">Q</div>
+    <h1>You're Offline</h1>
+    <p>Qythera needs an internet connection to communicate with the inference server. Check your connection and try again.</p>
+    <a href="/" class="btn" onclick="location.reload(); return false;">Try Again</a>
+    <div class="features">
+      <div class="feature">
+        <span class="feature-icon">⚡</span>
+        <span class="feature-text">Custom autodiff engine — no external APIs</span>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">🧠</span>
+        <span class="feature-text">Vaelon MoE architecture with GQA + RoPE</span>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">🔒</span>
+        <span class="feature-text">Built-in safety: toxicity, jailbreak, PII detection</span>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

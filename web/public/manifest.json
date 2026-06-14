@@ -1,0 +1,58 @@
+{
+  "name": "Qythera AI — Production Superintelligence",
+  "short_name": "Qythera",
+  "description": "Ask anything. Code, analyze, create — powered by Vaelon model architecture with custom autodiff engine.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#09090b",
+  "theme_color": "#7c3aed",
+  "scope": "/",
+  "lang": "en",
+  "dir": "ltr",
+  "id": "/",
+  "prefer_related_applications": false,
+  "categories": ["productivity", "developer tools", "utilities"],
+  "shortcuts": [
+    {
+      "name": "New Chat",
+      "short_name": "Chat",
+      "url": "/?action=new",
+      "description": "Start a new conversation",
+      "icons": [{"src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png"}]
+    },
+    {
+      "name": "About Qythera",
+      "short_name": "About",
+      "url": "/?action=about",
+      "description": "Learn about Qythera architecture",
+      "icons": [{"src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png"}]
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/screenshots/desktop.png",
+      "sizes": "1280x720",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "Qythera Desktop Interface"
+    },
+    {
+      "src": "/screenshots/mobile.png",
+      "sizes": "390x844",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "Qythera Mobile Interface"
+    }
+  ],
+  "icons": [
+    {"src": "/icons/icon-72.png", "sizes": "72x72", "type": "image/png", "purpose": "any"},
+    {"src": "/icons/icon-96.png", "sizes": "96x96", "type": "image/png", "purpose": "any"},
+    {"src": "/icons/icon-128.png", "sizes": "128x128", "type": "image/png", "purpose": "any"},
+    {"src": "/icons/icon-144.png", "sizes": "144x144", "type": "image/png", "purpose": "any"},
+    {"src": "/icons/icon-152.png", "sizes": "152x152", "type": "image/png", "purpose": "any"},
+    {"src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/icons/icon-384.png", "sizes": "384x384", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}
