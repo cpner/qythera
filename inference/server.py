@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from core.model import VaelonModel, VaelonConfig
 from core.tokenizer.bpe import BPETokenizer
 from core.safety import SafetyModerator
+from core.intelligence import Intelligence
 
 
 class InferenceServer:
@@ -14,6 +15,7 @@ class InferenceServer:
         self.model = VaelonModel(self.config)
         self.tokenizer = BPETokenizer()
         self.safety = SafetyModerator()
+        self.ai = Intelligence()
         self.request_count = 0
         self.start_time = time.time()
 
@@ -22,27 +24,9 @@ class InferenceServer:
             safe, result = self.safety.filter_input(m.get("content", ""))
             if not safe:
                 return result
-
-        prompt = "\n".join(f"<|{m['role']}|>\n{m['content']}" for m in messages) + "\n<|assistant|>\n"
-        ids = self.tokenizer.encode(prompt, add_special=False)
-        if not ids:
-            ids = [0]
-
-        try:
-            generated = VaelonModel.generate_ids(
-                self.model, ids, max_new=min(max_tokens, 128),
-                temp=max(temperature, 0.1), top_k=top_k, top_p=top_p
-            )
-            response = self.tokenizer.decode(generated, skip_special=True)
-            if prompt in response:
-                response = response[len(prompt):]
-            response = response.strip()
-            if not response or "\n" not in response:
-                response = self._template_response(messages)
-            return response
-        except Exception:
-            return self._template_response(messages)
-
+        last_msg = messages[-1].get("content", "") if messages else ""
+        history = messages[:-1] if len(messages) > 1 else None
+        return self.ai.respond(last_msg, history)
     def _template_response(self, messages):
         last = messages[-1].get("content", "").lower() if messages else ""
         if any(w in last for w in ["hello", "hi", "hey", "привет"]):
