@@ -87,8 +87,8 @@ function getAnswer($question) {
 // Handle API requests
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $input = json_decode(file_get_contents('php://input'), true);
-    $messages = $input['messages'] ?? [];
-    $lastMsg = end($messages)['content'] ?? '';
+    $messages = (isset($input['messages']) ? $input['messages'] : []);
+    $lastMsg = (isset(end($messages)['content']) ? end($messages)['content'] : '');
     
     $response = getAnswer($lastMsg);
     
