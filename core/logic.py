@@ -230,7 +230,7 @@ class ModalLogic:
     def __init__(self):
         self.worlds: List[str] = []
         self.accessibility: Dict[str, Set[str]] = {}
-        self-valuations: Dict[str, Dict[str, bool]] = {}
+        self.valuations: Dict[str, Dict[str, bool]] = {}
 
     def add_world(self, world: str):
         if world not in self.worlds:
