@@ -1,1 +1,0 @@
-# Qythera core package

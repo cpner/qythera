@@ -12,7 +12,7 @@ import numpy as np
 
 def _load_model(model_path: Optional[str] = None):
     try:
-        from core.model import Transformer, TransformerConfig
+        from qythera.model import Transformer, TransformerConfig
         cfg = TransformerConfig()
         model = Transformer(cfg)
         if model_path and os.path.exists(model_path):
@@ -28,7 +28,7 @@ def _load_model(model_path: Optional[str] = None):
 
 def _load_tokenizer(tokenizer_path: Optional[str] = None):
     try:
-        from core.tokenizer import BPETokenizer
+        from qythera.tokenizer import BPETokenizer
         tok = BPETokenizer()
         if tokenizer_path and os.path.exists(tokenizer_path):
             tok.load(tokenizer_path)
@@ -87,8 +87,8 @@ def cmd_train(args):
         return
 
     try:
-        from core.tensor import Tensor
-        from core.optim import AdamW
+        from qythera.tensor import Tensor
+        from qythera.optim import AdamW
     except ImportError as e:
         print(f"Error importing optimizer: {e}")
         return
@@ -164,7 +164,7 @@ def cmd_infer(args):
         return
 
     try:
-        from core.tensor import Tensor
+        from qythera.tensor import Tensor
         tokens = tokenizer.encode(prompt)
         if not isinstance(tokens, list):
             tokens = [tokens]
@@ -240,7 +240,7 @@ def cmd_quantize(args):
     print(f"Quantizing {model_path} to {bits}-bit")
 
     try:
-        from core.quantize import quantize_model
+        from qythera.training.quantize import quantize_model
         quantize_model(model_path, output_path, bits=bits)
         print(f"Quantized model saved to {output_path}")
     except (ImportError, Exception):
@@ -271,7 +271,7 @@ def cmd_quantize(args):
 # ---------------------------------------------------------------------------
 
 def cmd_serve(args):
-    from core.server import main as server_main
+    from qythera.server import main as server_main
     sys.argv = ["server.py", "--port", str(args.port)]
     if args.model_path:
         sys.argv.extend(["--model-path", args.model_path])
@@ -299,8 +299,8 @@ def cmd_finetune(args):
         return
 
     try:
-        from core.tensor import Tensor
-        from core.optim import AdamW
+        from qythera.tensor import Tensor
+        from qythera.optim import AdamW
     except ImportError as e:
         print(f"Error importing optimizer: {e}")
         return
@@ -352,7 +352,7 @@ def cmd_evaluate(args):
         return
 
     try:
-        from core.tensor import Tensor
+        from qythera.tensor import Tensor
     except ImportError:
         print("Tensor module not available.")
         return
@@ -398,7 +398,7 @@ def cmd_benchmark(args):
         return
 
     try:
-        from core.tensor import Tensor
+        from qythera.tensor import Tensor
     except ImportError:
         print("Tensor module not available.")
         return

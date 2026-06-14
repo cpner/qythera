@@ -5,7 +5,7 @@ import weakref
 from collections import OrderedDict
 from contextlib import contextmanager
 from functools import lru_cache
-from core.tensor import Tensor, no_grad, zeros, ones, randn, eye
+from qythera.tensor import Tensor, no_grad, zeros, ones, randn, eye
 
 # ---------------------------------------------------------------------------
 # Weight initialization

@@ -1,7 +1,15 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+dist/
+build/
 .venv/
 models/*/model.npz
 .env
-.DS_Store
+.DS_Store__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/

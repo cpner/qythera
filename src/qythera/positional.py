@@ -1,7 +1,7 @@
 """Positional encodings: RoPE, YaRN, ALiBi, sinusoidal, learned. Pure Python + NumPy."""
 import math
 import numpy as np
-from core.tensor import Tensor
+from qythera.tensor import Tensor
 
 def _rotate_half(x):
     x1 = x[..., ::2]

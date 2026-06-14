@@ -3,7 +3,7 @@ import math
 import copy
 import numpy as np
 from collections import OrderedDict
-from core.tensor import Tensor, no_grad
+from qythera.tensor import Tensor, no_grad
 
 # ---------------------------------------------------------------------------
 # Base Optimizer

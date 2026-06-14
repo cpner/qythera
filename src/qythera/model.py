@@ -5,13 +5,13 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
-from core.tensor import Tensor, no_grad, zeros, ones, arange
-from core.nn import (
+from qythera.tensor import Tensor, no_grad, zeros, ones, arange
+from qythera.nn import (
     Module, Linear, Embedding, RMSNorm as NNRMSNorm, Dropout,
     ModuleList, Sequential, LayerNorm, GELU as NNGELU, SiLU as NNSiLU,
     ReLU as NNReLU,
 )
-from core.positional import RoPE, ALiBi, SinusoidalPE
+from qythera.positional import RoPE, ALiBi, SinusoidalPE
 
 
 # ---------------------------------------------------------------------------

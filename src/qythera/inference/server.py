@@ -10,18 +10,8 @@ import queue
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
-    import importlib.util
-    def _load_module(name, path):
-        spec = importlib.util.spec_from_file_location(name, path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    _dir = os.path.dirname(os.path.abspath(__file__))
-    _model_mod = _load_module('core.model', os.path.join(_dir, 'model.py'))
-    Transformer = getattr(_model_mod, 'Transformer', None)
-    TransformerConfig = getattr(_model_mod, 'TransformerConfig', None)
-    _tok_mod = _load_module('core.tokenizer', os.path.join(_dir, 'tokenizer.py'))
-    BPETokenizer = getattr(_tok_mod, 'BPETokenizer', None)
+    from qythera.model import Transformer, TransformerConfig
+    from qythera.tokenizer import BPETokenizer
 except Exception:
     Transformer = None
     TransformerConfig = None
@@ -271,7 +261,7 @@ class RouteHandler:
         return ResponseBuilder.not_found()
 
     def _serve_ui(self, request: Dict) -> bytes:
-        ui_path = os.path.join(BASE, "ui.html")
+        ui_path = os.path.join(os.path.dirname(BASE), "web", "ui.html")
         try:
             with open(ui_path, 'r') as f:
                 return ResponseBuilder.html(f.read())
@@ -333,7 +323,7 @@ class RouteHandler:
             try:
                 tokens = self.tokenizer.encode(prompt)
                 input_arr = np.array([tokens], dtype=np.int32) if hasattr(tokens, '__iter__') else np.array([[tokens]], dtype=np.int32)
-                from core.tensor import Tensor
+                from qythera.tensor import Tensor
                 inp = Tensor(input_arr)
                 output = self.model.forward(inp)
                 if hasattr(output, 'data'):
@@ -350,7 +340,9 @@ class RouteHandler:
         return f"Qythera received: {prompt}"
 
     def _serve_static(self, path: str, content_type: str) -> bytes:
-        file_path = os.path.join(BASE, path)
+        # Serve icons from the root icons/ directory
+        icons_dir = os.path.join(os.path.dirname(os.path.dirname(BASE)), "icons")
+        file_path = os.path.join(icons_dir, path)
         if os.path.exists(file_path):
             with open(file_path, 'rb') as f:
                 data = f.read()
@@ -493,7 +485,7 @@ def main():
             cfg = TransformerConfig()
             model = Transformer(cfg)
             if os.path.exists(args.model_path):
-                from core.tensor import Tensor
+                from qythera.tensor import Tensor
                 state = np.load(args.model_path, allow_pickle=True).item()
                 for name, param in model.parameters():
                     if name in state:

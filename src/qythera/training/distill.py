@@ -4,8 +4,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from core.tensor import Tensor
-from core.nn import Module, Linear
+from qythera.tensor import Tensor
+from qythera.nn import Module, Linear
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +170,7 @@ class DistillationTrainer:
 
 class _no_grad_context:
     def __enter__(self):
-        from core.tensor import no_grad
+        from qythera.tensor import no_grad
         self.ctx = no_grad()
         self.ctx.__enter__()
         return self

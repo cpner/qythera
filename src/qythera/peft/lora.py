@@ -3,8 +3,8 @@ import numpy as np
 import math
 from collections import OrderedDict
 
-from core.tensor import Tensor, no_grad, randn, zeros, ones, eye
-from core.nn import Module, Linear
+from qythera.tensor import Tensor, no_grad, randn, zeros, ones, eye
+from qythera.nn import Module, Linear
 
 
 # ---------------------------------------------------------------------------

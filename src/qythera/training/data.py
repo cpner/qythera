@@ -10,7 +10,7 @@ from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 
-from core.tensor import Tensor
+from qythera.tensor import Tensor
 
 
 # ---------------------------------------------------------------------------
