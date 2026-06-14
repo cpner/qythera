@@ -1750,6 +1750,481 @@ class MixtureOfDepths(Module):
 
 
 # ---------------------------------------------------------------------------
+# SparseAttention (Longformer-style)
+# ---------------------------------------------------------------------------
+
+class SparseAttention(Module):
+    def __init__(self, config: TransformerConfig, window_size: int = 256, num_global_tokens: int = 1):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** -0.5
+        self.window_size = window_size
+        self.num_global_tokens = num_global_tokens
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.wq = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wk = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.wv = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.wo = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+    def _sparse_mask(self, S: int) -> np.ndarray:
+        mask = np.zeros((S, S), dtype=np.bool_)
+        for i in range(S):
+            start = max(0, i - self.window_size)
+            end = min(S, i + self.window_size + 1)
+            mask[i, start:end] = True
+            mask[:self.num_global_tokens, i] = True
+            mask[i, :self.num_global_tokens] = True
+        return mask
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        q = self.wq(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.wk(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.wv(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        if self.num_kv_groups > 1:
+            k = Tensor(np.repeat(k.data, self.num_kv_groups, axis=1), requires_grad=k.requires_grad)
+            v = Tensor(np.repeat(v.data, self.num_kv_groups, axis=1), requires_grad=v.requires_grad)
+
+        q_scaled = Tensor(q.data * self.scaling, requires_grad=q.requires_grad)
+        k_t = Tensor(k.data.transpose(0, 1, 3, 2), requires_grad=k.requires_grad)
+        attn = q_scaled.matmul(k_t)
+
+        sparse_mask = self._sparse_mask(L)
+        attn = Tensor(np.where(sparse_mask[None, None, :, :], attn.data, -1e9),
+                       requires_grad=attn.requires_grad)
+
+        if mask is not None:
+            mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
+            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+                           requires_grad=attn.requires_grad)
+
+        attn = attn.softmax(axis=-1)
+        out = attn.matmul(v)
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        return self.wo(out)
+
+
+# ---------------------------------------------------------------------------
+# BigBirdAttention (random + window + global)
+# ---------------------------------------------------------------------------
+
+class BigBirdAttention(Module):
+    def __init__(self, config: TransformerConfig, window_size: int = 64, num_random: int = 64, num_global: int = 2):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** -0.5
+        self.window_size = window_size
+        self.num_random = num_random
+        self.num_global = num_global
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.wq = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wk = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.wv = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.wo = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+        self._random_mask_cache = {}
+
+    def _bigbird_mask(self, S: int) -> np.ndarray:
+        if S in self._random_mask_cache:
+            return self._random_mask_cache[S]
+        mask = np.zeros((S, S), dtype=np.bool_)
+        for i in range(S):
+            start = max(0, i - self.window_size)
+            end = min(S, i + self.window_size + 1)
+            mask[i, start:end] = True
+            mask[:self.num_global, :] = True
+            mask[:, :self.num_global] = True
+            n_rand = min(self.num_random, S)
+            rand_idx = np.random.choice(S, size=n_rand, replace=False)
+            mask[i, rand_idx] = True
+        self._random_mask_cache[S] = mask
+        return mask
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        q = self.wq(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.wk(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.wv(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        if self.num_kv_groups > 1:
+            k = Tensor(np.repeat(k.data, self.num_kv_groups, axis=1), requires_grad=k.requires_grad)
+            v = Tensor(np.repeat(v.data, self.num_kv_groups, axis=1), requires_grad=v.requires_grad)
+
+        q_scaled = Tensor(q.data * self.scaling, requires_grad=q.requires_grad)
+        k_t = Tensor(k.data.transpose(0, 1, 3, 2), requires_grad=k.requires_grad)
+        attn = q_scaled.matmul(k_t)
+
+        bb_mask = self._bigbird_mask(L)
+        attn = Tensor(np.where(bb_mask[None, None, :, :], attn.data, -1e9),
+                       requires_grad=attn.requires_grad)
+
+        if mask is not None:
+            mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
+            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+                           requires_grad=attn.requires_grad)
+
+        attn = attn.softmax(axis=-1)
+        out = attn.matmul(v)
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        return self.wo(out)
+
+
+# ---------------------------------------------------------------------------
+# RingAttention (simulated ring exchange with online softmax)
+# ---------------------------------------------------------------------------
+
+class RingAttention(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** -0.5
+        self.num_workers = 2
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.wq = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.wk = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.wv = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.wo = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        q = self.wq(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.wk(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.wv(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        if self.num_kv_groups > 1:
+            k = Tensor(np.repeat(k.data, self.num_kv_groups, axis=1), requires_grad=k.requires_grad)
+            v = Tensor(np.repeat(v.data, self.num_kv_groups, axis=1), requires_grad=v.requires_grad)
+
+        n_workers = min(self.num_workers, L)
+        chunk_size = L // n_workers
+        if chunk_size == 0:
+            chunk_size = 1
+            n_workers = L
+
+        output = np.zeros_like(q.data)
+        m_prev = np.full((B, self.num_heads, L, 1), -np.inf, dtype=np.float32)
+        l_prev = np.zeros((B, self.num_heads, L, 1), dtype=np.float32)
+
+        for ring_step in range(n_workers):
+            k_chunk = k.data[:, :, ring_step * chunk_size:(ring_step + 1) * chunk_size, :]
+            v_chunk = v.data[:, :, ring_step * chunk_size:(ring_step + 1) * chunk_size, :]
+            if k_chunk.shape[2] == 0:
+                continue
+
+            scores = np.einsum('bhid,bhjd->bhij', q.data * self.scaling, k_chunk)
+
+            if mask is not None:
+                mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
+                chunk_mask = mask_exp[:, :, :, ring_step * chunk_size:(ring_step + 1) * chunk_size]
+                if chunk_mask.shape[-1] == scores.shape[-1]:
+                    scores = np.where(chunk_mask, scores, -1e9)
+
+            m_curr = scores.max(axis=-1, keepdims=True)
+            m_new = np.maximum(m_prev, m_curr)
+            exp_scores = np.exp(scores - m_new)
+            l_new = l_prev * np.exp(m_prev - m_new) + exp_scores.sum(axis=-1, keepdims=True)
+            output = output * (l_prev * np.exp(m_prev - m_new) / l_new) + \
+                     np.einsum('bhij,bhjd->bhid', exp_scores, v_chunk) / l_new
+            m_prev = m_new
+            l_prev = l_new
+
+        out = Tensor(output.transpose(0, 2, 1, 3).reshape(B, L, self.num_heads * self.head_dim),
+                      requires_grad=q.requires_grad)
+        return self.wo(out)
+
+
+# ---------------------------------------------------------------------------
+# GShard MoE (top-1 routing with capacity factor)
+# ---------------------------------------------------------------------------
+
+class GShardMoE(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_experts = config.num_experts if config.num_experts > 0 else 8
+        self.capacity_factor = config.switch_capacity_factor
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.gate = Linear(self.embed_dim, self.num_experts, bias=False)
+        self.experts = ModuleList([
+            FeedForward(config) for _ in range(self.num_experts)
+        ])
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        x_flat = x.reshape(B * L, D)
+        total_tokens = x_flat.shape[0]
+
+        router_logits = self.gate(x_flat)
+        router_probs = router_logits.softmax(axis=-1)
+        topk_vals, topk_idx = router_probs.topk(1, dim=-1)
+
+        capacity = int(total_tokens * self.capacity_factor / self.num_experts)
+        out = np.zeros((total_tokens, D), dtype=np.float32)
+        expert_counts = np.zeros(self.num_experts, dtype=np.int32)
+
+        for t in range(total_tokens):
+            e = int(topk_idx.data[t, 0])
+            if expert_counts[e] < capacity:
+                expert_counts[e] += 1
+                x_t = Tensor(x_flat.data[t:t+1])
+                expert_out = self.experts[e](x_t)
+                w = topk_vals.data[t, 0]
+                out[t] = expert_out.data[0] * w
+
+        return Tensor(out.reshape(B, L, D), requires_grad=x.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# GLaM MoE (64 experts, 2 activated)
+# ---------------------------------------------------------------------------
+
+class GLaMMoE(Module):
+    def __init__(self, config: TransformerConfig, num_experts: int = 64, num_activated: int = 2):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_experts = num_experts
+        self.num_activated = num_activated
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.gate = Linear(self.embed_dim, self.num_experts, bias=False)
+        self.experts = ModuleList([
+            FeedForward(config) for _ in range(self.num_experts)
+        ])
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        x_flat = x.reshape(B * L, D)
+
+        router_logits = self.gate(x_flat)
+        router_probs = router_logits.softmax(axis=-1)
+
+        k = min(self.num_activated, self.num_experts)
+        topk_vals, topk_idx = router_probs.topk(k, dim=-1)
+
+        out = np.zeros((x_flat.shape[0], D), dtype=np.float32)
+
+        for e in range(self.num_experts):
+            mask_e = (topk_idx.data == e).any(axis=-1)
+            if not mask_e.any():
+                continue
+            idx = np.where(mask_e)[0]
+            x_e = Tensor(x_flat.data[idx])
+            expert_out = self.experts[e](x_e)
+            for j in range(k):
+                mask = (topk_idx.data[:, j] == e) & mask_e
+                if mask.any():
+                    w = topk_vals.data[mask, j:j+1]
+                    n = mask.sum()
+                    out[mask] += (expert_out.data[:n] * w).astype(np.float32)
+
+        return Tensor(out.reshape(B, L, D), requires_grad=x.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# SoftMoE (soft routing via weighted average)
+# ---------------------------------------------------------------------------
+
+class SoftMoE(Module):
+    def __init__(self, config: TransformerConfig, num_experts: int = 8):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_experts = num_experts
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.gate = Linear(self.embed_dim, self.num_experts, bias=False)
+        self.experts = ModuleList([
+            FeedForward(config) for _ in range(self.num_experts)
+        ])
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        x_flat = x.reshape(B * L, D)
+
+        router_logits = self.gate(x_flat)
+        router_probs = router_logits.softmax(axis=-1)
+
+        out = np.zeros((x_flat.shape[0], D), dtype=np.float32)
+        for e in range(self.num_experts):
+            weights = router_probs.data[:, e:e+1]
+            x_e = Tensor(x_flat.data * weights)
+            expert_out = self.experts[e](x_e)
+            out += expert_out.data * weights
+
+        return Tensor(out.reshape(B, L, D), requires_grad=x.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive Computation Time (ACT)
+# ---------------------------------------------------------------------------
+
+class AdaptiveComputationTime(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.halting_prob = Linear(config.embed_dim, 1, bias=False)
+
+        if config.norm_type == "rms":
+            self.norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        else:
+            self.norm = LayerNorm(config.embed_dim)
+
+        self.ffn = FeedForward(config)
+        self.attn_norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps) if config.norm_type == "rms" else LayerNorm(config.embed_dim)
+
+    def forward(self, x: Tensor, max_steps: int = 10) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        output = np.zeros_like(x.data)
+        remainder = np.ones((B, L, 1), dtype=np.float32)
+        accumulated = np.zeros((B, L, 1), dtype=np.float32)
+
+        for step in range(max_steps):
+            normed = self.norm(Tensor(x.data + output))
+            halt_logits = self.halting_prob(normed)
+            halt_prob = 1.0 / (1.0 + np.exp(-halt_logits.data))
+
+            p = halt_prob * remainder
+            remainder = remainder * (1.0 - halt_prob)
+
+            normed2 = self.attn_norm(Tensor(x.data + output))
+            step_out = self.ffn(normed2)
+
+            output = output + step_out.data * p
+
+            if remainder.sum() < 1e-6:
+                break
+
+        output = output + x.data * remainder
+        return Tensor(output, requires_grad=x.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# Universal Transformer (shared weights across depth)
+# ---------------------------------------------------------------------------
+
+class UniversalTransformer(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.shared_block = TransformerBlock(config, 0)
+        self.act = AdaptiveComputationTime(config)
+
+        if config.norm_type == "rms":
+            self.norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        else:
+            self.norm = LayerNorm(config.embed_dim)
+        self.head = Linear(config.embed_dim, config.vocab_size, bias=False)
+
+    def forward(self, x: Tensor, mask=None, max_steps: int = 6) -> Tensor:
+        if isinstance(x, np.ndarray):
+            x = Tensor(x)
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        h = x
+
+        for _ in range(max_steps):
+            block_out, _ = self.shared_block(h)
+            h = block_out
+
+        h = self.act(h)
+        h = self.norm(h)
+        return self.head(h)
+
+
+# ---------------------------------------------------------------------------
+# MixtralMoE (interleaved every other layer)
+# ---------------------------------------------------------------------------
+
+class MixtralMoE(Module):
+    def __init__(self, config: TransformerConfig, num_experts: int = 8, num_activated: int = 2):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_experts = num_experts
+        self.num_activated = num_activated
+        self.num_layers = config.num_layers
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.head = Linear(config.embed_dim, config.vocab_size, bias=False)
+
+        self.attn_blocks = ModuleList([
+            TransformerBlock(config, i) for i in range(self.num_layers)
+        ])
+
+        self.moe_layers = ModuleList()
+        for _ in range(self.num_layers // 2):
+            self.moe_layers.append(
+                GLaMMoE(config, num_experts=num_experts, num_activated=num_activated)
+            )
+
+        if config.norm_type == "rms":
+            self.norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        else:
+            self.norm = LayerNorm(config.embed_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if isinstance(x, np.ndarray):
+            x = Tensor(x)
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        h = x
+
+        moe_idx = 0
+        for i in range(self.num_layers):
+            h, _ = self.attn_blocks[i](h)
+            if i % 2 == 1 and moe_idx < len(self.moe_layers):
+                h = self.moe_layers[moe_idx](h)
+                moe_idx += 1
+
+        h = self.norm(h)
+        return self.head(h)
+
+
+# ---------------------------------------------------------------------------
 # Transformer
 # ---------------------------------------------------------------------------
 

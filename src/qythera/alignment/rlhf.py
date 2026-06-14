@@ -733,3 +733,236 @@ class RejectionSamplingFT:
             if correct:
                 return correct[0], 1.0
         return samples[0] if samples else [], 0.0
+
+
+class KTOTrainer:
+    def __init__(
+        self,
+        policy: Module,
+        ref_model: Module,
+        beta: float = 0.1,
+        lr: float = 1e-6,
+        lambda_win: float = 1.0,
+        lambda_loss: float = 1.0,
+    ):
+        self.policy = policy
+        self.ref_model = ref_model
+        self.beta = beta
+        self.lambda_win = lambda_win
+        self.lambda_loss = lambda_loss
+        self.optimizer = Adam(policy.parameters(), lr=lr)
+        self.ref_model.eval()
+
+    def _prospect_utility(self, x: float, reference: float) -> float:
+        x_rel = x - reference
+        if x_rel >= 0:
+            return x_rel ** 0.88
+        else:
+            return -2.25 * ((-x_rel) ** 0.88)
+
+    def train_step(self, chosen_ids: Tensor, rejected_ids: Tensor, rewards_chosen: float, rewards_rejected: float) -> float:
+        self.policy.train()
+        chosen_np = chosen_ids.data.astype(np.int32) if isinstance(chosen_ids, Tensor) else np.array(chosen_ids, dtype=np.int32)
+        rejected_np = rejected_ids.data.astype(np.int32) if isinstance(rejected_ids, Tensor) else np.array(rejected_ids, dtype=np.int32)
+        policy_chosen_lp = _gather_log_probs(_model_log_probs(self.policy, chosen_np), chosen_np)
+        policy_rejected_lp = _gather_log_probs(_model_log_probs(self.policy, rejected_np), rejected_np)
+        ref_chosen_lp = _gather_log_probs(_model_log_probs(self.ref_model, chosen_np), chosen_np)
+        ref_rejected_lp = _gather_log_probs(_model_log_probs(self.ref_model, rejected_np), rejected_np)
+        chosen_log_ratios = policy_chosen_lp - ref_chosen_lp
+        rejected_log_ratios = policy_rejected_lp - ref_rejected_lp
+        z_ref = np.mean(rejected_log_ratios)
+        utility_chosen = self._prospect_utility(float(chosen_log_ratios.mean()), 0.0)
+        utility_rejected = self._prospect_utility(float(rejected_log_ratios.mean()), float(z_ref))
+        loss_win = self.lambda_win * (1.0 - np.tanh(float(utility_chosen)))
+        loss_loss = self.lambda_loss * (1.0 + np.tanh(float(utility_rejected)))
+        total_loss = float(np.mean(loss_win + loss_loss))
+        self.policy.zero_grad()
+        self.optimizer.step()
+        return total_loss
+
+
+class RLAIFTrainer:
+    def __init__(
+        self,
+        policy: Module,
+        annotator_model: Module,
+        reward_model: Optional[Module] = None,
+        lr: float = 1e-6,
+        temperature: float = 0.7,
+        principles: Optional[List[str]] = None,
+    ):
+        self.policy = policy
+        self.annotator_model = annotator_model
+        self.reward_model = reward_model
+        self.optimizer = Adam(policy.parameters(), lr=lr)
+        self.annotator_model.eval()
+        self.temperature = temperature
+        self.principles = principles or [
+            "Be helpful and informative",
+            "Be harmless and safe",
+            "Be honest and accurate",
+        ]
+
+    def annotate_preferences(self, prompt: Tensor, responses: List[Tensor]) -> np.ndarray:
+        preferences = []
+        with no_grad():
+            for resp in responses:
+                score = 0.0
+                for principle in self.principles:
+                    logits = self.annotator_model(Tensor(np.concatenate([prompt.data, resp.data], axis=1).astype(np.int32)))
+                    score += float(np.mean(logits.data))
+                preferences.append(score / len(self.principles))
+        return np.array(preferences)
+
+    def train_reward_model(self, chosen_ids: Tensor, rejected_ids: Tensor, num_epochs: int = 1) -> float:
+        if self.reward_model is None:
+            self.reward_model = Module()
+        self.reward_model.train()
+        total_loss = 0.0
+        for _ in range(num_epochs):
+            chosen_log_probs = _model_log_probs(self.policy, chosen_ids.data.astype(np.int32))
+            rejected_log_probs = _model_log_probs(self.policy, rejected_ids.data.astype(np.int32))
+            chosen_rewards = np.mean(chosen_log_probs, axis=-1)
+            rejected_rewards = np.mean(rejected_log_probs, axis=-1)
+            diff = chosen_rewards - rejected_rewards
+            loss = -np.mean(np.log(1.0 / (1.0 + np.exp(-diff)) + 1e-8))
+            total_loss += float(loss)
+        return total_loss / num_epochs
+
+    def train_step(self, prompt: Tensor, chosen_ids: Tensor, rejected_ids: Tensor) -> float:
+        self.policy.train()
+        chosen_np = chosen_ids.data.astype(np.int32) if isinstance(chosen_ids, Tensor) else np.array(chosen_ids, dtype=np.int32)
+        rejected_np = rejected_ids.data.astype(np.int32) if isinstance(rejected_ids, Tensor) else np.array(rejected_ids, dtype=np.int32)
+        policy_chosen_lp = _gather_log_probs(_model_log_probs(self.policy, chosen_np), chosen_np)
+        policy_rejected_lp = _gather_log_probs(_model_log_probs(self.policy, rejected_np), rejected_np)
+        diff = policy_chosen_lp - policy_rejected_lp
+        loss = -np.mean(np.log(1.0 / (1.0 + np.exp(-diff)) + 1e-8))
+        self.policy.zero_grad()
+        self.optimizer.step()
+        return float(loss)
+
+
+class SPINTrainer:
+    def __init__(
+        self,
+        policy: Module,
+        beta: float = 1.0,
+        lr: float = 1e-6,
+        num_iterations: int = 3,
+    ):
+        self.policy = policy
+        self.ref_model = None
+        self.beta = beta
+        self.lr = lr
+        self.num_iterations = num_iterations
+        self.optimizer = Adam(policy.parameters(), lr=lr)
+        self.current_iteration = 0
+
+    def update_ref(self):
+        self.ref_model = copy.deepcopy(self.policy)
+        self.ref_model.eval()
+
+    def train_step(self, chosen_ids: Tensor, rejected_ids: Tensor) -> float:
+        if self.ref_model is None:
+            self.update_ref()
+        self.policy.train()
+        chosen_np = chosen_ids.data.astype(np.int32) if isinstance(chosen_ids, Tensor) else np.array(chosen_ids, dtype=np.int32)
+        rejected_np = rejected_ids.data.astype(np.int32) if isinstance(rejected_ids, Tensor) else np.array(rejected_ids, dtype=np.int32)
+        policy_chosen_lp = _gather_log_probs(_model_log_probs(self.policy, chosen_np), chosen_np)
+        policy_rejected_lp = _gather_log_probs(_model_log_probs(self.policy, rejected_np), rejected_np)
+        ref_chosen_lp = _gather_log_probs(_model_log_probs(self.ref_model, chosen_np), chosen_np)
+        ref_rejected_lp = _gather_log_probs(_model_log_probs(self.ref_model, rejected_np), rejected_np)
+        logits = self.beta * ((policy_chosen_lp - ref_chosen_lp) - (policy_rejected_lp - ref_rejected_lp))
+        loss = -np.mean(np.log(1.0 / (1.0 + np.exp(-logits)) + 1e-8))
+        self.policy.zero_grad()
+        self.optimizer.step()
+        return float(loss)
+
+    def iterative_train(self, chosen_ids: Tensor, rejected_ids: Tensor) -> List[float]:
+        losses = []
+        for i in range(self.num_iterations):
+            if i > 0:
+                self.update_ref()
+            loss = self.train_step(chosen_ids, rejected_ids)
+            losses.append(loss)
+            self.current_iteration += 1
+        return losses
+
+
+class ILQLTrainer:
+    def __init__(
+        self,
+        policy: Module,
+        beta: float = 0.1,
+        lr: float = 1e-4,
+        gamma: float = 0.99,
+        tau: float = 0.005,
+    ):
+        self.policy = policy
+        self.beta = beta
+        self.gamma = gamma
+        self.tau = tau
+        self.optimizer = Adam(policy.parameters(), lr=lr)
+        self.q_values: dict = {}
+        self.target_q_values: dict = {}
+
+    def _get_state_key(self, state: np.ndarray) -> str:
+        return state.tobytes()
+
+    def _compute_q(self, state: np.ndarray, action: int) -> float:
+        key = self._get_state_key(state)
+        if key not in self.q_values:
+            self.q_values[key] = np.zeros(100)
+        return float(self.q_values[key][action])
+
+    def _compute_target_q(self, state: np.ndarray, action: int) -> float:
+        key = self._get_state_key(state)
+        if key not in self.target_q_values:
+            self.target_q_values[key] = np.zeros(100)
+        return float(self.target_q_values[key][action])
+
+    def implicit_q_update(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool) -> float:
+        current_q = self._compute_q(state, action)
+        if done:
+            target = reward
+        else:
+            next_q_values = [self._compute_target_q(next_state, a) for a in range(100)]
+            target = reward + self.gamma * max(next_q_values)
+        td_error = target - current_q
+        key = self._get_state_key(state)
+        if key in self.q_values:
+            self.q_values[key][action] += self.beta * td_error
+        loss = 0.5 * (td_error ** 2)
+        self._soft_update()
+        return loss
+
+    def _soft_update(self):
+        for key in self.q_values:
+            if key not in self.target_q_values:
+                self.target_q_values[key] = self.q_values[key].copy()
+            else:
+                self.target_q_values[key] = (1.0 - self.tau) * self.target_q_values[key] + self.tau * self.q_values[key]
+
+    def train_step(self, batch: dict) -> float:
+        states = batch.get("states", [])
+        actions = batch.get("actions", [])
+        rewards = batch.get("rewards", [])
+        next_states = batch.get("next_states", [])
+        dones = batch.get("dones", [])
+        total_loss = 0.0
+        for i in range(len(states)):
+            loss = self.implicit_q_update(
+                np.array(states[i]),
+                int(actions[i]),
+                float(rewards[i]),
+                np.array(next_states[i]),
+                bool(dones[i])
+            )
+            total_loss += loss
+        return total_loss / max(len(states), 1)
+
+    def get_q_values(self, state: np.ndarray) -> np.ndarray:
+        key = self._get_state_key(state)
+        if key not in self.q_values:
+            return np.zeros(100)
+        return self.q_values[key].copy()

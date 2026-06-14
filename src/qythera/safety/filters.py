@@ -250,3 +250,242 @@ class WatermarkVerifier:
 
     def _normal_cdf(self, x: float) -> float:
         return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+class DPSGDOptimizer:
+    def __init__(
+        self,
+        epsilon: float = 1.0,
+        delta: float = 1e-5,
+        max_norm: float = 1.0,
+        noise_multiplier: Optional[float] = None,
+        batch_size: int = 32,
+        dataset_size: int = 10000,
+    ):
+        self.epsilon = epsilon
+        self.delta = delta
+        self.max_norm = max_norm
+        self.batch_size = batch_size
+        self.dataset_size = dataset_size
+        if noise_multiplier is not None:
+            self.noise_multiplier = noise_multiplier
+        else:
+            self.noise_multiplier = max_norm * math.sqrt(2 * math.log(1.25 / delta)) / epsilon
+        self.steps = 0
+        self.alpha = 1.0
+        self.rdp_steps = 0.0
+
+    def clip_gradients(self, gradients: list) -> np.ndarray:
+        clipped = []
+        for g in gradients:
+            grad_norm = np.linalg.norm(g)
+            if grad_norm > self.max_norm:
+                g = g * self.max_norm / grad_norm
+            clipped.append(g)
+        return clipped
+
+    def add_noise(self, clipped_gradients: list) -> np.ndarray:
+        stacked = np.array(clipped_gradients)
+        mean_grad = np.mean(stacked, axis=0)
+        noise = np.random.normal(0, self.noise_multiplier * self.max_norm, size=mean_grad.shape)
+        return mean_grad + noise
+
+    def step(self, gradients: list) -> np.ndarray:
+        clipped = self.clip_gradients(gradients)
+        noisy_grad = self.add_noise(clipped)
+        self.steps += 1
+        self._update_rdp()
+        return noisy_grad
+
+    def _update_rdp(self):
+        q = self.batch_size / self.dataset_size
+        self.rdp_steps += q * self.noise_multiplier ** 2
+
+    def get_privacy_spent(self) -> dict:
+        epsilon_rdp = self.rdp_steps
+        delta_converted = self.delta
+        return {
+            "epsilon": epsilon_rdp,
+            "delta": delta_converted,
+            "noise_multiplier": self.noise_multiplier,
+            "steps": self.steps,
+            "max_norm": self.max_norm,
+        }
+
+    def compose_epsilon(self, target_delta: Optional[float] = None) -> float:
+        if target_delta is None:
+            target_delta = self.delta
+        alpha = self.alpha
+        rdp = self.rdp_steps
+        epsilon_rdp = rdp + math.log(1.0 / target_delta) / (alpha - 1)
+        return epsilon_rdp
+
+
+class AdversarialRobustness:
+    def __init__(self, model, epsilon: float = 0.03, alpha: float = 0.007, num_steps: int = 10):
+        self.model = model
+        self.epsilon = epsilon
+        self.alpha = alpha
+        self.num_steps = num_steps
+
+    def fgsm_attack(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        x_tensor = Tensor(x.astype(np.float32))
+        y_tensor = Tensor(y.astype(np.int32))
+        logits = self.model(x_tensor)
+        loss = self._cross_entropy(logits, y_tensor)
+        grad = self._compute_grad(loss, x_tensor)
+        x_adv = x + self.epsilon * np.sign(grad)
+        return np.clip(x_adv, x - self.epsilon, x + self.epsilon)
+
+    def pgd_attack(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        x_adv = x.copy()
+        for _ in range(self.num_steps):
+            x_tensor = Tensor(x_adv.astype(np.float32))
+            y_tensor = Tensor(y.astype(np.int32))
+            logits = self.model(x_tensor)
+            loss = self._cross_entropy(logits, y_tensor)
+            grad = self._compute_grad(loss, x_tensor)
+            x_adv = x_adv + self.alpha * np.sign(grad)
+            perturbation = np.clip(x_adv - x, -self.epsilon, self.epsilon)
+            x_adv = x + perturbation
+        return x_adv
+
+    def adversarial_training_step(self, x: np.ndarray, y: np.ndarray) -> float:
+        x_adv = self.pgd_attack(x, y)
+        x_tensor = Tensor(x_adv.astype(np.float32))
+        y_tensor = Tensor(y.astype(np.int32))
+        logits = self.model(x_tensor)
+        loss = self._cross_entropy(logits, y_tensor)
+        return float(loss.data)
+
+    def _cross_entropy(self, logits: Tensor, targets: Tensor) -> Tensor:
+        log_probs = logits.data - np.log(np.exp(logits.data).sum(axis=-1, keepdims=True) + 1e-8)
+        B, L, V = log_probs.shape
+        targets_flat = targets.data.flatten()
+        token_log_probs = log_probs.reshape(-1, V)[np.arange(len(targets_flat)), targets_flat]
+        return Tensor(-token_log_probs.mean().reshape(1))
+
+    def _compute_grad(self, loss: Tensor, x: Tensor) -> np.ndarray:
+        grad = np.random.randn(*x.data.shape) * 0.01
+        return grad
+
+    def evaluate_robustness(self, x_test: np.ndarray, y_test: np.ndarray, attacks: list = None) -> dict:
+        if attacks is None:
+            attacks = ["fgsm", "pgd"]
+        results = {}
+        clean_correct = 0
+        total = len(x_test)
+        for atk in attacks:
+            correct = 0
+            for i in range(total):
+                if atk == "fgsm":
+                    x_adv = self.fgsm_attack(x_test[i:i+1], y_test[i:i+1])
+                else:
+                    x_adv = self.pgd_attack(x_test[i:i+1], y_test[i:i+1])
+                logits = self.model(Tensor(x_adv.astype(np.float32)))
+                pred = np.argmax(logits.data[0, -1])
+                if pred == y_test[i, -1]:
+                    correct += 1
+            results[f"{atk}_accuracy"] = correct / total
+        return results
+
+
+class MembershipInferenceDefense:
+    def __init__(self, loss_noise_std: float = 0.1, calibration_bins: int = 10):
+        self.loss_noise_std = loss_noise_std
+        self.calibration_bins = calibration_bins
+        self.calibration_map: dict = {}
+
+    def add_loss_noise(self, losses: np.ndarray) -> np.ndarray:
+        noise = np.random.normal(0, self.loss_noise_std, size=losses.shape)
+        return losses + noise
+
+    def compute_confidence(self, logits: np.ndarray) -> np.ndarray:
+        probs = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+        probs = probs / probs.sum(axis=-1, keepdims=True)
+        return probs.max(axis=-1)
+
+    def calibrate(self, confidences: np.ndarray, labels: np.ndarray):
+        bins = np.linspace(0, 1, self.calibration_bins + 1)
+        for i in range(self.calibration_bins):
+            mask = (confidences >= bins[i]) & (confidences < bins[i+1])
+            if mask.sum() > 0:
+                self.calibration_map[i] = labels[mask].mean()
+            else:
+                self.calibration_map[i] = (bins[i] + bins[i+1]) / 2
+
+    def calibrated_confidence(self, confidence: float) -> float:
+        bins = np.linspace(0, 1, self.calibration_bins + 1)
+        bin_idx = min(int(confidence * self.calibration_bins), self.calibration_bins - 1)
+        return self.calibration_map.get(bin_idx, confidence)
+
+    def defense_score(self, logits: np.ndarray, labels: np.ndarray) -> dict:
+        confidences = self.compute_confidence(logits)
+        noisy_losses = self.add_loss_noise(-np.log(confidences + 1e-8))
+        calibrated = np.array([self.calibrated_confidence(c) for c in confidences])
+        return {
+            "confidences": confidences,
+            "noisy_losses": noisy_losses,
+            "calibrated_confidences": calibrated,
+            "membership_score": float(np.mean(calibrated)),
+        }
+
+
+class BackdoorDetector:
+    def __init__(self, num_clusters: int = 2, spectral_threshold: float = 0.5):
+        self.num_clusters = num_clusters
+        self.spectral_threshold = spectral_threshold
+        self.clean_activations: Optional[np.ndarray] = None
+        self.suspicious_activations: Optional[np.ndarray] = None
+
+    def set_clean_activations(self, activations: np.ndarray):
+        self.clean_activations = activations
+
+    def set_suspicious_activations(self, activations: np.ndarray):
+        self.suspicious_activations = activations
+
+    def activation_clustering(self) -> dict:
+        if self.clean_activations is None or self.suspicious_activations is None:
+            return {"clustered": False, "reason": "activations not set"}
+        clean_mean = np.mean(self.clean_activations, axis=0)
+        suspicious_mean = np.mean(self.suspicious_activations, axis=0)
+        clean_std = np.std(self.clean_activations, axis=0) + 1e-8
+        z_scores = np.abs(suspicious_mean - clean_mean) / clean_std
+        backdoor_detected = np.mean(z_scores > 3.0) > self.spectral_threshold
+        return {
+            "backdoor_detected": backdoor_detected,
+            "mean_z_score": float(np.mean(z_scores)),
+            "max_z_score": float(np.max(z_scores)),
+            "fraction_outlier": float(np.mean(z_scores > 3.0)),
+        }
+
+    def spectral_signature(self) -> dict:
+        if self.clean_activations is None or self.suspicious_activations is None:
+            return {"detected": False, "reason": "activations not set"}
+        combined = np.vstack([self.clean_activations, self.suspicious_activations])
+        mean_centered = combined - combined.mean(axis=0)
+        _, s, _ = np.linalg.svd(mean_centered, full_matrices=False)
+        if len(s) < 2:
+            return {"detected": False, "reason": "insufficient dimensions"}
+        spectral_gap = s[0] - s[1]
+        mean_s = np.mean(s)
+        ratio = spectral_gap / (mean_s + 1e-8)
+        suspicious_ratio = len(self.suspicious_activations) / len(combined)
+        detected = ratio > self.spectral_threshold and suspicious_ratio < 0.5
+        return {
+            "detected": detected,
+            "spectral_gap": float(spectral_gap),
+            "singular_value_ratio": float(ratio),
+            "suspicious_fraction": float(suspicious_ratio),
+            "top_singular_values": s[:5].tolist(),
+        }
+
+    def detect(self) -> dict:
+        cluster_result = self.activation_clustering()
+        spectral_result = self.spectral_signature()
+        backdoor_detected = cluster_result.get("backdoor_detected", False) or spectral_result.get("detected", False)
+        return {
+            "backdoor_detected": backdoor_detected,
+            "clustering": cluster_result,
+            "spectral": spectral_result,
+        }

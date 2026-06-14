@@ -804,3 +804,411 @@ class ChainedScheduler(LRScheduler):
     def step(self, epoch=None):
         for s in self.schedulers:
             s.step(epoch)
+
+
+# ---------------------------------------------------------------------------
+# ScheduleFreeAdam
+# ---------------------------------------------------------------------------
+
+class ScheduleFreeAdam(Optimizer):
+    def __init__(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, beta=0.9, c=1.0):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, beta=beta, c=c)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr, eps, wd = group['lr'], group['eps'], group['weight_decay']
+            b1, b2 = group['betas']
+            beta, c = group['beta'], group['c']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state = self.state.setdefault(id(p), {
+                    'theta': p.data.copy(),
+                    'z': np.zeros_like(p.data),
+                    'exp_avg': np.zeros_like(p.data),
+                    'exp_avg_sq': np.zeros_like(p.data),
+                    'step': 0
+                })
+                state['step'] += 1
+                y = beta * state['theta'] + (1 - beta) * state['z']
+                g = p.grad.data
+                if wd != 0:
+                    g = g + wd * y
+                state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g
+                state['exp_avg_sq'] = b2 * state['exp_avg_sq'] + (1 - b2) * g ** 2
+                bias_correction1 = 1 - b1 ** state['step']
+                bias_correction2 = 1 - b2 ** state['step']
+                step_size = lr / bias_correction1
+                denom = np.sqrt(state['exp_avg_sq'] / bias_correction2) + eps
+                grad_update = state['exp_avg'] / denom
+                state['z'] = state['z'] - lr * grad_update
+                state['theta'] = (1 - c) * state['theta'] + c * state['z']
+                p.data = state['theta'].copy()
+
+    def eval(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.state.get(id(p))
+                if state is not None:
+                    p.data = state['theta'].copy()
+
+
+# ---------------------------------------------------------------------------
+# Prodigy
+# ---------------------------------------------------------------------------
+
+class Prodigy(Optimizer):
+    def __init__(self, params, lr=1.0, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, growth_factor=2.0, d0=1e-6, d_largest=10.0, k=0.5, safety_factor=0.85):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, growth_factor=growth_factor, d0=d0, d_largest=d_largest, k=k, safety_factor=safety_factor)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr, eps, wd = group['lr'], group['eps'], group['weight_decay']
+            b1, b2 = group['betas']
+            d0 = group['d0']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                g = p.grad.data
+                state = self.state.setdefault(id(p), {
+                    'step': 0, 'exp_avg': np.zeros_like(p.data), 'exp_avg_sq': np.zeros_like(p.data),
+                    'd': d0, 'd_sum': 0.0, 'prev_x': p.data.copy(), 'prev_g': np.zeros_like(p.data)
+                })
+                state['step'] += 1
+                if wd != 0:
+                    g = g + wd * p.data
+                state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g
+                state['exp_avg_sq'] = b2 * state['exp_avg_sq'] + (1 - b2) * g ** 2
+                bias_correction1 = 1 - b1 ** state['step']
+                bias_correction2 = 1 - b2 ** state['step']
+                m_hat = state['exp_avg'] / bias_correction1
+                v_hat = state['exp_avg_sq'] / bias_correction2
+                if state['step'] > 1:
+                    x_diff = state['prev_x'] - p.data
+                    g_diff = state['prev_g'] - g
+                    numerator = np.abs(np.sum(x_diff * g_diff))
+                    denominator = np.sum(g_diff ** 2) + eps
+                    d_hat = numerator / denominator
+                    d_hat = max(d_hat.item() if hasattr(d_hat, 'item') else float(d_hat), d0)
+                    state['d'] = min(state['d'] * group['growth_factor'], max(d_hat, d0))
+                state['d_sum'] += state['d'] ** (-2)
+                adapt_lr = group['safety_factor'] * state['d'] / (np.sqrt(state['d_sum'] * v_hat) + eps)
+                update = adapt_lr * m_hat
+                state['prev_x'] = p.data.copy()
+                state['prev_g'] = g.copy()
+                p.data -= lr * update
+
+
+# ---------------------------------------------------------------------------
+# GaLore
+# ---------------------------------------------------------------------------
+
+class GaLore(Optimizer):
+    def __init__(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, rank=128, update_every=200):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, rank=rank, update_every=update_every)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr, eps, wd = group['lr'], group['eps'], group['weight_decay']
+            b1, b2 = group['betas']
+            rank = group['rank']
+            update_every = group['update_every']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                g = p.grad.data
+                if wd != 0:
+                    g = g + wd * p.data
+                state = self.state.setdefault(id(p), {
+                    'step': 0, 'P': None, 'exp_avg': None, 'exp_avg_sq': None
+                })
+                state['step'] += 1
+                r = min(rank, min(g.shape))
+                if p.data.ndim >= 2 and (state['P'] is None or state['step'] % update_every == 0):
+                    U, S, Vt = np.linalg.svd(g, full_matrices=False)
+                    state['P'] = U[:, :r].T
+                if state['exp_avg'] is None:
+                    state['exp_avg'] = np.zeros((r, g.shape[-1]) if g.ndim >= 2 else (r,))
+                    state['exp_avg_sq'] = np.zeros_like(state['exp_avg'])
+                if state['P'] is not None and g.ndim >= 2:
+                    g_proj = state['P'] @ g
+                    state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g_proj
+                    state['exp_avg_sq'] = b2 * state['exp_avg_sq'] + (1 - b2) * g_proj ** 2
+                    bias_correction1 = 1 - b1 ** state['step']
+                    bias_correction2 = 1 - b2 ** state['step']
+                    denom = np.sqrt(state['exp_avg_sq'] / bias_correction2) + eps
+                    update_proj = state['exp_avg'] / denom
+                    update_full = state['P'].T @ update_proj
+                else:
+                    state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g
+                    state['exp_avg_sq'] = b2 * state['exp_avg_sq'] + (1 - b2) * g ** 2
+                    bias_correction1 = 1 - b1 ** state['step']
+                    bias_correction2 = 1 - b2 ** state['step']
+                    denom = np.sqrt(state['exp_avg_sq'] / bias_correction2) + eps
+                    update_full = state['exp_avg'] / denom
+                p.data -= lr * update_full
+
+
+# ---------------------------------------------------------------------------
+# Flora
+# ---------------------------------------------------------------------------
+
+class Flora(Optimizer):
+    def __init__(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, rank=128):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, rank=rank)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr, eps, wd = group['lr'], group['eps'], group['weight_decay']
+            b1, b2 = group['betas']
+            rank = group['rank']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                g = p.grad.data
+                if wd != 0:
+                    g = g + wd * p.data
+                state = self.state.setdefault(id(p), {
+                    'step': 0, 'A': None, 'B': None,
+                    'exp_avg': None, 'exp_avg_sq': None
+                })
+                state['step'] += 1
+                if state['A'] is None and g.ndim >= 2:
+                    m, n = g.shape
+                    r = min(rank, min(m, n))
+                    state['A'] = np.random.randn(m, r) / np.sqrt(r)
+                    state['B'] = np.random.randn(n, r) / np.sqrt(r)
+                    state['exp_avg'] = np.zeros((r, r))
+                    state['exp_avg_sq'] = np.zeros((r, r))
+                if state['A'] is not None and g.ndim >= 2:
+                    g_compressed = state['A'].T @ g @ state['B']
+                    state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g_compressed
+                    state['exp_avg_sq'] = b2 * state['exp_avg_sq'] + (1 - b2) * g_compressed ** 2
+                    bias_correction1 = 1 - b1 ** state['step']
+                    bias_correction2 = 1 - b2 ** state['step']
+                    denom = np.sqrt(state['exp_avg_sq'] / bias_correction2) + eps
+                    state_update = state['exp_avg'] / denom
+                    update_full = state['A'] @ state_update @ state['B'].T
+                else:
+                    if state['exp_avg'] is None:
+                        state['exp_avg'] = np.zeros_like(g)
+                        state['exp_avg_sq'] = np.zeros_like(g)
+                    state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g
+                    state['exp_avg_sq'] = b2 * state['exp_avg_sq'] + (1 - b2) * g ** 2
+                    bias_correction1 = 1 - b1 ** state['step']
+                    bias_correction2 = 1 - b2 ** state['step']
+                    denom = np.sqrt(state['exp_avg_sq'] / bias_correction2) + eps
+                    update_full = state['exp_avg'] / denom
+                p.data -= lr * update_full
+
+
+# ---------------------------------------------------------------------------
+# OneBitAdam
+# ---------------------------------------------------------------------------
+
+class OneBitAdam(Optimizer):
+    def __init__(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, warmup_steps=0):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, warmup_steps=warmup_steps)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr, eps, wd = group['lr'], group['eps'], group['weight_decay']
+            b1, b2 = group['betas']
+            warmup_steps = group['warmup_steps']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                g = p.grad.data
+                state = self.state.setdefault(id(p), {
+                    'step': 0, 'exp_avg': np.zeros_like(p.data), 'exp_avg_sq': np.zeros_like(p.data),
+                    'residual': np.zeros_like(p.data), 'scale': 1.0
+                })
+                state['step'] += 1
+                if wd != 0:
+                    g = g + wd * p.data
+                if state['step'] > warmup_steps:
+                    g_effective = g + state['residual']
+                    g_norm = np.linalg.norm(g_effective)
+                    state['scale'] = g_norm / max(np.sqrt(np.sum(g_effective.size)), eps)
+                    binarized = np.sign(g_effective) * state['scale']
+                    state['residual'] = g_effective - binarized
+                    g = binarized
+                state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g
+                state['exp_avg_sq'] = b2 * state['exp_avg_sq'] + (1 - b2) * g ** 2
+                bias_correction1 = 1 - b1 ** state['step']
+                bias_correction2 = 1 - b2 ** state['step']
+                step_size = lr / bias_correction1
+                denom = np.sqrt(state['exp_avg_sq'] / bias_correction2) + eps
+                p.data -= step_size * state['exp_avg'] / denom
+
+
+# ---------------------------------------------------------------------------
+# PowerSGD
+# ---------------------------------------------------------------------------
+
+class PowerSGD(Optimizer):
+    def __init__(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, rank=4, powerSGD_iterations=1, start_powerSGD_iter=1):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, rank=rank, powerSGD_iterations=powerSGD_iterations, start_powerSGD_iter=start_powerSGD_iter)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr, eps, wd = group['lr'], group['eps'], group['weight_decay']
+            b1, b2 = group['betas']
+            rank = group['rank']
+            n_iter = group['powerSGD_iterations']
+            start_iter = group['start_powerSGD_iter']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                g = p.grad.data
+                if wd != 0:
+                    g = g + wd * p.data
+                state = self.state.setdefault(id(p), {
+                    'step': 0, 'exp_avg': np.zeros_like(p.data), 'exp_avg_sq': np.zeros_like(p.data),
+                    'P': None, 'Q': None
+                })
+                state['step'] += 1
+                if p.data.ndim >= 2 and state['step'] >= start_iter:
+                    m, n = g.shape
+                    r = min(rank, min(m, n))
+                    if state['P'] is None or state['P'].shape != (m, r):
+                        state['P'] = np.random.randn(m, r) / np.sqrt(r)
+                    P = state['P']
+                    Q = None
+                    for _ in range(n_iter):
+                        Q = g.T @ P
+                        Q = np.linalg.qr(Q)[0]
+                        P = g @ Q
+                        P = np.linalg.qr(P)[0]
+                    state['P'] = P
+                    g_approx = P @ Q.T
+                    state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g_approx
+                    state['exp_avg_sq'] = b2 * state['exp_avg_sq'] + (1 - b2) * g_approx ** 2
+                else:
+                    state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g
+                    state['exp_avg_sq'] = b2 * state['exp_avg_sq'] + (1 - b2) * g ** 2
+                bias_correction1 = 1 - b1 ** state['step']
+                bias_correction2 = 1 - b2 ** state['step']
+                denom = np.sqrt(state['exp_avg_sq'] / bias_correction2) + eps
+                p.data -= lr * state['exp_avg'] / bias_correction1 / denom
+
+
+# ---------------------------------------------------------------------------
+# LRFinder (Learning Rate Finder)
+# ---------------------------------------------------------------------------
+
+class LRFinder:
+    def __init__(self, model, optimizer, loss_fn, lr_min=1e-7, lr_max=10.0, num_steps=100, beta=0.98):
+        self.model = model
+        self.optimizer = optimizer
+        self.loss_fn = loss_fn
+        self.lr_min = lr_min
+        self.lr_max = lr_max
+        self.num_steps = num_steps
+        self.beta = beta
+        self.lrs = []
+        self.losses = []
+        self.best_loss = float('inf')
+        self._backup_state = None
+
+    def range_test(self, data_loader):
+        self._backup()
+        lr_schedule = np.geomspace(self.lr_min, self.lr_max, self.num_steps)
+        avg_loss = 0.0
+        for step, (x_batch, y_batch) in enumerate(range(self.num_steps)):
+            lr = float(lr_schedule[step])
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = lr
+            self.optimizer.zero_grad()
+            if hasattr(x_batch, 'data'):
+                output = self.model(x_batch)
+                loss = self.loss_fn(output, y_batch)
+            else:
+                output = self.model(Tensor(x_batch, requires_grad=True))
+                loss = self.loss_fn(output, Tensor(y_batch) if not isinstance(y_batch, Tensor) else y_batch)
+            loss_val = loss.data.item() if hasattr(loss.data, 'item') else float(loss.data)
+            avg_loss = self.beta * avg_loss + (1 - self.beta) * loss_val
+            smoothed = avg_loss / (1 - self.beta ** (step + 1))
+            self.lrs.append(lr)
+            self.losses.append(smoothed)
+            if smoothed < self.best_loss:
+                self.best_loss = smoothed
+            self.optimizer.zero_grad()
+            loss.backward() if hasattr(loss, 'backward') else None
+            self.optimizer.step()
+            if smoothed > 4 * self.best_loss:
+                break
+        self._restore()
+        return self.suggest_lr()
+
+    def suggest_lr(self, num_points=20):
+        if len(self.losses) < num_points:
+            return self.lrs[np.argmin(self.losses)]
+        loss_arr = np.array(self.losses)
+        lr_arr = np.array(self.lrs)
+        log_lr = np.log10(lr_arr)
+        min_idx = np.argmin(loss_arr)
+        end = min(min_idx + num_points, len(loss_arr))
+        start = max(end - num_points, 0)
+        segment_lr = log_lr[start:end]
+        segment_loss = loss_arr[start:end]
+        grads = np.diff(segment_loss) / np.diff(segment_lr)
+        min_grad_idx = np.argmin(grads)
+        return 10 ** float(segment_lr[min_grad_idx])
+
+    def _backup(self):
+        self._backup_state = {}
+        for i, group in enumerate(self.optimizer.param_groups):
+            self._backup_state[i] = group['lr']
+
+    def _restore(self):
+        if self._backup_state:
+            for i, group in enumerate(self.optimizer.param_groups):
+                group['lr'] = self._backup_state[i]
+
+
+# ---------------------------------------------------------------------------
+# DoReMiScheduler
+# ---------------------------------------------------------------------------
+
+class DoReMiScheduler:
+    def __init__(self, optimizer, num_domains, reference_loss=None, smoothing=0.9, lr_factor=1.0):
+        self.optimizer = optimizer
+        self.num_domains = num_domains
+        self.reference_loss = reference_loss if reference_loss is not None else np.ones(num_domains)
+        self.smoothing = smoothing
+        self.lr_factor = lr_factor
+        self.domain_weights = np.ones(num_domains) / num_domains
+        self._ema_excess = np.zeros(num_domains)
+        self._step_count = 0
+
+    def step(self, domain_losses):
+        self._step_count += 1
+        domain_losses = np.array(domain_losses, dtype=np.float64)
+        excess_loss = domain_losses - self.reference_loss
+        self._ema_excess = self.smoothing * self._ema_excess + (1 - self.smoothing) * excess_loss
+        e = self._ema_excess - np.max(self._ema_excess)
+        self.domain_weights = np.exp(e) / np.exp(e).sum() * self.num_domains
+        for group in self.optimizer.param_groups:
+            group['lr'] = group.get('base_lr', group['lr']) * self.lr_factor
+
+    def get_domain_weights(self):
+        return self.domain_weights.copy()
+
+    def state_dict(self):
+        return {
+            'domain_weights': self.domain_weights.copy(),
+            'ema_excess': self._ema_excess.copy(),
+            'step_count': self._step_count
+        }
+
+    def load_state_dict(self, state_dict):
+        self.domain_weights = state_dict['domain_weights'].copy()
+        self._ema_excess = state_dict['ema_excess'].copy()
+        self._step_count = state_dict['step_count']
