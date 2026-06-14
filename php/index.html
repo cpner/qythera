@@ -2,30 +2,22 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<meta name="theme-color" content="#09090b">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Qythera AI</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-:root{--bg:#09090b;--glass:rgba(255,255,255,.03);--border:rgba(255,255,255,.06);--accent:#7c3aed;--text:#fafafa;--muted:#52525b;--radius:16px}
 *{margin:0;padding:0;box-sizing:border-box}
-html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased;overflow:hidden}
-.bg{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse 80% 50% at 20% 40%,rgba(124,58,237,.06) 0%,transparent 60%),radial-gradient(ellipse 60% 40% at 80% 20%,rgba(59,130,246,.04) 0%,transparent 50%),var(--bg)}
-.glass{background:var(--glass);backdrop-filter:blur(24px);border:1px solid var(--border);border-radius:var(--radius)}
-.msg-u{background:linear-gradient(135deg,rgba(124,58,237,.12),rgba(59,130,246,.08));border:1px solid rgba(124,58,237,.1);border-radius:var(--radius) var(--radius) 10px var(--radius);padding:12px 16px;max-width:82%;margin-left:auto}
-.msg-a{background:var(--glass);border:1px solid var(--border);border-radius:var(--radius) var(--radius) var(--radius) 10px;padding:12px 16px;max-width:88%}
-.inp{background:var(--glass);backdrop-filter:blur(16px);border:1px solid var(--border);border-radius:24px;padding:10px 16px;transition:all .3s}
-.inp:focus-within{border-color:rgba(124,58,237,.4);box-shadow:0 0 0 3px rgba(124,58,237,.08)}
-.btn{background:linear-gradient(135deg,#7c3aed,#3b82f6);border:none;border-radius:12px;padding:10px 20px;color:white;font-weight:500;cursor:pointer;transition:all .2s}
-.btn:hover{opacity:.9;transform:translateY(-1px)}
+html,body{height:100%;background:#09090b;color:#fafafa;font-family:system-ui,sans-serif;overflow:hidden}
+.bg{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse at 20% 40%,rgba(124,58,237,.06),transparent 60%),#09090b}
+.glass{background:rgba(255,255,255,.03);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.06);border-radius:16px}
+.mu{background:linear-gradient(135deg,rgba(124,58,237,.12),rgba(59,130,246,.08));border:1px solid rgba(124,58,237,.1);border-radius:16px 16px 4px 16px;padding:12px 16px;max-width:82%;margin-left:auto}
+.ma{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:16px 16px 16px 4px;padding:12px 16px;max-width:88%}
+.ib{background:rgba(255,255,255,.03);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,.06);border-radius:24px;padding:10px 16px}
+.ib:focus-within{border-color:rgba(124,58,237,.4);box-shadow:0 0 0 3px rgba(124,58,237,.08)}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#a78bfa;margin:0 2px;animation:d 1.4s ease-in-out infinite;opacity:.4}
 .dot:nth-child(2){animation-delay:.15s}.dot:nth-child(3){animation-delay:.3s}
 @keyframes d{0%,60%,100%{opacity:.2;transform:scale(.85)}30%{opacity:1;transform:scale(1.1)}}
 @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
-::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:10px}
-@media(max-width:768px){.msg-u,.msg-a{max-width:92%!important;padding:10px 12px}.inp{padding:8px 12px}body{font-size:15px}}
-@supports(padding:env(safe-area-inset-bottom)){.ia{padding-bottom:max(12px,env(safe-area-inset-bottom))}}
-@media(hover:none)and(pointer:coarse){button{min-height:44px;min-width:44px}}
+@media(max-width:768px){.mu,.ma{max-width:92%!important;padding:10px 12px}body{font-size:15px}}
 </style>
 </head>
 <body>
@@ -34,68 +26,42 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Inter'
 <div class="glass" style="margin:8px;padding:10px 16px;display:flex;align-items:center;gap:10px">
   <div style="width:32px;height:32px;border-radius:10px;background:linear-gradient(135deg,#7c3aed,#3b82f6);display:flex;align-items:center;justify-content:center"><span style="color:white;font-weight:bold;font-size:14px">Q</span></div>
   <div><div style="font-weight:600;font-size:14px;background:linear-gradient(135deg,#a78bfa,#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Qythera</div><div style="font-size:10px;color:#52525b">Vaelon AI</div></div>
-  <div style="margin-left:auto;font-size:10px;color:#52525b" id="count">0 msgs</div>
+  <div style="margin-left:auto;font-size:10px;color:#52525b" id="cnt">0</div>
 </div>
-<div id="messages" style="flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px">
-  <div id="welcome" style="text-align:center;padding:40px 16px">
+<div id="msgs" style="flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px">
+  <div id="wel" style="text-align:center;padding:40px 16px">
     <div style="width:80px;height:80px;margin:0 auto 24px;border-radius:20px;background:linear-gradient(135deg,#7c3aed,#3b82f6);display:flex;align-items:center;justify-content:center;box-shadow:0 8px 32px rgba(124,58,237,.25);animation:float 5s ease-in-out infinite"><span style="font-size:32px">✦</span></div>
-    <h2 style="font-size:22px;font-weight:700;margin-bottom:8px;background:linear-gradient(135deg,#a78bfa,#60a5fa,#22d3ee);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Welcome to Qythera</h2>
-    <p style="color:#52525b;font-size:13px;max-width:320px;margin:0 auto 24px;line-height:1.5">Ask me anything. I can help with coding, science, math, and more.</p>
+    <h2 style="font-size:22px;font-weight:700;margin-bottom:8px;background:linear-gradient(135deg,#a78bfa,#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Welcome to Qythera</h2>
+    <p style="color:#52525b;font-size:13px;max-width:320px;margin:0 auto 24px">Ask me about coding, science, math.</p>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;max-width:320px;margin:0 auto">
-      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="send('Write a Python sorting algorithm')"><span style="font-size:16px">💻</span><div style="font-size:11px;color:#a1a1aa;margin-top:4px">Sorting algorithm</div></button>
-      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="send('Explain how transformers work')"><span style="font-size:16px">🧠</span><div style="font-size:11px;color:#a1a1aa;margin-top:4px">Explain transformers</div></button>
-      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="send('What is machine learning?')"><span style="font-size:16px">🔬</span><div style="font-size:11px;color:#a1a1aa;margin-top:4px">Machine learning</div></button>
-      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="send('What is 2+2?')"><span style="font-size:16px">🔢</span><div style="font-size:11px;color:#a1a1aa;margin-top:4px">Math</div></button>
+      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="S('Write a Python sorting algorithm')">💻 Sorting</button>
+      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="S('Explain transformers')">🧠 Transformers</button>
+      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="S('What is machine learning?')">🔬 ML</button>
+      <button class="glass" style="padding:12px;text-align:left;cursor:pointer;border:none" onclick="S('What is 2+2?')">🔢 Math</button>
     </div>
   </div>
 </div>
-<div class="ia" style="padding:8px 12px 12px">
-  <div class="inp" style="display:flex;align-items:end;gap:8px">
-    <textarea id="input" placeholder="Message Qythera..." rows="1" style="flex:1;background:transparent;border:none;color:white;outline:none;resize:none;font-size:13.5px;font-family:inherit;padding:4px 0;max-height:160px" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,160)+'px'" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
-    <button onclick="send()" style="padding:10px;border-radius:16px;background:linear-gradient(135deg,#7c3aed,#3b82f6);border:none;color:white;cursor:pointer;flex-shrink:0">➤</button>
+<div style="padding:8px 12px 12px">
+  <div class="ib" style="display:flex;align-items:end;gap:8px">
+    <textarea id="inp" placeholder="Message Qythera..." rows="1" style="flex:1;background:transparent;border:none;color:white;outline:none;resize:none;font-size:13.5px;padding:4px 0;max-height:160px" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,160)+'px'" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();S()}"></textarea>
+    <button onclick="S()" style="padding:10px;border-radius:16px;background:linear-gradient(135deg,#7c3aed,#3b82f6);border:none;color:white;cursor:pointer;flex-shrink:0">➤</button>
   </div>
-  <div style="text-align:center;font-size:9px;color:#27272a;margin-top:6px">Qythera AI — Vaelon Model</div>
 </div>
 </div>
 <script>
-const API='api.php';
-let msgCount=0;
+var API='api.php';
+var K={"python":"Python is a high-level programming language created by Guido van Rossum in 1991.","javascript":"JavaScript is a programming language for web development.","transformer":"Transformers use self-attention to process sequences.","machine_learning":"Machine learning: systems learn patterns from data.","git":"Git is a distributed version control system.","physics":"Newton laws: F=ma. Conservation of energy.","math":"Algebra uses symbols for numbers.","ai":"Artificial Intelligence: systems performing tasks requiring human intelligence.","llm":"Large Language Models: neural networks trained on text."};
 
-function send(text){
-const input=document.getElementById('input');
-const msg=text||input.value.trim();
-if(!msg)return;
-if(text)input.value='';
-const welcome=document.getElementById('welcome');
-if(welcome)welcome.remove();
-const msgsDiv=document.getElementById('messages');
+function S(t){var i=document.getElementById('inp');var m=t||i.value.trim();if(!m)return;if(t)i.value='';var w=document.getElementById('wel');if(w)w.remove();var d=document.getElementById('msgs');
+var u=document.createElement('div');u.className='mu';u.innerHTML='<div style="font-size:13px;white-space:pre-wrap">'+H(m)+'</div>';d.appendChild(u);
+var ty=document.createElement('div');ty.className='ma';ty.innerHTML='<span class="dot"></span><span class="dot"></span><span class="dot"></span>';d.appendChild(ty);d.scrollTop=d.scrollHeight;
+fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages:[{role:'user',content:m}]})}).then(function(r){return r.json()}).then(function(d){
+ty.remove();var r=d.choices[0].message.content;var b=document.createElement('div');b.className='ma';b.innerHTML='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><div style="width:18px;height:18px;border-radius:6px;background:linear-gradient(135deg,#7c3aed,#3b82f6);display:flex;align-items:center;justify-content:center"><span style="font-size:8px;color:white;font-weight:bold">Q</span></div><span style="font-size:11px;color:rgba(167,139,250,.7)">Vaelon</span></div><div style="font-size:13px;line-height:1.65;white-space:pre-wrap">'+F(r)+'</div>';d.appendChild(b);d.scrollTop=d.scrollHeight;document.getElementById('cnt').textContent=parseInt(document.getElementById('cnt').textContent)+1}).catch(function(e){ty.remove();var err=document.createElement('div');err.className='ma';err.innerHTML='<div style="color:#ef4444">Error: '+e.message+'</div>';d.appendChild(err);d.scrollTop=d.scrollHeight})}
 
-const userDiv=document.createElement('div');
-userDiv.className='msg-u';
-userDiv.innerHTML=`<div style="font-size:13px;white-space:pre-wrap;word-break:break-word">${esc(msg)}</div><div style="font-size:9px;color:rgba(255,255,255,.2);margin-top:4px;text-align:right">${new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>`;
-msgsDiv.appendChild(userDiv);
-
-const typing=document.createElement('div');
-typing.className='msg-a';typing.id='typing';
-typing.innerHTML='<div class="dot"></div><div class="dot"></div><div class="dot"></div>';
-msgsDiv.appendChild(typing);
-msgsDiv.scrollTop=msgsDiv.scrollHeight;
-
-fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages:[{role:'user',content:msg}]})})
-.then(r=>r.json()).then(d=>{
-const response=d.choices?.[0]?.message?.content||'No response';
-typing.remove();
-const botDiv=document.createElement('div');
-botDiv.className='msg-a';
-botDiv.innerHTML=`<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><div style="width:18px;height:18px;border-radius:6px;background:linear-gradient(135deg,#7c3aed,#3b82f6);display:flex;align-items:center;justify-content:center"><span style="font-size:8px;color:white;font-weight:bold">Q</span></div><span style="font-size:11px;color:rgba(167,139,250,.7);font-weight:500">Vaelon</span></div><div style="font-size:13px;line-height:1.65;white-space:pre-wrap;word-break:break-word">${fmt(response)}</div>`;
-msgsDiv.appendChild(botDiv);
-msgsDiv.scrollTop=msgsDiv.scrollHeight;
-msgCount++;document.getElementById('count').textContent=msgCount+' msgs';
-}).catch(e=>{typing.remove();const err=document.createElement('div');err.className='msg-a';err.innerHTML=`<div style="color:#ef4444">Error: ${e.message}</div>`;msgsDiv.appendChild(err);msgsDiv.scrollTop=msgsDiv.scrollHeight;});
-}
-function esc(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML;}
-function fmt(t){return esc(t).replace(/```(\w+)?\n([\s\S]*?)```/g,'<pre style="background:rgba(0,0,0,.4);border-radius:8px;padding:12px;overflow-x:auto;margin:8px 0"><code style="font-family:JetBrains Mono,monospace;font-size:12px;color:#a5f3fc">$2</code></pre>').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>').replace(/`(.*?)`/g,'<code style="background:rgba(255,255,255,.08);padding:2px 6px;border-radius:4px;font-size:12px">$1</code>');}
-input.focus();
+function H(t){var d=document.createElement('div');d.textContent=t;return d.innerHTML}
+function F(t){return H(t).replace(/```(\w+)?\n([\s\S]*?)```/g,'<pre style="background:rgba(0,0,0,.4);border-radius:8px;padding:12px;overflow-x:auto"><code style="font-size:12px;color:#a5f3fc">$2</code></pre>').replace(/\*\*(.*?)\*\*/g,'<b>$1</b>')}
+function G(q){q=q.toLowerCase().trim();for(var k in K)if(q.indexOf(k)!==-1)return K[k];if(q.indexOf('hello')!==-1||q.indexOf('hi')!==-1)return"Hello! Ask about programming, science, math.";return"I can help with programming, science, math. Try a specific topic!"}
+document.getElementById('inp').focus();
 </script>
 </body>
 </html>
