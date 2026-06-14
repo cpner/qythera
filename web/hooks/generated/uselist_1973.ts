@@ -1,6 +1,0 @@
-'use client';
-import { useState } from 'react';
-
-export function useList_1973(v) {
-  return useState(v);
-}

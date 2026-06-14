@@ -1,8 +1,0 @@
-name: UltraChat
-hf_id: stingning/ultrachat
-split: train
-fields:
-  prompt: prompt
-  response: response
-max_length: 2048
-description: Large-scale multi-turn dialogue dataset

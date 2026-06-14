@@ -1,13 +1,13 @@
+"""RMSNorm normalization layer."""
 
-import torch
-import torch.nn as nn
+import numpy as np
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
+
+class RMSNorm:
+    def __init__(self, dim, eps=1e-6):
+        self.weight = np.ones(dim, dtype=np.float32)
         self.eps = eps
+    
     def forward(self, x):
-        dtype = x.dtype
-        x = x.float()
-        return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)).to(dtype) * self.weight
+        rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + self.eps)
+        return (x / rms) * self.weight

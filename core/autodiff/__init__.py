@@ -1,8 +1,7 @@
-"""Qythera Autodiff Engine - Custom automatic differentiation from scratch."""
+"""Custom autodiff tensor engine."""
 
 from core.autodiff.tensor import Tensor
-from core.autodiff.graph import ComputationGraph
-from core.autodiff.backward import backward_pass
-from core.autodiff.optim import SGD, Adam, AdamW
+from core.autodiff.optimizers import Adam, AdamW, SGD, Lion
+from core.autodiff.scheduler import CosineScheduler, LinearScheduler, WarmupScheduler
 
-__all__ = ["Tensor", "ComputationGraph", "backward_pass", "SGD", "Adam", "AdamW"]
+__all__ = ["Tensor", "Adam", "AdamW", "SGD", "Lion", "CosineScheduler", "LinearScheduler", "WarmupScheduler"]

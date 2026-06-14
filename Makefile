@@ -1,8 +1,6 @@
-
-.PHONY: install serve web train test
-install: pip install -e .
-serve: python -m inference.server
+.PHONY: install serve web chat test
+install: pip install -e . && cd web && npm install
+serve: python -m core.inference.server
 web: cd web && npm install && npm run dev
-train: python -m training.trainer
+chat: python cli/main.py chat
 test: python -m pytest tests/ -v
-lint: python -m ruff check core/ inference/ training/ cli/

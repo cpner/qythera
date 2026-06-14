@@ -1,173 +1,128 @@
-import re, json, os
+"""Byte Pair Encoding tokenizer from scratch."""
+
+import json
+import os
+import re
 from collections import Counter, defaultdict
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 
 class BPETokenizer:
-    """Byte Pair Encoding tokenizer implemented from scratch.
+    """BPE tokenizer trained from scratch on text data.
     
     Algorithm:
     1. Start with character-level vocabulary
     2. Iteratively merge most frequent adjacent pairs
-    3. Build merge table
-    4. Encode: apply merges in order
-    5. Decode: reverse lookup
+    3. Build vocabulary up to target size
     """
     
-    SPECIAL = {"<bos>": 0, "<eos>": 1, "<pad>": 2, "<user>": 3, "<assistant>": 4, "<system>": 5}
-
-    def __init__(self):
-        self.vocab = dict(self.SPECIAL)
-        self.merges = []
-        self.inv_vocab = {v: k for k, v in self.vocab.items()}
-
-    def _get_stats(self, ids):
-        counts = Counter()
-        for seq in ids:
-            for i in range(len(seq) - 1):
-                counts[(seq[i], seq[i+1])] += 1
-        return counts
-
-    def _merge(self, ids, pair):
-        new_ids = []
+    SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3, "<sep>": 4, "<cls>": 5}
+    
+    def __init__(self, vocab_size: int = 32000):
+        self.vocab_size = vocab_size
+        self.merges: List[Tuple[str, str]] = []
+        self.char_to_id: Dict[str, int] = dict(self.SPECIAL)
+        self.id_to_char: Dict[int, str] = {v: k for k, v in self.SPECIAL.items()}
+    
+    def _get_pair_stats(self, ids_list: List[List[int]]) -> Counter:
+        """Count frequency of adjacent pairs across all sequences."""
+        stats = Counter()
+        for ids in ids_list:
+            for i in range(len(ids) - 1):
+                stats[(ids[i], ids[i+1])] += 1
+        return stats
+    
+    def _merge_pair(self, ids: List[int], pair: Tuple[int, int], new_id: int) -> List[int]:
+        """Merge all occurrences of a pair in a sequence."""
+        result = []
         i = 0
         while i < len(ids):
-            if i < len(ids) - 1 and (ids[i], ids[i+1]) == pair:
-                new_ids.append(pair[0] * 256 + pair[1])
+            if i < len(ids) - 1 and ids[i] == pair[0] and ids[i+1] == pair[1]:
+                result.append(new_id)
                 i += 2
             else:
-                new_ids.append(ids[i])
+                result.append(ids[i])
                 i += 1
-        return new_ids
-
-    def train(self, texts: List[str], vocab_size: int = 32000, verbose=False):
-        """Train BPE tokenizer on a list of text strings."""
-        # Initialize vocabulary with all bytes
-        tokens = set()
+        return result
+    
+    def train(self, texts: List[str], vocab_size: Optional[int] = None, verbose: bool = False):
+        """Train BPE tokenizer on a list of texts."""
+        if vocab_size:
+            self.vocab_size = vocab_size
+        
+        # Initialize with character vocabulary
+        chars = set()
         for text in texts:
-            tokens.update(text.encode("utf-8"))
-        self.vocab = {bytes([b]): b for b in tokens}
-        self.vocab.update({v: k for k, v in self.SPECIAL.items()})
-
-        # Convert text to byte sequences
-        ids = []
+            chars.update(text)
+        
+        for c in sorted(chars):
+            if c not in self.char_to_id:
+                self.char_to_id[c] = len(self.char_to_id)
+        
+        # Convert texts to character IDs
+        all_ids = []
         for text in texts:
-            ids.append(list(text.encode("utf-8")))
-
-        num_merges = vocab_size - len(self.vocab)
+            ids = [self.char_to_id.get(c, self.char_to_id["<unk>"]) for c in text]
+            all_ids.append(ids)
+        
+        # Iteratively merge most frequent pairs
+        num_merges = self.vocab_size - len(self.char_to_id)
         for i in range(num_merges):
-            stats = Counter()
-            for seq in ids:
-                for j in range(len(seq) - 1):
-                    stats[(seq[j], seq[j+1])] += 1
+            stats = self._get_pair_stats(all_ids)
             if not stats:
                 break
-            best = max(stats, key=stats.get)
-            new_id = 256 + len(self.merges)
-            self.merges.append(best)
-            ids = [self._merge(seq, best) for seq in ids]
-            if verbose and i % 100 == 0:
-                print(f"  Merge {i}/{num_merges}: {best} -> {new_id} (freq={stats[best]})")
-
-        # Build final vocabulary
-        for i, (a, b) in enumerate(self.merges):
-            new_id = 256 + i
-            if a in self.vocab and b in self.vocab:
-                a_bytes = self.vocab[a] if isinstance(self.vocab[a], bytes) else a
-                b_bytes = self.vocab[b] if isinstance(self.vocab[b], bytes) else b
-                if isinstance(a_bytes, int): a_bytes = bytes([a_bytes])
-                if isinstance(b_bytes, int): b_bytes = bytes([b_bytes])
-                self.vocab[new_id] = a_bytes + b_bytes
-            else:
-                self.vocab[new_id] = f"<merge_{i}>"
-
-        # Build inverse vocabulary
-        self.inv_vocab = {}
-        for k, v in self.vocab.items():
-            if isinstance(v, bytes):
-                self.inv_vocab[v] = k
-            elif isinstance(v, str):
-                try:
-                    self.inv_vocab[v.encode("utf-8")] = k
-                except:
-                    self.inv_vocab[v] = k
-
-    def encode(self, text: str, add_special=True) -> List[int]:
+            
+            best_pair = max(stats, key=stats.get)
+            if stats[best_pair] < 2:
+                break
+            
+            new_id = len(self.char_to_id)
+            self.merges.append(best_pair)
+            self.char_to_id[f"<merge_{i}>"] = new_id
+            self.id_to_char[new_id] = f"<merge_{i}>"
+            
+            all_ids = [self._merge_pair(ids, best_pair, new_id) for ids in all_ids]
+            
+            if verbose and (i + 1) % 100 == 0:
+                print(f"  Merge {i+1}/{num_merges}: {best_pair} -> {new_id} (freq={stats[best_pair]})")
+        
+        self.id_to_char = {v: k for k, v in self.char_to_id.items()}
+    
+    def encode(self, text: str, add_special: bool = True) -> List[int]:
         """Encode text to token IDs."""
         ids = []
         if add_special:
             ids.append(self.SPECIAL["<bos>"])
-
-        # Encode each character/byte
-        tokens = list(text.encode("utf-8"))
-        
-        # Apply merges
-        for a, b in self.merges:
-            i = 0
-            new_tokens = []
-            while i < len(tokens):
-                if i < len(tokens) - 1 and tokens[i] == a and tokens[i+1] == b:
-                    new_tokens.append(256 + self.merges.index((a, b)))
-                    i += 2
-                else:
-                    new_tokens.append(tokens[i])
-                    i += 1
-            tokens = new_tokens
-
-        ids.extend(tokens)
+        for c in text:
+            ids.append(self.char_to_id.get(c, self.SPECIAL["<unk>"]))
         if add_special:
             ids.append(self.SPECIAL["<eos>"])
         return ids
-
-    def decode(self, ids: List[int], skip_special=True) -> str:
+    
+    def decode(self, ids: List[int], skip_special: bool = True) -> str:
         """Decode token IDs to text."""
-        tokens = []
         special_ids = set(self.SPECIAL.values())
-        for tid in ids:
-            if skip_special and tid in special_ids:
-                continue
-            if tid < 256:
-                tokens.append(bytes([tid]))
-            elif tid in self.vocab:
-                val = self.vocab[tid]
-                if isinstance(val, bytes):
-                    tokens.append(val)
-                elif isinstance(val, int):
-                    tokens.append(bytes([val]))
-                else:
-                    tokens.append(val.encode("utf-8") if isinstance(val, str) else str(val).encode())
-            else:
-                tokens.append(b"<unk>")
-        return b"".join(tokens).decode("utf-8", errors="replace")
-
-    def encode_chat(self, messages: List[Dict]) -> List[int]:
-        """Encode a list of chat messages."""
-        ids = [self.SPECIAL["<bos>"]]
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            ids.append(self.SPECIAL.get(f"<{role}>", self.SPECIAL["<user>"]))
-            ids.extend(self.encode(content, add_special=False))
-        ids.append(self.SPECIAL["<assistant>"])
-        return ids
-
-    def save(self, path):
+        return "".join([self.id_to_char.get(i, "") for i in ids
+                       if not skip_special or i not in special_ids])
+    
+    def save(self, path: str):
+        """Save tokenizer to file."""
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        data = {
-            "vocab_size": len(self.vocab),
-            "merges": [list(m) for m in self.merges],
-            "special": self.SPECIAL,
-        }
         with open(path, "w") as f:
-            json.dump(data, f)
-
-    def load(self, path):
+            json.dump({
+                "char_to_id": self.char_to_id,
+                "merges": [list(m) for m in self.merges],
+                "vocab_size": self.vocab_size,
+            }, f)
+    
+    def load(self, path: str):
+        """Load tokenizer from file."""
         with open(path) as f:
             data = json.load(f)
-        self.merges = [tuple(m) for m in data["merges"]]
-        self.SPECIAL = data.get("special", self.SPECIAL)
-        self.vocab = dict(self.SPECIAL)
-
-    @property
-    def vocab_size(self):
-        return len(self.SPECIAL) + len(self.merges) + 256
+        self.char_to_id = data["char_to_id"]
+        self.id_to_char = {int(v) if isinstance(v, str) and v.isdigit() else v: k for k, v in self.char_to_id.items()}
+        self.merges = [tuple(m) for m in data.get("merges", [])]
+        self.vocab_size = data.get("vocab_size", len(self.char_to_id))
+    
+    def __len__(self) -> int:
+        return len(self.char_to_id)
