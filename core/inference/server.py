@@ -1,4 +1,4 @@
-"""HTTP inference server with graceful shutdown."""
+"""HTTP inference server with graceful shutdown and error handling."""
 
 import json
 import time
@@ -6,6 +6,7 @@ import os
 import sys
 import signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import socket
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from core.knowledge.base import get_answer
@@ -17,9 +18,9 @@ class QytheraAI:
         self.safety = SafetyModerator()
         self.request_count = 0
         self.start_time = time.time()
-        print("  Knowledge base loaded")
-        print("  Safety filters active")
-    
+        print("  \033[32m✓\033[0m Knowledge base loaded")
+        print("  \033[32m✓\033[0m Safety filters active")
+
     def generate(self, messages, **kwargs):
         for m in messages:
             safe, result = self.safety.filter_input(m.get("content", ""))
@@ -88,40 +89,82 @@ class Handler(BaseHTTPRequestHandler):
 
 def shutdown_handler(signum, frame):
     global httpd
-    print("\n  Shutting down server...")
+    print("\n\033[33m  Shutting down server...\033[0m")
     if httpd:
         httpd.shutdown()
-    print("  Server stopped.")
+    print("\033[32m  Server stopped.\033[0m")
     sys.exit(0)
+
+
+def find_free_port(start=8000, end=9000):
+    """Find a free port in range."""
+    for port in range(start, end):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", port))
+            s.close()
+            return port
+        except OSError:
+            continue
+    return start
 
 
 def run_server(host="0.0.0.0", port=8000):
     global server_instance, httpd
-    
+
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
-    
-    print("\n  Qythera Inference Server")
-    print(f"  Host: {host}:{port}")
-    server_instance = QytheraAI()
-    print(f"\n  API: http://{host}:{port}/v1/chat/completions")
-    print(f"  Health: http://{host}:{port}/health")
-    print(f"\n  Press Ctrl+C to stop\n")
-    
-    httpd = HTTPServer((host, port), Handler)
+
+    # Try to find a free port if requested port is busy
+    actual_port = port
     try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        s.close()
+    except OSError:
+        print(f"\n  \033[33m⚠ Port {port} is busy, finding free port...\033[0m")
+        actual_port = find_free_port(port + 1)
+        print(f"  \033[32m✓ Using port {actual_port}\033[0m")
+
+    print(f"\n  \033[35m╔══════════════════════════════════╗\033[0m")
+    print(f"  \033[35m║      Qythera Inference Server     ║\033[0m")
+    print(f"  \033[35m╚══════════════════════════════════╝\033[0m")
+    print(f"  Host: {host}:{actual_port}")
+
+    server_instance = QytheraAI()
+
+    print(f"\n  \033[36mAPI:\033[0m    http://{host}:{actual_port}/v1/chat/completions")
+    print(f"  \033[36mHealth:\033[0m  http://{host}:{actual_port}/health")
+    print(f"\n  \033[33mPress Ctrl+C to stop\033[0m\n")
+
+    try:
+        httpd = HTTPServer((host, actual_port), Handler)
         httpd.serve_forever()
+    except PermissionError:
+        print(f"\n  \033[31mERROR: Permission denied on port {actual_port}\033[0m")
+        print(f"  \033[33mSolutions:\033[0m")
+        print(f"  1. Use a higher port: python -m core.inference.server --port 8080")
+        print(f"  2. On serv00: use port 8080 or higher")
+        print(f"  3. On Linux: sudo python -m core.inference.server")
+        sys.exit(1)
+    except OSError as e:
+        print(f"\n  \033[31mERROR: {e}\033[0m")
+        print(f"  \033[33mTry: python -m core.inference.server --port 8080\033[0m")
+        sys.exit(1)
     except KeyboardInterrupt:
         pass
     finally:
-        print("\n  Server stopped.")
-        httpd.server_close()
+        print("\n  \033[32mServer stopped.\033[0m")
+        if httpd:
+            httpd.server_close()
 
 
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="Qythera Inference Server")
     p.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    p.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    p.add_argument("--port", type=int, default=8000, help="Port (auto-finds free if busy)")
     args = p.parse_args()
     run_server(args.host, args.port)
