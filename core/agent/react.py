@@ -40,8 +40,12 @@ class ReActAgent:
             tool_name = action_match.group(1)
             args_str = action_match.group(2)
             try:
-                args = dict(re.findall(r"(\w+)=[\'"](.*?)[\'"]", args_str))
-            except:
+                args = {}
+                for pair in args_str.split(","):
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        args[k.strip()] = v.strip().strip('"\'')
+            except Exception:
                 args = {"input": args_str}
             return thought, tool_name, args
         
