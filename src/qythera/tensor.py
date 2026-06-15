@@ -698,7 +698,7 @@ class GatherBackward:
     def backward(ctx, grad):
         x, idx, axis = ctx.saved
         g = np.zeros_like(x)
-        np.add.at(g, (idx, _bk_arange(g.shape[1])) if axis == 1 else idx, grad)
+        np.add.at(g, (idx, _bk_arange(g.shape[1]).astype(np.int64)) if axis == 1 else idx, grad)
         return g, None
 
 class ScatterBackward:
@@ -818,7 +818,7 @@ def _einsum_backward_repeated(grad, inp_sub, remaining_str, input_subs_list, out
         g_unique = _bk_einsum(unique_eq, grad)
     for orig_ch, new_ch, dup_axis, orig_axis in reversed(dup_info):
         n = dim_sizes[orig_ch]
-        diag_idx = _bk_arange(n)
+        diag_idx = _bk_arange(n).astype(np.int64)
         idx_list = [slice(None)] * g_unique.ndim
         idx_list[orig_axis] = diag_idx
         idx_list[dup_axis] = diag_idx
@@ -940,8 +940,8 @@ class ConvBackward:
                 dcol = _bk_einsum('ji,bik->bjk', wg, gg).reshape(B, Cg, KH, KW, H_out, W_out)
                 for ki in range(KH):
                     for kj in range(KW):
-                        hi = _bk_arange(H_out) * SH + ki * DH
-                        wj = _bk_arange(W_out) * SW + kj * DW
+                        hi = _bk_arange(H_out, dtype=np.int64) * SH + ki * DH
+                        wj = _bk_arange(W_out, dtype=np.int64) * SW + kj * DW
                         hh, ww = np.meshgrid(hi, wj, indexing='ij')
                         for bi in range(B):
                             for ci in range(Cg):
@@ -967,7 +967,7 @@ class ConvBackward:
                 dweight[g * Og:(g + 1) * Og] = _bk_einsum('bij,bjk->ik', gg, cg).reshape(Og, Cg, K)
                 dcol = _bk_einsum('ji,bik->bjk', wg, gg).reshape(B, Cg, K, L_out)
                 for ki in range(K):
-                    li = _bk_arange(L_out) * S + ki * D
+                    li = _bk_arange(L_out, dtype=np.int64) * S + ki * D
                     for bi in range(B):
                         for ci in range(Cg):
                             np.add.at(dx_pad[bi, g * Cg + ci], li, dcol[bi, ci, ki])
@@ -2008,7 +2008,7 @@ class Tensor:
 
     def scatter_add_(self, dim, index, src):
         src = src if isinstance(src, Tensor) else Tensor(_bk_from_list(src, dtype=np.float32))
-        np.add.at(self.data, (index.data, _bk_arange(self.shape[1])) if dim == 1 else index.data, src.data)
+        np.add.at(self.data, (index.data, _bk_arange(self.shape[1]).astype(np.int64)) if dim == 1 else index.data, src.data)
         self._version += 1
         return self
 
@@ -2157,11 +2157,13 @@ class Tensor:
         V = log_probs.shape[-1]
         if label_smoothing > 0:
             one_hot = _bk_zeros((n, V), dtype=np.float32)
-            one_hot[_bk_arange(n), target_idx] = 1.0 - label_smoothing
+            idx = _bk_arange(n).astype(np.int64)
+            one_hot[idx, target_idx] = 1.0 - label_smoothing
             one_hot += label_smoothing / V
         else:
             one_hot = _bk_zeros((n, V), dtype=np.float32)
-            one_hot[_bk_arange(n), target_idx] = 1.0
+            idx = _bk_arange(n).astype(np.int64)
+            one_hot[idx, target_idx] = 1.0
         one_hot_t = Tensor(one_hot, requires_grad=False)
         cross = -(log_probs * one_hot_t).sum(axis=-1) / n
         return cross.mean()
@@ -2193,16 +2195,18 @@ def cross_entropy(logits, target, label_smoothing=0.0):
     log_probs = _bk_log(probs.data + 1e-8)
     if label_smoothing > 0:
         V = probs.shape[-1]
-        loss = -(1 - label_smoothing) * log_probs[_bk_arange(target.shape[0]), target.astype(int)] - \
+        idx = _bk_arange(target.shape[0]).astype(np.int64)
+        loss = -(1 - label_smoothing) * log_probs[idx, target.astype(int)] - \
                label_smoothing * log_probs.mean(axis=-1)
     else:
-        loss = -log_probs[_bk_arange(target.shape[0]), target.astype(int)]
+        idx = _bk_arange(target.shape[0]).astype(np.int64)
+        loss = -log_probs[idx, target.astype(int)]
     return Tensor(loss.mean(), requires_grad=logits.requires_grad)
 
 def nll_loss(log_probs, target):
     if isinstance(target, Tensor):
         target = target.data
-    loss = -log_probs.data[_bk_arange(target.shape[0]), target]
+    loss = -log_probs.data[_bk_arange(target.shape[0]).astype(np.int64), target.astype(int)]
     return Tensor(loss.mean(), requires_grad=log_probs.requires_grad)
 
 def bce_loss(pred, target):
