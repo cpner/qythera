@@ -683,8 +683,8 @@ class Dropout(Module):
             return x
         scale = 1.0 / (1.0 - self.p)
         mask = np.random.binomial(1, 1 - self.p, x.shape).astype(np.float32)
-        return Tensor(x.data * mask * scale, requires_grad=x.requires_grad,
-                      _ctx=Context(DropoutBackward, (x,), (mask, scale)))
+        mask_t = Tensor(mask, requires_grad=False)
+        return x * mask_t * scale
 
 
 class Dropout2d(Module):

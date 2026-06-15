@@ -698,14 +698,30 @@ class GatherBackward:
     def backward(ctx, grad):
         x, idx, axis = ctx.saved
         g = np.zeros_like(x)
-        np.add.at(g, (idx, _bk_arange(g.shape[1]).astype(np.int64)) if axis == 1 else idx, grad)
+        idx_arrays = []
+        for k in range(x.ndim):
+            if k == axis:
+                idx_arrays.append(idx)
+            else:
+                arr = np.arange(x.shape[k], dtype=np.int64)
+                shape = [1] * idx.ndim
+                shape[k] = x.shape[k]
+                arr = arr.reshape(shape)
+                arr = np.broadcast_to(arr, idx.shape).copy()
+                idx_arrays.append(arr)
+        np.add.at(g, tuple(idx_arrays), grad)
         return g, None
 
 class ScatterBackward:
     @staticmethod
     def backward(ctx, grad):
-        idx, dim, src = ctx.saved
-        return grad[idx], None
+        idx, dim, src_shape = ctx.saved
+        g = np.zeros(src_shape, dtype=np.float32)
+        idx_tuple = [slice(None)] * len(src_shape)
+        idx_tuple[dim] = idx
+        idx_tuple = tuple(idx_tuple)
+        np.add.at(g, idx_tuple, grad)
+        return g, None
 
 class WhereBackward:
     @staticmethod
@@ -1996,19 +2012,26 @@ class Tensor:
 
     def gather(self, dim, index):
         index = index if isinstance(index, Tensor) else Tensor(_bk_from_list(index, dtype=np.int64))
-        result = np.take_along_axis(self.data, index.data, axis=dim)
+        idx_data = index.data.astype(np.int64)
+        result = np.take_along_axis(self.data, idx_data, axis=dim)
         return Tensor(result, requires_grad=self.requires_grad,
-                      _ctx=Context(GatherBackward, (self, index), (self.data, index.data, dim)))
+                      _ctx=Context(GatherBackward, (self, index), (self.data, idx_data, dim)))
 
     def scatter_(self, dim, index, src):
         src = src if isinstance(src, Tensor) else Tensor(_bk_from_list(src, dtype=np.float32))
-        np.put_along_axis(self.data, index.data, src.data, axis=dim)
+        np.put_along_axis(self.data, index.data.astype(np.int64), src.data, axis=dim)
         self._version += 1
         return self
 
     def scatter_add_(self, dim, index, src):
         src = src if isinstance(src, Tensor) else Tensor(_bk_from_list(src, dtype=np.float32))
-        np.add.at(self.data, (index.data, _bk_arange(self.shape[1]).astype(np.int64)) if dim == 1 else index.data, src.data)
+        idx_data = index.data.astype(np.int64)
+        if dim == 1:
+            extra = _bk_arange(self.shape[0]).astype(np.int64).reshape(-1, 1)
+            extra = np.broadcast_to(extra, idx_data.shape).copy()
+            np.add.at(self.data, (extra, idx_data), src.data)
+        else:
+            np.add.at(self.data, idx_data, src.data)
         self._version += 1
         return self
 

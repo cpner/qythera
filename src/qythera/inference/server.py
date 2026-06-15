@@ -283,36 +283,47 @@ class RouteHandler:
             return ResponseBuilder.bad_request("messages required")
 
         stream = body.get("stream", False)
-        prompt = messages[-1].get("content", "")
+        max_tokens = body.get("max_tokens", 256)
+        temperature = body.get("temperature", 1.0)
+        top_k = body.get("top_k", 50)
+
+        conv_id = body.get("conversation_id", f"conv_{int(time.time()*1000)}")
+        history = self._get_conversation(conv_id)
+        for msg in messages:
+            role = msg.get("role", "user")
+            content_text = msg.get("content", "")
+            if history and history[-1]["role"] == role and role == "user":
+                history[-1]["content"] = content_text
+            else:
+                history.append({"role": role, "content": content_text})
+        self._save_conversation(conv_id, history)
 
         t0 = time.time()
         slot_id = self.batch.acquire_slot()
 
         try:
             if stream:
+                return self._stream_chat(conv_id, history, max_tokens,
+                                         temperature, top_k, t0, slot_id, body)
+            else:
+                response_text = self._generate_autoregressive(
+                    history, max_tokens, temperature, top_k)
+                latency = time.time() - t0
+                self.health.record_request(latency * 1000)
+                history.append({"role": "assistant", "content": response_text})
+                self._save_conversation(conv_id, history)
                 return ResponseBuilder.json({
                     "id": f"c{int(time.time()*1000)}",
                     "object": "chat.completion",
                     "model": body.get("model", "vaelon"),
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
-                    "streaming": True,
+                    "conversation_id": conv_id,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": response_text},
+                        "finish_reason": "stop",
+                    }],
+                    "latency_ms": round(latency * 1000, 1),
                 })
-
-            response_text = self._generate_response(prompt)
-            latency = time.time() - t0
-            self.health.record_request(latency * 1000)
-
-            return ResponseBuilder.json({
-                "id": f"c{int(time.time()*1000)}",
-                "object": "chat.completion",
-                "model": body.get("model", "vaelon"),
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": response_text},
-                    "finish_reason": "stop",
-                }],
-                "latency_ms": round(latency * 1000, 1),
-            })
         except Exception as e:
             self.health.record_request(0, error=True)
             return ResponseBuilder.json({"error": str(e)}, 500)
@@ -320,26 +331,156 @@ class RouteHandler:
             if slot_id is not None:
                 self.batch.release_slot(slot_id)
 
-    def _generate_response(self, prompt: str) -> str:
-        if self.model is not None and self.tokenizer is not None:
-            try:
-                tokens = self.tokenizer.encode(prompt)
-                input_arr = np.array([tokens], dtype=np.int32) if hasattr(tokens, '__iter__') else np.array([[tokens]], dtype=np.int32)
-                from qythera.tensor import Tensor
+    def _get_conversation(self, conv_id: str) -> List[Dict]:
+        if not hasattr(self, '_conversations'):
+            self._conversations = {}
+        return self._conversations.setdefault(conv_id, [])
+
+    def _save_conversation(self, conv_id: str, history: List[Dict]):
+        if not hasattr(self, '_conversations'):
+            self._conversations = {}
+        self._conversations[conv_id] = history
+
+    def _format_prompt(self, history: List[Dict]) -> str:
+        parts = []
+        for msg in history:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            parts.append(f"<|{role}|>\n{content}")
+        parts.append("<|assistant|>\n")
+        return "".join(parts)
+
+    def _generate_autoregressive(self, history: List[Dict], max_tokens: int = 256,
+                                  temperature: float = 1.0, top_k: int = 50) -> str:
+        if self.model is None or self.tokenizer is None:
+            prompt = history[-1].get("content", "")
+            return f"Qythera received: {prompt}"
+
+        try:
+            from qythera.tensor import Tensor
+            full_prompt = self._format_prompt(history)
+            tokens = self.tokenizer.encode(full_prompt)
+            if isinstance(tokens, int):
+                tokens = [tokens]
+
+            generated_tokens = []
+            for _ in range(max_tokens):
+                input_arr = np.array([tokens], dtype=np.int32)
                 inp = Tensor(input_arr)
                 output = self.model.forward(inp)
-                if hasattr(output, 'data'):
-                    logits = output.data
-                    if logits.ndim == 3:
-                        last_logits = logits[0, -1, :]
-                    else:
-                        last_logits = logits.flatten()
+                if not hasattr(output, 'data'):
+                    break
+                logits = output.data
+                if logits.ndim == 3:
+                    last_logits = logits[0, -1, :]
+                else:
+                    last_logits = logits.flatten()
+
+                if temperature > 0:
+                    scaled = last_logits / temperature
+                    top_k_idx = np.argpartition(scaled, -top_k)[-top_k:]
+                    mask = np.full_like(scaled, -1e9)
+                    mask[top_k_idx] = scaled[top_k_idx]
+                    exp_logits = np.exp(mask - mask.max())
+                    probs = exp_logits / exp_logits.sum()
+                    token_id = int(np.random.choice(len(probs), p=probs))
+                else:
                     token_id = int(np.argmax(last_logits))
-                    return self.tokenizer.decode([token_id])
-                return str(output)
-            except Exception as e:
-                return f"Model error: {e}"
-        return f"Qythera received: {prompt}"
+
+                if hasattr(self.tokenizer, 'eos_token_id') and                    token_id == self.tokenizer.eos_token_id:
+                    break
+                generated_tokens.append(token_id)
+                tokens.append(token_id)
+
+            if generated_tokens:
+                return self.tokenizer.decode(generated_tokens)
+            return ""
+        except Exception as e:
+            return f"Model error: {e}"
+
+    def _stream_chat(self, conv_id, history, max_tokens, temperature, top_k,
+                     t0, slot_id, body):
+        from qythera.tensor import Tensor
+        gen_id = f"c{int(time.time()*1000)}"
+
+        try:
+            conn = None
+            full_prompt = self._format_prompt(history)
+            tokens = self.tokenizer.encode(full_prompt)
+            if isinstance(tokens, int):
+                tokens = [tokens]
+
+            generated_tokens = []
+            for i in range(max_tokens):
+                input_arr = np.array([tokens], dtype=np.int32)
+                inp = Tensor(input_arr)
+                output = self.model.forward(inp)
+                if not hasattr(output, 'data'):
+                    break
+                logits = output.data
+                if logits.ndim == 3:
+                    last_logits = logits[0, -1, :]
+                else:
+                    last_logits = logits.flatten()
+
+                if temperature > 0:
+                    scaled = last_logits / temperature
+                    top_k_idx = np.argpartition(scaled, -top_k)[-top_k:]
+                    mask = np.full_like(scaled, -1e9)
+                    mask[top_k_idx] = scaled[top_k_idx]
+                    exp_logits = np.exp(mask - mask.max())
+                    probs = exp_logits / exp_logits.sum()
+                    token_id = int(np.random.choice(len(probs), p=probs))
+                else:
+                    token_id = int(np.argmax(last_logits))
+
+                if hasattr(self.tokenizer, 'eos_token_id') and                    token_id == self.tokenizer.eos_token_id:
+                    break
+                generated_tokens.append(token_id)
+                tokens.append(token_id)
+
+                token_text = self.tokenizer.decode([token_id])
+                chunk = json.dumps({
+                    "id": gen_id,
+                    "object": "chat.completion.chunk",
+                    "model": body.get("model", "vaelon"),
+                    "conversation_id": conv_id,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": token_text},
+                        "finish_reason": None,
+                    }],
+                })
+                sse_payload = f"data: {chunk}\n\n".encode("utf-8")
+                yield sse_payload
+
+            done_chunk = json.dumps({
+                "id": gen_id,
+                "object": "chat.completion.chunk",
+                "model": body.get("model", "vaelon"),
+                "conversation_id": conv_id,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            })
+            yield f"data: {done_chunk}\n\n".encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+            latency = time.time() - t0
+            self.health.record_request(latency * 1000)
+            if generated_tokens:
+                full_response = self.tokenizer.decode(generated_tokens)
+                history.append({"role": "assistant", "content": full_response})
+                self._save_conversation(conv_id, history)
+        except Exception as e:
+            self.health.record_request(0, error=True)
+            err = json.dumps({"error": str(e)})
+            yield f"data: {err}\n\n".encode("utf-8")
+        finally:
+            if slot_id is not None:
+                self.batch.release_slot(slot_id)
 
     def _serve_static(self, path: str, content_type: str) -> bytes:
         # Serve icons from the root icons/ directory
@@ -447,7 +588,23 @@ class RawSocketHTTPServer:
 
             request = RequestParser.parse(data)
             response = self.handler.handle(request)
-            conn.sendall(response)
+            if hasattr(response, '__iter__') and not isinstance(response, (bytes, dict)):
+                header = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/event-stream\r\n"
+                    b"Cache-Control: no-cache\r\n"
+                    b"Connection: keep-alive\r\n"
+                    b"Access-Control-Allow-Origin: *\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"\r\n"
+                )
+                conn.sendall(header)
+                for chunk in response:
+                    size = f"{len(chunk):x}\r\n".encode("utf-8")
+                    conn.sendall(size + chunk + b"\r\n")
+                conn.sendall(b"0\r\n\r\n")
+            else:
+                conn.sendall(response)
         except Exception as e:
             try:
                 conn.sendall(ResponseBuilder.json({"error": str(e)}, 500))

@@ -479,6 +479,68 @@ class KVQuantizedCache:
         return 1.0 - (quant_bytes / full_bytes)
 
 
+class INT8KVCache:
+    def __init__(self, max_seq_len: int, num_layers: int, num_kv_heads: int, head_dim: int):
+        self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.k_data = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.int8)
+                       for _ in range(num_layers)]
+        self.v_data = [np.zeros((1, num_kv_heads, max_seq_len, head_dim), dtype=np.int8)
+                       for _ in range(num_layers)]
+        self.k_scales = [np.zeros((1, num_kv_heads, 1, 1), dtype=np.float32)
+                         for _ in range(num_layers)]
+        self.v_scales = [np.zeros((1, num_kv_heads, 1, 1), dtype=np.float32)
+                         for _ in range(num_layers)]
+        self.cur_len = [0] * num_layers
+
+    def _quantize_per_head(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        abs_max = np.abs(x).max(axis=-1, keepdims=True)
+        abs_max = np.where(abs_max == 0, 1.0, abs_max)
+        scale = abs_max / 127.0
+        quantized = np.clip(np.round(x / scale), -128, 127).astype(np.int8)
+        return quantized, scale
+
+    def _dequantize_per_head(self, quantized: np.ndarray, scale: np.ndarray) -> np.ndarray:
+        return quantized.astype(np.float32) * scale
+
+    def update(self, layer: int, new_k: np.ndarray, new_v: np.ndarray, position: int):
+        n = new_k.shape[2]
+        qk, sk = self._quantize_per_head(new_k)
+        qv, sv = self._quantize_per_head(new_v)
+        self.k_data[layer][:, :, position:position + n] = qk
+        self.v_data[layer][:, :, position:position + n] = qv
+        self.k_scales[layer] = sk
+        self.v_scales[layer] = sv
+        self.cur_len[layer] = position + n
+        return self._gather(layer)
+
+    def _gather(self, layer: int):
+        c = self.cur_len[layer]
+        if c == 0:
+            return (np.zeros((1, self.num_kv_heads, 0, self.head_dim), dtype=np.float32),
+                    np.zeros((1, self.num_kv_heads, 0, self.head_dim), dtype=np.float32))
+        k = self._dequantize_per_head(self.k_data[layer][:, :, :c], self.k_scales[layer])
+        v = self._dequantize_per_head(self.v_data[layer][:, :, :c], self.v_scales[layer])
+        return k, v
+
+    def get(self, layer: int):
+        return self._gather(layer)
+
+    def reset(self):
+        self.cur_len = [0] * self.num_layers
+
+    def get_seq_len(self, layer: int = 0):
+        return self.cur_len[layer]
+
+    def get_memory_savings(self) -> float:
+        full = self.num_layers * 2 * self.max_seq_len * self.num_kv_heads * self.head_dim * 4
+        quant = self.num_layers * 2 * self.max_seq_len * self.num_kv_heads * (self.head_dim + 1)
+        return 1.0 - (quant / full)
+
+
+
 class SnapKVCache:
     def __init__(self, max_seq_len: int, num_layers: int, num_kv_heads: int,
                  head_dim: int, window_size: int = 64, num_snapshots: int = 16):
@@ -674,6 +736,99 @@ class PrefixCache:
 
     def clear(self):
         self.cache.clear()
+
+
+class SpeculativeDecoder:
+    def __init__(self, target_model, draft_model, tokenizer, draft_tokens: int = 4,
+                 temperature: float = 1.0, top_k: int = 50):
+        self.target_model = target_model
+        self.draft_model = draft_model
+        self.tokenizer = tokenizer
+        self.draft_tokens = draft_tokens
+        self.temperature = temperature
+        self.top_k = top_k
+
+    def _sample_token(self, logits: np.ndarray, temperature: float = 1.0,
+                      top_k: int = 0) -> int:
+        if temperature > 0:
+            logits = logits / temperature
+        if top_k > 0:
+            top_indices = np.argpartition(logits, -top_k)[-top_k:]
+            mask = np.full_like(logits, -1e9)
+            mask[top_indices] = logits[top_indices]
+            logits = mask
+        exp_logits = exp(logits - logits.max())
+        probs = exp_logits / exp_logits.sum()
+        return int(np.random.choice(len(probs), p=probs))
+
+    def _get_logits(self, model, token_ids: List[int], position: int = 0):
+        from qythera.tensor import Tensor
+        arr = np.array([token_ids], dtype=np.int32)
+        inp = Tensor(arr)
+        output = model.forward(inp)
+        if hasattr(output, 'data'):
+            logits = output.data
+            if logits.ndim == 3:
+                return logits[0, -1, :]
+            return logits.flatten()
+        return None
+
+    def generate(self, prompt_tokens: List[int], max_new_tokens: int = 128) -> List[int]:
+        from qythera.tensor import Tensor
+        generated = list(prompt_tokens)
+
+        for _ in range(max_new_tokens):
+            draft_token_ids = list(generated)
+            draft_probs = []
+
+            for _ in range(self.draft_tokens):
+                logits = self._get_logits(self.draft_model, draft_token_ids)
+                if logits is None:
+                    break
+                tok = self._sample_token(logits, self.temperature, self.top_k)
+                draft_token_ids.append(tok)
+                draft_probs.append(logits)
+
+            target_logits = self._get_logits(self.target_model, draft_token_ids)
+            if target_logits is None:
+                break
+
+            accepted = 0
+            for i in range(min(self.draft_tokens, len(draft_probs))):
+                draft_tok = draft_token_ids[len(generated) + i]
+                d_logits = draft_probs[i]
+                t_logits = target_logits
+
+                d_probs = exp(d_logits - d_logits.max())
+                d_probs = d_probs / d_probs.sum()
+                q_prob = d_probs[draft_tok]
+
+                t_probs = exp(t_logits - t_logits.max())
+                t_probs = t_probs / t_probs.sum()
+                p_prob = t_probs[draft_tok]
+
+                ratio = min(1.0, p_prob / max(q_prob, 1e-10))
+                if np.random.random() < ratio:
+                    generated.append(draft_tok)
+                    accepted += 1
+                else:
+                    break
+
+            if accepted < len(draft_probs):
+                break
+
+            if accepted == 0:
+                logits = self._get_logits(self.target_model, generated)
+                if logits is None:
+                    break
+                tok = self._sample_token(logits, self.temperature, self.top_k)
+                generated.append(tok)
+
+            if generated[-1] == self.tokenizer.eos_token_id:
+                break
+
+        return generated[len(prompt_tokens):]
+
 
 
 # ---------------------------------------------------------------------------

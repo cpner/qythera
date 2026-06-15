@@ -1,4 +1,5 @@
 """Data pipeline. Pure Python + NumPy."""
+import glob as _glob
 import html
 import json
 import math
@@ -7,9 +8,10 @@ import os
 import re
 import struct
 import sys
+import random
 from collections import Counter, defaultdict
 import functools
-from typing import Iterator, List, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -117,14 +119,32 @@ class DataLoader:
             batch_idx = indices[start : start + self.batch_size]
             batch = []
             for idx in batch_idx:
-                seq = self.dataset[idx]
+                item = self.dataset[idx]
+                if isinstance(item, tuple) and len(item) == 2:
+                    inp, tgt = item
+                    if isinstance(inp, np.ndarray) and isinstance(tgt, np.ndarray):
+                        batch.append({"input": inp, "target": tgt})
+                        continue
+                seq = item if isinstance(item, np.ndarray) else np.array(item)
                 if len(seq) < self.seq_len:
                     pad = [self.pad_id] * (self.seq_len - len(seq))
                     seq = np.concatenate([seq, np.array(pad, dtype=seq.dtype)])
                 elif len(seq) > self.seq_len:
                     seq = seq[: self.seq_len]
                 batch.append(seq)
-            yield Tensor(np.stack(batch))
+            if batch and isinstance(batch[0], dict):
+                max_len = max(len(b["input"]) for b in batch)
+                for b in batch:
+                    if len(b["input"]) < max_len:
+                        pad = [self.pad_id] * (max_len - len(b["input"]))
+                        b["input"] = np.concatenate([b["input"], np.array(pad, dtype=b["input"].dtype)])
+                        b["target"] = np.concatenate([b["target"], np.array(pad, dtype=b["target"].dtype)])
+                yield {
+                    "input": Tensor(np.stack([b["input"] for b in batch])),
+                    "target": Tensor(np.stack([b["target"] for b in batch])),
+                }
+            else:
+                yield Tensor(np.stack(batch))
 
     def __len__(self):
         return math.ceil(len(self.dataset) / self.batch_size)
@@ -567,3 +587,138 @@ class ImportanceSampler:
 
     def sample(self, batch_size: int) -> np.ndarray:
         return np.random.choice(len(self.weights), batch_size, p=self.weights)
+
+
+# ---------------------------------------------------------------------------
+# TextDataset – read text file, tokenize, create (input, target) pairs
+# ---------------------------------------------------------------------------
+
+class TextDataset:
+    def __init__(self, path: str, tokenizer, max_seq_len: int = 512, pad_id: int = 0,
+                 eos_id: int = 0):
+        self.max_seq_len = max_seq_len
+        self.pad_id = pad_id
+        with open(path, "r") as f:
+            text = f.read()
+        tokens = tokenizer.encode(text)
+        if not tokens or tokens[-1] != eos_id:
+            tokens.append(eos_id)
+        self._tokens = tokens
+        self._num_samples = max(0, (len(tokens) - 1) // max_seq_len)
+
+    def __len__(self):
+        return self._num_samples
+
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        start = idx * self.max_seq_len
+        end = start + self.max_seq_len + 1
+        chunk = self._tokens[start:end]
+        if len(chunk) < self.max_seq_len + 1:
+            chunk = chunk + [self.pad_id] * (self.max_seq_len + 1 - len(chunk))
+        inp = np.array(chunk[: self.max_seq_len], dtype=np.int64)
+        tgt = np.array(chunk[1: self.max_seq_len + 1], dtype=np.int64)
+        return inp, tgt
+
+
+# ---------------------------------------------------------------------------
+# collate_fn – pad sequences in a batch to same length
+# ---------------------------------------------------------------------------
+
+def collate_fn(batch: list, pad_id: int = 0) -> dict:
+    if not batch:
+        return {"input": np.array([], dtype=np.int64), "target": np.array([], dtype=np.int64)}
+    first = batch[0]
+    if isinstance(first, dict):
+        keys = list(first.keys())
+        max_len = max(len(b[k]) for b in batch for k in keys)
+        result = {}
+        for k in keys:
+            padded = []
+            for b in batch:
+                arr = np.array(b[k], dtype=np.int64)
+                if len(arr) < max_len:
+                    arr = np.concatenate([arr, np.full(max_len - len(arr), pad_id, dtype=np.int64)])
+                padded.append(arr)
+            result[k] = np.stack(padded)
+        return result
+    if isinstance(first, tuple) and len(first) == 2:
+        max_len = max(len(b[0]) for b in batch)
+        inputs, targets = [], []
+        for inp, tgt in batch:
+            inp = np.array(inp, dtype=np.int64)
+            tgt = np.array(tgt, dtype=np.int64)
+            if len(inp) < max_len:
+                inp = np.concatenate([inp, np.full(max_len - len(inp), pad_id, dtype=np.int64)])
+                tgt = np.concatenate([tgt, np.full(max_len - len(tgt), pad_id, dtype=np.int64)])
+            inputs.append(inp)
+            targets.append(tgt)
+        return {"input": np.stack(inputs), "target": np.stack(targets)}
+    max_len = max(len(b) for b in batch)
+    padded = []
+    for b in batch:
+        arr = np.array(b, dtype=np.int64)
+        if len(arr) < max_len:
+            arr = np.concatenate([arr, np.full(max_len - len(arr), pad_id, dtype=np.int64)])
+        padded.append(arr)
+    return {"input": np.stack(padded), "target": np.stack(padded)}
+
+
+# ---------------------------------------------------------------------------
+# SimpleTextCorpus – load multiple text files, merge, shuffle
+# ---------------------------------------------------------------------------
+
+class SimpleTextCorpus:
+    def __init__(self, paths: Optional[List[str]] = None, pattern: Optional[str] = None,
+                 shuffle: bool = True, seed: int = 42):
+        self.shuffle = shuffle
+        self.seed = seed
+        if paths is None and pattern is not None:
+            paths = sorted(_glob.glob(pattern))
+        if not paths:
+            raise ValueError("no files provided")
+        self._files = list(paths)
+        self._docs = []
+        for p in self._files:
+            with open(p, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        self._docs.append(line)
+        if shuffle:
+            rng = random.Random(seed)
+            rng.shuffle(self._docs)
+
+    def __len__(self):
+        return len(self._docs)
+
+    def __iter__(self):
+        return iter(self._docs)
+
+    def texts(self) -> List[str]:
+        return list(self._docs)
+
+
+# ---------------------------------------------------------------------------
+# SampleTrainingDataGenerator – synthetic training data for testing
+# ---------------------------------------------------------------------------
+
+class SampleTrainingDataGenerator:
+    def __init__(self, seed: int = 42):
+        self.rng = random.Random(seed)
+
+    def generate(self, path: str, num_samples: int = 100, min_len: int = 10, max_len: int = 50):
+        vocab = list("abcdefghijklmnopqrstuvwxyz ")
+        with open(path, "w") as f:
+            for _ in range(num_samples):
+                length = self.rng.randint(min_len, max_len)
+                line = "".join(self.rng.choices(vocab, k=length))
+                f.write(line + "\n")
+
+    def generate_corpus(self, path: str, num_files: int = 3, samples_per_file: int = 50,
+                        min_len: int = 10, max_len: int = 50) -> List[str]:
+        paths = []
+        for i in range(num_files):
+            fp = f"{path}_{i}.txt"
+            self.generate(fp, num_samples=samples_per_file, min_len=min_len, max_len=max_len)
+            paths.append(fp)
+        return paths
