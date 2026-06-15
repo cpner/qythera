@@ -842,3 +842,54 @@ class TriviaQA:
 
     def _exact_match(self, pred, answer):
         return pred.lower().strip() == answer.lower().strip()
+
+
+# ---------------------------------------------------------------------------
+# MATH: Competition Mathematics with LaTeX Answer Extraction
+# ---------------------------------------------------------------------------
+
+class MATH:
+    """MATH: competition-level math problems with LaTeX answer extraction."""
+
+    def evaluate(self, model_fn, data):
+        correct = 0
+        for problem, answer in data:
+            pred = model_fn(f"Solve: {problem}")
+            if self._extract_answer(pred) == self._extract_answer(answer):
+                correct += 1
+        return correct / len(data)
+
+    def _extract_answer(self, text):
+        text = text.strip()
+        m = re.search(r"\\boxed\{(.+?)\}", text)
+        if m:
+            return m.group(1).strip()
+        for delim in ["$$", "$"]:
+            if delim in text:
+                start = text.find(delim)
+                end = text.rfind(delim)
+                if start != end:
+                    return text[start + len(delim):end].strip()
+        m = re.search(r"(?:=|is)\s*(.+?)\s*$", text)
+        if m:
+            return m.group(1).strip()
+        return text
+
+
+# ---------------------------------------------------------------------------
+# MTBench: Multi-Turn Dialogue with Reward Model Scoring
+# ---------------------------------------------------------------------------
+
+class MTBench:
+    """MTBench: multi-turn dialogue evaluation with reward model scoring."""
+
+    def __init__(self, reward_model):
+        self.reward_model = reward_model
+
+    def evaluate(self, model_fn, data):
+        scores = []
+        for conversation in data:
+            response = model_fn(conversation)
+            score = self.reward_model.score(response)
+            scores.append(score)
+        return float(np.mean(scores)) if scores else 0.0

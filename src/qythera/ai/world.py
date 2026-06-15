@@ -218,3 +218,76 @@ class BDI_Agent:
             'desires': list(self.desires),
             'intentions': list(self.intentions)
         }
+
+
+class RK4Integrator:
+    def step(self, state: np.ndarray, dt: float, derivatives: callable) -> np.ndarray:
+        k1 = derivatives(state)
+        k2 = derivatives(state + dt / 2 * k1)
+        k3 = derivatives(state + dt / 2 * k2)
+        k4 = derivatives(state + dt * k3)
+        return state + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+
+class SPHSimulation:
+    def __init__(self, particles: np.ndarray, h: float = 0.1):
+        self.particles = np.array(particles, dtype=np.float64)
+        self.h = float(h)
+        self.density = np.zeros(len(particles))
+        self.pressure = np.zeros(len(particles))
+        self.velocities = np.zeros_like(particles)
+        self.mass = np.ones(len(particles))
+        self.rest_density = 1000.0
+        self.gas_constant = 2000.0
+        self.viscosity = 200.0
+        self.gravity = np.array([0.0, -9.81])
+
+    def _kernel(self, r: float) -> float:
+        q = r / self.h
+        if q > 2.0:
+            return 0.0
+        return (15.0 / (np.pi * self.h ** 3)) * max(0.0, 1.0 - q) ** 3
+
+    def _kernel_gradient(self, r_ij: np.ndarray) -> np.ndarray:
+        r = np.linalg.norm(r_ij)
+        if r < 1e-6 or r / self.h > 2.0:
+            return np.zeros_like(r_ij)
+        q = r / self.h
+        return (-45.0 / (np.pi * self.h ** 4)) * (1.0 - q) ** 2 * (r_ij / r)
+
+    def compute_density(self):
+        n = len(self.particles)
+        self.density = np.zeros(n)
+        for i in range(n):
+            for j in range(n):
+                r_ij = self.particles[i] - self.particles[j]
+                r = np.linalg.norm(r_ij)
+                self.density[i] += self.mass[j] * self._kernel(r)
+
+    def compute_pressure(self):
+        self.pressure = self.gas_constant * (self.density - self.rest_density)
+
+    def compute_forces(self) -> np.ndarray:
+        n = len(self.particles)
+        forces = np.zeros_like(self.particles)
+        for i in range(n):
+            f_pressure = np.zeros(2)
+            f_viscosity = np.zeros(2)
+            for j in range(n):
+                if i == j:
+                    continue
+                r_ij = self.particles[i] - self.particles[j]
+                grad = self._kernel_gradient(r_ij)
+                f_pressure += -self.mass[j] * (self.pressure[i] + self.pressure[j]) / (2 * self.density[j] + 1e-6) * grad
+                f_viscosity += self.mass[j] * (self.velocities[j] - self.velocities[i]) / (self.density[j] + 1e-6) * grad
+            f_viscosity *= self.viscosity
+            forces[i] = f_pressure + f_viscosity + self.mass[i] * self.gravity
+        return forces
+
+    def step(self, dt: float):
+        self.compute_density()
+        self.compute_pressure()
+        forces = self.compute_forces()
+        accelerations = forces / (self.density[:, np.newaxis] + 1e-6)
+        self.velocities += accelerations * dt
+        self.particles += self.velocities * dt

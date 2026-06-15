@@ -1004,3 +1004,25 @@ class SelfPlay:
             else:
                 pairs.append((completions[i + 1], completions[i]))
         return pairs
+
+
+class WeakToStrong:
+    def __init__(self, weak_model, strong_model):
+        self.weak_model = weak_model
+        self.strong_model = strong_model
+
+    def train(self, data):
+        pass
+
+
+class DebateAgent:
+    def __init__(self, agent1, agent2, judge):
+        self.agent1 = agent1
+        self.agent2 = agent2
+        self.judge = judge
+
+    def debate(self, topic):
+        arg1 = self.agent1.generate(f"Argue for: {topic}")
+        arg2 = self.agent2.generate(f"Argue against: {topic}")
+        winner = self.judge.decide(arg1, arg2)
+        return winner

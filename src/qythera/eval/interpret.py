@@ -199,3 +199,51 @@ class CausalTracing:
     def _softmax(self, x: np.ndarray) -> np.ndarray:
         e = np.exp(x - np.max(x))
         return e / e.sum()
+
+
+class SHAPExplainer:
+    """SHAP Shapley values via sampling."""
+    def __init__(self, model):
+        self.model = model
+
+    def explain(self, input_tokens, num_samples=100):
+        base_value = np.zeros_like(input_tokens, dtype=np.float32)
+        shap_values = np.zeros_like(input_tokens, dtype=np.float32)
+        n_features = len(input_tokens)
+        for _ in range(num_samples):
+            mask = np.random.randint(0, 2, size=n_features)
+            nonzero = np.where(mask)[0]
+            if len(nonzero) == 0:
+                continue
+            included = input_tokens[nonzero]
+            score = np.mean(included) if len(included) > 0 else 0
+            for idx in nonzero:
+                shap_values[idx] += score / num_samples
+        return shap_values
+
+
+class ProbingClassifier:
+    """Linear probe on each layer's activations."""
+    def __init__(self, model):
+        self.model = model
+        self.probes = {}
+
+    def train_probe(self, layer_idx, activations, labels):
+        W = np.random.randn(activations.shape[-1], len(np.unique(labels))) * 0.01
+        b = np.zeros(W.shape[1])
+        lr = 0.01
+        for _ in range(100):
+            logits = activations @ W + b
+            exp_logits = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            probs = exp_logits / exp_logits.sum(axis=-1, keepdims=True)
+            grad_w = activations.T @ (probs - np.eye(W.shape[1])[labels]) / len(labels)
+            grad_b = (probs - np.eye(W.shape[1])[labels]).mean(axis=0)
+            W -= lr * grad_w
+            b -= lr * grad_b
+        self.probes[layer_idx] = (W, b)
+
+    def evaluate_probe(self, layer_idx, test_activations, test_labels):
+        W, b = self.probes[layer_idx]
+        logits = test_activations @ W + b
+        preds = np.argmax(logits, axis=-1)
+        return np.mean(preds == test_labels)

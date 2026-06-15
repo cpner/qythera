@@ -516,3 +516,30 @@ class WatermarkDetector:
         import hashlib
         h = hashlib.md5(str(prev_token).encode()).hexdigest()
         return set(range(int(h[:8], 16) % 1000, int(h[:8], 16) % 1000 + 500))
+
+
+class RedTeamAgent:
+    def __init__(self, model):
+        self.model = model
+
+    def generate_adversarial(self, target_behavior):
+        prompts = self.model.generate(f"Generate a prompt that would cause: {target_behavior}")
+        return prompts
+
+
+class OutputConsistency:
+    def __init__(self, model, num_samples=5):
+        self.model = model
+        self.num_samples = num_samples
+        self.threshold = 0.5
+
+    def check(self, prompt):
+        outputs = [self.model.generate(prompt) for _ in range(self.num_samples)]
+        variance = self._compute_variance(outputs)
+        return variance < self.threshold
+
+    def _compute_variance(self, outputs):
+        if len(outputs) < 2:
+            return 0.0
+        unique_ratio = len(set(str(o) for o in outputs)) / len(outputs)
+        return unique_ratio

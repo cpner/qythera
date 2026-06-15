@@ -319,3 +319,46 @@ class ScratchpadTrainer:
             output_text += f"\nAnswer: {ex['answer']}"
             pairs.append((input_text, output_text))
         return pairs
+
+
+class PAL:
+    """Program-Aided Language: generate executable Python, run it, use stdout."""
+    def __init__(self, model):
+        self.model = model
+
+    def reason(self, question: str) -> str:
+        code = self.model.generate(f"Write Python code to solve: {question}")
+        try:
+            local_ns = {}
+            exec(code, {"__builtins__": {}}, local_ns)
+            result = local_ns.get("result", local_ns.get("answer", str(code)))
+            return str(result)
+        except Exception as e:
+            return f"Error: {e}"
+
+
+class SocraticMethod:
+    """Chain of decomposed sub-questions."""
+    def __init__(self, model, max_depth=3):
+        self.model = model
+        self.max_depth = max_depth
+
+    def reason(self, question: str) -> str:
+        sub_questions = self._decompose(question)
+        answers = []
+        for sq in sub_questions:
+            answer = self.model.generate(f"Answer concisely: {sq}")
+            answers.append(f"Q: {sq}\nA: {answer}")
+        synthesis = self.model.generate(
+            f"Original question: {question}\n"
+            f"Sub-answers:\n" + "\n".join(answers) +
+            "\nSynthesize a final answer."
+        )
+        return synthesis
+
+    def _decompose(self, question: str) -> list:
+        raw = self.model.generate(
+            f"Break this question into {self.max_depth} simpler sub-questions, "
+            f"one per line: {question}"
+        )
+        return [line.strip() for line in raw.strip().split("\n") if line.strip()][:self.max_depth]
