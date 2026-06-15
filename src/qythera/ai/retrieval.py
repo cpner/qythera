@@ -1,4 +1,4 @@
-"""Retrieval modules: BM25, Dense, Hybrid, ColBERT, InvertedIndex, HyDE, RAPTOR, RRF."""
+"""Retrieval modules: BM25, Dense, Hybrid, ColBERT, InvertedIndex, HyDE, SelfRAG, RAPTOR, RRF."""
 
 import math
 from collections import defaultdict, Counter
@@ -225,13 +225,96 @@ class InvertedIndex:
 
 
 class HyDERetriever:
-    def __init__(self, retriever, lm):
+    def __init__(self, retriever, lm_generate):
         self.retriever = retriever
-        self.lm = lm
+        self.lm_generate = lm_generate
 
-    def retrieve(self, query: str, top_k: int = 5):
-        hypothetical = self.lm.generate(f"Write a document that answers: {query}")
-        return self.retriever.retrieve(hypothetical, top_k)
+    def search(self, query: str, top_k: int = 5) -> List[Tuple[int, float]]:
+        hypothetical = self.lm_generate(f"Write a passage that would answer: {query}")
+        return self.retriever.search(hypothetical, top_k)
+
+
+class SelfRAG:
+    def __init__(self, retriever, lm_generate, lm_classify,
+                 retrieve_threshold: float = 0.5,
+                 relevance_threshold: float = 0.5,
+                 support_threshold: float = 0.5):
+        self.retriever = retriever
+        self.lm_generate = lm_generate
+        self.lm_classify = lm_classify
+        self.retrieve_threshold = retrieve_threshold
+        self.relevance_threshold = relevance_threshold
+        self.support_threshold = support_threshold
+
+    def _should_retrieve(self, query: str) -> float:
+        return self.lm_classify(
+            f"[Retrieve] Rate 0-1 how much external retrieval would help answer: {query}"
+        )
+
+    def _is_relevant(self, query: str, doc_text: str) -> float:
+        return self.lm_classify(
+            f"[IsREL] Rate 0-1 relevance of this document to the query.\n"
+            f"Query: {query}\nDocument: {doc_text}"
+        )
+
+    def _is_supported(self, query: str, response: str, doc_text: str) -> float:
+        return self.lm_classify(
+            f"[IsSUP] Rate 0-1 whether this response is supported by the document.\n"
+            f"Query: {query}\nResponse: {response}\nDocument: {doc_text}"
+        )
+
+    def _is_useful(self, query: str, response: str) -> float:
+        return self.lm_classify(
+            f"[IsUSE] Rate 0-1 usefulness of this response for the query.\n"
+            f"Query: {query}\nResponse: {response}"
+        )
+
+    def search(self, query: str, top_k: int = 5,
+               doc_texts: Optional[Dict[int, str]] = None) -> Dict[str, Any]:
+        retrieve_score = self._should_retrieve(query)
+        used_retrieval = retrieve_score >= self.retrieve_threshold
+
+        relevant_docs = []
+        if used_retrieval:
+            candidates = self.retriever.search(query, top_k=top_k * 2)
+            for doc_id, score in candidates:
+                text = (doc_texts or {}).get(doc_id, f"doc_{doc_id}")
+                rel = self._is_relevant(query, text)
+                if rel >= self.relevance_threshold:
+                    relevant_docs.append((doc_id, score, rel))
+
+            relevant_docs.sort(key=lambda x: x[2], reverse=True)
+            relevant_docs = relevant_docs[:top_k]
+
+        if relevant_docs and doc_texts:
+            context = "\n".join(
+                f"[Doc {did}]: {doc_texts.get(did, '')}" for did, _, _ in relevant_docs
+            )
+            response = self.lm_generate(
+                f"Using these documents:\n{context}\n\nAnswer: {query}"
+            )
+            support_score = max(
+                (self._is_supported(query, response, doc_texts.get(did, ""))
+                 for did, _, _ in relevant_docs),
+                default=0.0,
+            )
+        elif relevant_docs:
+            response = self.lm_generate(f"Answer based on retrieved context: {query}")
+            support_score = 0.0
+        else:
+            response = self.lm_generate(query)
+            support_score = 0.0
+
+        usefulness = self._is_useful(query, response)
+
+        return {
+            "response": response,
+            "used_retrieval": used_retrieval,
+            "retrieve_score": retrieve_score,
+            "relevant_docs": [(did, sc) for did, sc, _ in relevant_docs],
+            "support_score": support_score,
+            "usefulness_score": usefulness,
+        }
 
 
 class RAPTORRetriever:

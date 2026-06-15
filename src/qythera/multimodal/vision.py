@@ -204,6 +204,107 @@ class AudioProcessor:
         return log_mel
 
 
+class CLIPModel:
+    def __init__(self, embed_dim: int = 512, image_size: int = 224, patch_size: int = 32,
+                 in_channels: int = 3, num_heads: int = 8, num_layers: int = 6,
+                 vocab_size: int = 49408, max_text_len: int = 77, temperature_init: float = 0.07):
+        self.embed_dim = embed_dim
+        self.temperature = temperature_init
+        self.image_encoder = ViTEncoder(image_size, patch_size, in_channels, embed_dim, num_heads, num_layers, embed_dim)
+        self.image_proj = np.random.randn(embed_dim, embed_dim) * np.sqrt(2.0 / (embed_dim * 2))
+        self.text_embedding = np.random.randn(vocab_size, embed_dim) * np.sqrt(2.0 / vocab_size)
+        self.text_proj = np.random.randn(embed_dim, embed_dim) * np.sqrt(2.0 / (embed_dim * 2))
+        self.text_pos = np.random.randn(max_text_len, embed_dim) * 0.02
+        self.text_attn = MultiHeadAttention(embed_dim, num_heads)
+        self.text_norm = LayerNorm(embed_dim)
+
+    def encode_image(self, images: np.ndarray) -> np.ndarray:
+        features = self.image_encoder.forward(images)
+        features = features / (np.linalg.norm(features, axis=-1, keepdims=True) + 1e-8)
+        return features
+
+    def encode_text(self, token_ids: np.ndarray) -> np.ndarray:
+        batch_size, seq_len = token_ids.shape
+        x = self.text_embedding[token_ids]
+        x = x + self.text_pos[:seq_len]
+        x = self.text_attn.forward(x)
+        x = self.text_norm.forward(x)
+        mask = (token_ids != 0).astype(np.float64)
+        x = x * mask[:, :, np.newaxis]
+        pooled = x.sum(axis=1) / (mask.sum(axis=1, keepdims=True) + 1e-8)
+        pooled = pooled / (np.linalg.norm(pooled, axis=-1, keepdims=True) + 1e-8)
+        return pooled
+
+    def forward(self, images: np.ndarray, token_ids: np.ndarray) -> float:
+        image_features = self.encode_image(images) @ self.image_proj
+        text_features = self.encode_text(token_ids) @ self.text_proj
+        image_features = image_features / (np.linalg.norm(image_features, axis=-1, keepdims=True) + 1e-8)
+        text_features = text_features / (np.linalg.norm(text_features, axis=-1, keepdims=True) + 1e-8)
+        logits = image_features @ text_features.T / self.temperature
+        batch_size = len(logits)
+        labels = np.arange(batch_size)
+        exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+        log_sum_exp = np.log(exp_logits.sum(axis=1) + 1e-8)
+        log_probs = logits - log_sum_exp[:, np.newaxis]
+        loss_i2t = -np.mean(np.sum(log_probs * np.eye(batch_size)[labels], axis=1))
+        log_probs_t = logits.T - np.log(exp_logits.sum(axis=0, keepdims=True).T + 1e-8)
+        loss_t2i = -np.mean(np.sum(log_probs_t * np.eye(batch_size)[labels], axis=1))
+        return (loss_i2t + loss_t2i) / 2
+
+
+class VideoProcessor:
+    def __init__(self, frame_size: int = 224, patch_size: int = 16, num_channels: int = 3,
+                 temporal_patch_size: int = 4, num_frames: int = 8, embed_dim: int = 256):
+        self.frame_size = frame_size
+        self.patch_size = patch_size
+        self.num_channels = num_channels
+        self.temporal_patch_size = temporal_patch_size
+        self.num_frames = num_frames
+        self.embed_dim = embed_dim
+        self.spatial_patches_per_frame = (frame_size // patch_size) ** 2
+        self.patch_dim = num_channels * patch_size * patch_size
+        self.flat_dim = self.temporal_patch_size * self.spatial_patches_per_frame * self.patch_dim
+        scale = np.sqrt(2.0 / (self.flat_dim + embed_dim))
+        self.video_embed = np.random.randn(self.flat_dim, embed_dim) * scale
+        self.video_bias = np.zeros(embed_dim)
+        self.temporal_pos = np.random.randn(num_frames // temporal_patch_size, embed_dim) * 0.02
+
+    def sample_frames(self, video: np.ndarray, num_frames: int = None) -> np.ndarray:
+        if num_frames is None:
+            num_frames = self.num_frames
+        total_frames = video.shape[0]
+        if total_frames <= num_frames:
+            indices = np.arange(total_frames)
+            padded = np.zeros((num_frames,) + video.shape[1:], dtype=video.dtype)
+            padded[:total_frames] = video[indices]
+            return padded
+        indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+        return video[indices]
+
+    def extract_temporal_patches(self, video: np.ndarray) -> np.ndarray:
+        num_frames = video.shape[0]
+        t_groups = num_frames // self.temporal_patch_size
+        h, w = video.shape[1], video.shape[2]
+        patches = []
+        for t in range(t_groups):
+            frame_patches = []
+            for f in range(t * self.temporal_patch_size, (t + 1) * self.temporal_patch_size):
+                for i in range(0, h, self.patch_size):
+                    for j in range(0, w, self.patch_size):
+                        patch = video[f, i:i+self.patch_size, j:j+self.patch_size].flatten()
+                        frame_patches.append(patch)
+            patches.append(np.concatenate(frame_patches))
+        return np.array(patches, dtype=np.float64)
+
+    def forward(self, video: np.ndarray) -> np.ndarray:
+        video = self.sample_frames(video)
+        temporal_patches = self.extract_temporal_patches(video)
+        embeddings = temporal_patches @ self.video_embed + self.video_bias
+        t_groups = len(embeddings)
+        embeddings = embeddings + self.temporal_pos[:t_groups]
+        return embeddings
+
+
 class SimpleDiffusion:
     def __init__(self, input_dim: int, num_timesteps: int = 1000, beta_start: float = 1e-4,
                  beta_end: float = 0.02):
