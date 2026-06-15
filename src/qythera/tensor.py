@@ -5,7 +5,19 @@ import struct
 from contextlib import contextmanager
 from functools import lru_cache
 import threading
-import numpy as np
+from qythera.backend import (
+    HAS_NUMPY, np,
+    zeros as _bk_zeros, ones as _bk_ones, full as _bk_full, empty as _bk_empty,
+    arange as _bk_arange, from_list as _bk_from_list,
+    matmul as _bk_matmul, einsum as _bk_einsum,
+    sum as _bk_sum, mean as _bk_mean, max as _bk_max, min as _bk_min,
+    exp as _bk_exp, log as _bk_log, sqrt as _bk_sqrt, abs as _bk_abs,
+    sin as _bk_sin, cos as _bk_cos, tanh as _bk_tanh,
+    softmax as _bk_softmax, where as _bk_where,
+    stack as _bk_stack, concatenate as _bk_concatenate,
+    reshape as _bk_reshape, broadcast_to as _bk_broadcast_to,
+    to_numpy as _bk_to_numpy, to_list as _bk_to_list
+)
 
 _local = threading.local()
 
@@ -60,7 +72,7 @@ def cast(val, dtype):
     dt = dtype_info[dtype] if isinstance(dtype, str) else dtype
     if isinstance(val, Tensor):
         return Tensor(val.data.astype(np_dtype(dt)), requires_grad=val.requires_grad)
-    return np.array(val, dtype=np_dtype(dt))
+    return _bk_from_list(val, dtype=np_dtype(dt))
 
 def pack_int4(arr):
     arr = np.asarray(arr, dtype=np.int8).flatten()
@@ -80,7 +92,7 @@ def clamp_to_dtype(val, dtype):
 
 def unpack_int4(data, n):
     data = data if isinstance(data, (bytes, bytearray)) else bytes(data)
-    out = np.zeros(n, dtype=np.int8)
+    out = _bk_zeros(n, dtype=np.int8)
     for i in range(n):
         b = data[i // 2]
         out[i] = (b & 0x0F) if (i % 2 == 0) else ((b >> 4) & 0x0F)
@@ -99,7 +111,7 @@ def pack_int2(arr):
 
 def unpack_int2(data, n):
     data = data if isinstance(data, (bytes, bytearray)) else bytes(data)
-    out = np.zeros(n, dtype=np.int8)
+    out = _bk_zeros(n, dtype=np.int8)
     for i in range(n):
         b = data[i // 4]
         shift = (i % 4) * 2
@@ -230,7 +242,7 @@ class PowBackward:
         exp = ctx.saved[0]
         if isinstance(exp, Tensor):
             return _unbroadcast(grad * exp.data * (a.data ** (exp.data - 1)), a.shape), \
-                   _unbroadcast(grad * (a.data ** exp.data) * np.log(np.maximum(a.data, 1e-30)), exp.shape)
+                   _unbroadcast(grad * (a.data ** exp.data) * _bk_log(np.maximum(a.data, 1e-30)), exp.shape)
         return _unbroadcast(grad * exp * (a.data ** (exp - 1)), a.shape), None
 
 class ExpBackward:
@@ -266,12 +278,12 @@ class SignBackward:
 class SinBackward:
     @staticmethod
     def backward(ctx, grad):
-        return _unbroadcast(grad * np.cos(ctx.inputs[0].data), ctx.inputs[0].shape),
+        return _unbroadcast(grad * _bk_cos(ctx.inputs[0].data), ctx.inputs[0].shape),
 
 class CosBackward:
     @staticmethod
     def backward(ctx, grad):
-        return _unbroadcast(-grad * np.sin(ctx.inputs[0].data), ctx.inputs[0].shape),
+        return _unbroadcast(-grad * _bk_sin(ctx.inputs[0].data), ctx.inputs[0].shape),
 
 class TanBackward:
     @staticmethod
@@ -282,13 +294,13 @@ class AsinBackward:
     @staticmethod
     def backward(ctx, grad):
         x = ctx.inputs[0].data
-        return _unbroadcast(grad / np.sqrt(1 - x * x + 1e-7), x.shape),
+        return _unbroadcast(grad / _bk_sqrt(1 - x * x + 1e-7), x.shape),
 
 class AcosBackward:
     @staticmethod
     def backward(ctx, grad):
         x = ctx.inputs[0].data
-        return _unbroadcast(-grad / np.sqrt(1 - x * x + 1e-7), x.shape),
+        return _unbroadcast(-grad / _bk_sqrt(1 - x * x + 1e-7), x.shape),
 
 class AtanBackward:
     @staticmethod
@@ -323,13 +335,13 @@ class ArcsinhBackward:
     @staticmethod
     def backward(ctx, grad):
         x = ctx.inputs[0].data
-        return _unbroadcast(grad / np.sqrt(x * x + 1 + 1e-7), x.shape),
+        return _unbroadcast(grad / _bk_sqrt(x * x + 1 + 1e-7), x.shape),
 
 class ArccoshBackward:
     @staticmethod
     def backward(ctx, grad):
         x = ctx.inputs[0].data
-        return _unbroadcast(grad / np.sqrt(x * x - 1 + 1e-7), x.shape),
+        return _unbroadcast(grad / _bk_sqrt(x * x - 1 + 1e-7), x.shape),
 
 class ArctanhBackward:
     @staticmethod
@@ -396,7 +408,7 @@ class GeluBackward:
         x = ctx.inputs[0].data
         c = 0.7978845608028654
         k = 0.044715
-        t = np.tanh(c * (x + k * x ** 3))
+        t = _bk_tanh(c * (x + k * x ** 3))
         dt = 1 - t ** 2
         dx = c * (1 + 3 * k * x ** 2) * dt
         return _unbroadcast(grad * (0.5 * (1 + t) + 0.5 * x * dx), x.shape),
@@ -405,7 +417,7 @@ class SiluBackward:
     @staticmethod
     def backward(ctx, grad):
         x = ctx.inputs[0].data
-        s = 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+        s = 1 / (1 + _bk_exp(-np.clip(x, -500, 500)))
         return _unbroadcast(grad * (s + x * s * (1 - s)), x.shape),
 
 class SoftmaxBackward:
@@ -429,7 +441,7 @@ class SumBackward:
         shape, keepdims, axis = ctx.saved
         if axis is not None and not keepdims:
             grad = np.expand_dims(grad, axis=axis)
-        return np.broadcast_to(grad, shape).copy(),
+        return _bk_broadcast_to(grad, shape).copy(),
 
 class MeanBackward:
     @staticmethod
@@ -437,7 +449,7 @@ class MeanBackward:
         shape, keepdims, axis, n = ctx.saved
         if axis is not None and not keepdims:
             grad = np.expand_dims(grad, axis=axis)
-        return np.broadcast_to(grad / n, shape).copy(),
+        return _bk_broadcast_to(grad / n, shape).copy(),
 
 class MaxBackward:
     @staticmethod
@@ -517,7 +529,7 @@ class LogsumexpBackward:
         shape, keepdims, axis = ctx.saved
         x = ctx.inputs[0].data
         lse = x.max(axis=axis, keepdims=True)
-        exp_x = np.exp(x - lse)
+        exp_x = _bk_exp(x - lse)
         s = exp_x.sum(axis=axis, keepdims=True)
         g = grad * exp_x / s
         if not keepdims and axis is not None:
@@ -553,8 +565,8 @@ class MatMulBackward:
         if ad.ndim >= 2 and bd.ndim >= 2:
             batch_axes = tuple(range(max(0, ad.ndim - 2)))
             if ad.ndim == bd.ndim and ad.ndim > 2:
-                ga = np.einsum('...ij,...kj->...ik', grad, bd)
-                gb = np.einsum('...ij,...ik->...kj', ad, grad)
+                ga = _bk_einsum('...ij,...kj->...ik', grad, bd)
+                gb = _bk_einsum('...ij,...ik->...kj', ad, grad)
             else:
                 ga = grad @ np.swapaxes(bd, -1, -2)
                 gb = np.swapaxes(ad, -1, -2) @ grad
@@ -577,7 +589,7 @@ class RMSNormBackward:
     @staticmethod
     def backward(ctx, grad):
         x, gamma, eps = ctx.saved
-        norm = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + eps)
+        norm = _bk_sqrt(_bk_mean(x ** 2, axis=-1, keepdims=True) + eps)
         gx = gamma * grad / norm
         dnorm = -(x * gamma * grad).sum(axis=-1, keepdims=True) / (norm ** 3)
         gx += x * dnorm / x.shape[-1]
@@ -587,7 +599,7 @@ class SiLUBackward2:
     @staticmethod
     def backward(ctx, grad):
         x = ctx.inputs[0].data
-        sig = 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+        sig = 1 / (1 + _bk_exp(-np.clip(x, -500, 500)))
         return _unbroadcast(grad * (sig + x * sig * (1 - sig)), x.shape),
 
 class GELUBackward2:
@@ -596,7 +608,7 @@ class GELUBackward2:
         x = ctx.inputs[0].data
         c = 0.7978845608028654
         k = 0.044715
-        t = np.tanh(c * (x + k * x ** 3))
+        t = _bk_tanh(c * (x + k * x ** 3))
         dt = 1 - t ** 2
         dx = c * (1 + 3 * k * x ** 2) * dt
         return _unbroadcast(grad * (0.5 * (1 + t) + 0.5 * x * dx), x.shape),
@@ -617,7 +629,7 @@ class ELUBackward:
     @staticmethod
     def backward(ctx, grad):
         alpha = ctx.saved[0]
-        mask = (ctx.inputs[0].data > 0).astype(np.float32) + alpha * np.exp(ctx.inputs[0].data) * (ctx.inputs[0].data <= 0).astype(np.float32)
+        mask = (ctx.inputs[0].data > 0).astype(np.float32) + alpha * _bk_exp(ctx.inputs[0].data) * (ctx.inputs[0].data <= 0).astype(np.float32)
         return _unbroadcast(grad * mask, ctx.inputs[0].shape),
 
 class SELUBackward:
@@ -625,7 +637,7 @@ class SELUBackward:
     def backward(ctx, grad):
         alpha = ctx.saved[0]
         lam = ctx.saved[1]
-        mask = lam * ((ctx.inputs[0].data > 0).astype(np.float32) + alpha * np.exp(ctx.inputs[0].data) * (ctx.inputs[0].data <= 0).astype(np.float32))
+        mask = lam * ((ctx.inputs[0].data > 0).astype(np.float32) + alpha * _bk_exp(ctx.inputs[0].data) * (ctx.inputs[0].data <= 0).astype(np.float32))
         return _unbroadcast(grad * mask, ctx.inputs[0].shape),
 
 class ReLU6Backward:
@@ -686,7 +698,7 @@ class GatherBackward:
     def backward(ctx, grad):
         x, idx, axis = ctx.saved
         g = np.zeros_like(x)
-        np.add.at(g, (idx, np.arange(g.shape[1])) if axis == 1 else idx, grad)
+        np.add.at(g, (idx, _bk_arange(g.shape[1])) if axis == 1 else idx, grad)
         return g, None
 
 class ScatterBackward:
@@ -699,8 +711,8 @@ class WhereBackward:
     @staticmethod
     def backward(ctx, grad):
         cond, x, y = ctx.saved
-        gx = np.where(cond, grad, 0) if x is not None else None
-        gy = np.where(~cond, grad, 0) if y is not None else None
+        gx = _bk_where(cond, grad, 0) if x is not None else None
+        gy = _bk_where(~cond, grad, 0) if y is not None else None
         return (gx, gy, None)
 
 class SortBackward:
@@ -747,9 +759,9 @@ class EinsumBackward:
                 if remaining_str:
                     other_inputs_data = [inputs[j].data if isinstance(inputs[j], Tensor) else inputs[j]
                                         for j in range(len(inputs)) if j != i]
-                    g_i = np.einsum(backward_eq, grad, *other_inputs_data)
+                    g_i = _bk_einsum(backward_eq, grad, *other_inputs_data)
                 else:
-                    g_i = np.einsum(backward_eq, grad)
+                    g_i = _bk_einsum(backward_eq, grad)
             grads.append(g_i)
         return tuple(grads)
 
@@ -796,17 +808,17 @@ def _einsum_backward_repeated(grad, inp_sub, remaining_str, input_subs_list, out
     if not all_known:
         if len(inp_sub) == 2 and inp_sub[0] == inp_sub[1]:
             n = inp_shape[0]
-            result = np.zeros(inp_shape, dtype=np.float32)
+            result = _bk_zeros(inp_shape, dtype=np.float32)
             np.fill_diagonal(result, grad.ravel()[:n] if grad.ndim > 0 else grad)
             return result
         raise ValueError(f"Cannot resolve einsum backward with repeated output subscripts: {backward_eq}")
     if remaining_inputs_data:
-        g_unique = np.einsum(unique_eq, grad, *remaining_inputs_data)
+        g_unique = _bk_einsum(unique_eq, grad, *remaining_inputs_data)
     else:
-        g_unique = np.einsum(unique_eq, grad)
+        g_unique = _bk_einsum(unique_eq, grad)
     for orig_ch, new_ch, dup_axis, orig_axis in reversed(dup_info):
         n = dim_sizes[orig_ch]
-        diag_idx = np.arange(n)
+        diag_idx = _bk_arange(n)
         idx_list = [slice(None)] * g_unique.ndim
         idx_list[orig_axis] = diag_idx
         idx_list[dup_axis] = diag_idx
@@ -820,7 +832,7 @@ class SVDBackward:
         m, n = ctx.inputs[0].shape
         u_t = u.T if u.ndim == 2 else np.swapaxes(u, -1, -2)
         v = vh.T if vh.ndim == 2 else np.swapaxes(vh, -1, -2)
-        s_inv = np.zeros((s.shape[-1], s.shape[-1])) if s.ndim == 1 else np.zeros(s.shape + s.shape[-1:])
+        s_inv = _bk_zeros((s.shape[-1], s.shape[-1])) if s.ndim == 1 else _bk_zeros(s.shape + s.shape[-1:])
         if s.ndim == 1:
             s_inv = np.diag(1.0 / (s + 1e-30))
         else:
@@ -829,8 +841,8 @@ class SVDBackward:
         ds = np.zeros_like(s)
         if s.ndim == 1:
             ds = np.diag(grad[:min(m, n), :min(m, n)]).flatten()[:len(s)]
-        du = grad @ np.swapaxes(vh, -1, -2) if grad.ndim == 2 else np.einsum('...ij,...kj->...ik', grad, vh)
-        dv = u_t @ grad if grad.ndim == 2 else np.einsum('...ij,...ik->...kj', u_t, grad)
+        du = grad @ np.swapaxes(vh, -1, -2) if grad.ndim == 2 else _bk_einsum('...ij,...kj->...ik', grad, vh)
+        dv = u_t @ grad if grad.ndim == 2 else _bk_einsum('...ij,...ik->...kj', u_t, grad)
         return du, ds, dv
 
 class QRBackward:
@@ -918,18 +930,18 @@ class ConvBackward:
             Cg, Og = C // G, weight_data.shape[0] // G
             grad_f = grad.reshape(B, weight_data.shape[0], H_out * W_out)
             dweight = np.zeros_like(weight_data)
-            dx_pad = np.zeros((B, C, H + 2 * PH, W + 2 * PW))
+            dx_pad = _bk_zeros((B, C, H + 2 * PH, W + 2 * PW))
             col_rs = col.reshape(B, G, Cg * KH * KW, H_out * W_out)
             for g in range(G):
                 gg = grad_f[:, g * Og:(g + 1) * Og]
                 cg = col_rs[:, g]
                 wg = weight_data[g * Og:(g + 1) * Og].reshape(Og, Cg * KH * KW)
-                dweight[g * Og:(g + 1) * Og] = np.einsum('bij,bjk->ik', gg, cg).reshape(Og, Cg, KH, KW)
-                dcol = np.einsum('ji,bik->bjk', wg, gg).reshape(B, Cg, KH, KW, H_out, W_out)
+                dweight[g * Og:(g + 1) * Og] = _bk_einsum('bij,bjk->ik', gg, cg).reshape(Og, Cg, KH, KW)
+                dcol = _bk_einsum('ji,bik->bjk', wg, gg).reshape(B, Cg, KH, KW, H_out, W_out)
                 for ki in range(KH):
                     for kj in range(KW):
-                        hi = np.arange(H_out) * SH + ki * DH
-                        wj = np.arange(W_out) * SW + kj * DW
+                        hi = _bk_arange(H_out) * SH + ki * DH
+                        wj = _bk_arange(W_out) * SW + kj * DW
                         hh, ww = np.meshgrid(hi, wj, indexing='ij')
                         for bi in range(B):
                             for ci in range(Cg):
@@ -946,16 +958,16 @@ class ConvBackward:
             Cg, Og = C // G, weight_data.shape[0] // G
             grad_f = grad.reshape(B, weight_data.shape[0], L_out)
             dweight = np.zeros_like(weight_data)
-            dx_pad = np.zeros((B, C, L + 2 * P))
+            dx_pad = _bk_zeros((B, C, L + 2 * P))
             col_rs = col.reshape(B, G, Cg * K, L_out)
             for g in range(G):
                 gg = grad_f[:, g * Og:(g + 1) * Og]
                 cg = col_rs[:, g]
                 wg = weight_data[g * Og:(g + 1) * Og].reshape(Og, Cg * K)
-                dweight[g * Og:(g + 1) * Og] = np.einsum('bij,bjk->ik', gg, cg).reshape(Og, Cg, K)
-                dcol = np.einsum('ji,bik->bjk', wg, gg).reshape(B, Cg, K, L_out)
+                dweight[g * Og:(g + 1) * Og] = _bk_einsum('bij,bjk->ik', gg, cg).reshape(Og, Cg, K)
+                dcol = _bk_einsum('ji,bik->bjk', wg, gg).reshape(B, Cg, K, L_out)
                 for ki in range(K):
-                    li = np.arange(L_out) * S + ki * D
+                    li = _bk_arange(L_out) * S + ki * D
                     for bi in range(B):
                         for ci in range(Cg):
                             np.add.at(dx_pad[bi, g * Cg + ci], li, dcol[bi, ci, ki])
@@ -987,7 +999,7 @@ class PadBackward:
             inp_len = inp_shape[i]
             new_shape = list(working.shape)
             new_shape[i] = inp_len
-            result = np.zeros(new_shape, dtype=np.float32)
+            result = _bk_zeros(new_shape, dtype=np.float32)
             slc_c = [slice(None)] * working.ndim
             slc_c[i] = slice(lo, lo + inp_len)
             slc_r = [slice(None)] * working.ndim
@@ -1123,7 +1135,7 @@ class ModBackward:
 class Exp2Backward:
     @staticmethod
     def backward(ctx, grad):
-        return _unbroadcast(grad * ctx.saved[0] * np.log(2), ctx.inputs[0].shape),
+        return _unbroadcast(grad * ctx.saved[0] * _bk_log(2), ctx.inputs[0].shape),
 
 class RsqrtBackward:
     @staticmethod
@@ -1155,8 +1167,8 @@ class KronBackward:
     @staticmethod
     def backward(ctx, grad):
         a, b = ctx.inputs
-        return _unbroadcast(np.kron(grad, np.ones(b.shape)), a.shape), \
-               _unbroadcast(np.kron(np.ones(a.shape), grad), b.shape)
+        return _unbroadcast(np.kron(grad, _bk_ones(b.shape)), a.shape), \
+               _unbroadcast(np.kron(_bk_ones(a.shape), grad), b.shape)
 
 class DropoutBackward:
     @staticmethod
@@ -1173,7 +1185,7 @@ class LayerNormBackward:
 
         mean = x_data.mean(axis=-1, keepdims=True)
         var = x_data.var(axis=-1, keepdims=True, ddof=0)
-        std = np.sqrt(var + eps)
+        std = _bk_sqrt(var + eps)
         x_hat = (x_data - mean) / std
 
         if gamma_data is not None:
@@ -1231,7 +1243,7 @@ class Tensor:
         if isinstance(data, Tensor):
             data = data.data
         if isinstance(data, (list, tuple)):
-            data = np.array(data, dtype=np.float32)
+            data = _bk_from_list(data, dtype=np.float32)
         if isinstance(data, np.ndarray):
             data = data.astype(np.float32) if dtype is None else data.astype(np_dtype(dtype_info.get(dtype, dtype)))
         if dtype and isinstance(dtype, str) and dtype in dtype_info:
@@ -1332,7 +1344,7 @@ class Tensor:
             else:
                 raise RuntimeError("backward() requires gradient for non-scalar")
         if not isinstance(gradient, np.ndarray):
-            gradient = np.array(gradient, dtype=np.float32)
+            gradient = _bk_from_list(gradient, dtype=np.float32)
         self.grad = gradient if self.grad is None else self.grad + gradient
         order = _topological_sort(self)
         visited = set()
@@ -1391,7 +1403,7 @@ class Tensor:
                       _ctx=Context(UnsqueezeBackward, (self,), ()))
 
     def expand(self, *shape):
-        return Tensor(np.broadcast_to(self.data, shape), requires_grad=self.requires_grad,
+        return Tensor(_bk_broadcast_to(self.data, shape), requires_grad=self.requires_grad,
                       _ctx=Context(ExpandBackward, (self,), ()))
 
     def movedim(self, source, destination):
@@ -1436,12 +1448,12 @@ class Tensor:
     # ---- arithmetic ----
 
     def __add__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         req = self.requires_grad or other.requires_grad
         if self.shape != other.shape:
             bs = _broadcast_shape(self, other)
-            a = np.broadcast_to(self.data, bs)
-            b = np.broadcast_to(other.data, bs)
+            a = _bk_broadcast_to(self.data, bs)
+            b = _bk_broadcast_to(other.data, bs)
         else:
             a, b = self.data, other.data
         out = Tensor(a + b, requires_grad=req, _ctx=Context(AddBackward, (self, other), ()))
@@ -1451,36 +1463,36 @@ class Tensor:
         return self.__add__(other)
 
     def __sub__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         req = self.requires_grad or other.requires_grad
         if self.shape != other.shape:
             bs = _broadcast_shape(self, other)
-            a = np.broadcast_to(self.data, bs)
-            b = np.broadcast_to(other.data, bs)
+            a = _bk_broadcast_to(self.data, bs)
+            b = _bk_broadcast_to(other.data, bs)
         else:
             a, b = self.data, other.data
         out = Tensor(a - b, requires_grad=req, _ctx=Context(SubBackward, (self, other), ()))
         return out
 
     def __rsub__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         req = self.requires_grad or other.requires_grad
         if self.shape != other.shape:
             bs = _broadcast_shape(self, other)
-            a = np.broadcast_to(self.data, bs)
-            b = np.broadcast_to(other.data, bs)
+            a = _bk_broadcast_to(self.data, bs)
+            b = _bk_broadcast_to(other.data, bs)
         else:
             a, b = self.data, other.data
         out = Tensor(a - b, requires_grad=req, _ctx=Context(SubBackward, (other, self), ()))
         return out
 
     def __mul__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         req = self.requires_grad or other.requires_grad
         if self.shape != other.shape:
             bs = _broadcast_shape(self, other)
-            a = np.broadcast_to(self.data, bs)
-            b = np.broadcast_to(other.data, bs)
+            a = _bk_broadcast_to(self.data, bs)
+            b = _bk_broadcast_to(other.data, bs)
         else:
             a, b = self.data, other.data
         out = Tensor(a * b, requires_grad=req, _ctx=Context(MulBackward, (self, other), ()))
@@ -1490,35 +1502,35 @@ class Tensor:
         return self.__mul__(other)
 
     def __truediv__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         req = self.requires_grad or other.requires_grad
         if self.shape != other.shape:
             bs = _broadcast_shape(self, other)
-            a = np.broadcast_to(self.data, bs)
-            b = np.broadcast_to(other.data, bs)
+            a = _bk_broadcast_to(self.data, bs)
+            b = _bk_broadcast_to(other.data, bs)
         else:
             a, b = self.data, other.data
         out = Tensor(a / (b + 1e-8), requires_grad=req, _ctx=Context(DivBackward, (self, other), ()))
         return out
 
     def __rtruediv__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         return other / self
 
     def __floordiv__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         req = self.requires_grad or other.requires_grad
         return Tensor(np.floor(self.data / other.data).astype(np.float32), requires_grad=req,
                       _ctx=Context(FloordivBackward, (self, other), ()))
 
     def __rfloordiv__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         req = self.requires_grad or other.requires_grad
         return Tensor(np.floor(other.data / self.data).astype(np.float32), requires_grad=req,
                       _ctx=Context(FloordivBackward, (other, self), ()))
 
     def __mod__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         req = self.requires_grad or other.requires_grad
         return Tensor(self.data % other.data, requires_grad=req,
                       _ctx=Context(ModBackward, (self, other), ()))
@@ -1534,21 +1546,21 @@ class Tensor:
 
     def __rpow__(self, base):
         return Tensor(base ** self.data, requires_grad=self.requires_grad,
-                      _ctx=Context(PowBackward, (Tensor(np.array(base, dtype=np.float32)), self), (self,)))
+                      _ctx=Context(PowBackward, (Tensor(_bk_from_list(base, dtype=np.float32)), self), (self,)))
 
     def __neg__(self):
         return Tensor(-self.data, requires_grad=self.requires_grad,
                       _ctx=Context(NegBackward, (self,), ()))
 
     def __abs__(self):
-        return Tensor(np.abs(self.data), requires_grad=self.requires_grad,
+        return Tensor(_bk_abs(self.data), requires_grad=self.requires_grad,
                       _ctx=Context(AbsBackward, (self,), ()))
 
     # ---- element-wise ops ----
 
     def exp(self):
-        out = Tensor(np.exp(self.data), requires_grad=self.requires_grad,
-                     _ctx=Context(ExpBackward, (self,), (np.exp(self.data),)))
+        out = Tensor(_bk_exp(self.data), requires_grad=self.requires_grad,
+                     _ctx=Context(ExpBackward, (self,), (_bk_exp(self.data),)))
         return out
 
     def exp2(self):
@@ -1557,7 +1569,7 @@ class Tensor:
         return out
 
     def log(self):
-        out = Tensor(np.log(np.maximum(self.data, 1e-7)), requires_grad=self.requires_grad,
+        out = Tensor(_bk_log(np.maximum(self.data, 1e-7)), requires_grad=self.requires_grad,
                      _ctx=Context(LogBackward, (self,), (self.data + 1e-7,)))
         return out
 
@@ -1568,13 +1580,13 @@ class Tensor:
         return self.log() / math.log(10)
 
     def sqrt(self):
-        s = np.sqrt(np.maximum(self.data, 0) + 1e-7)
+        s = _bk_sqrt(np.maximum(self.data, 0) + 1e-7)
         out = Tensor(s, requires_grad=self.requires_grad,
                      _ctx=Context(SqrtBackward, (self,), (s,)))
         return out
 
     def rsqrt(self):
-        r = 1.0 / (np.sqrt(np.maximum(self.data, 0)) + 1e-7)
+        r = 1.0 / (_bk_sqrt(np.maximum(self.data, 0)) + 1e-7)
         out = Tensor(r, requires_grad=self.requires_grad,
                      _ctx=Context(RsqrtBackward, (self,), (r,)))
         return out
@@ -1584,12 +1596,12 @@ class Tensor:
                       _ctx=Context(SignBackward, (self,), ()))
 
     def sin(self):
-        out = Tensor(np.sin(self.data), requires_grad=self.requires_grad,
+        out = Tensor(_bk_sin(self.data), requires_grad=self.requires_grad,
                      _ctx=Context(SinBackward, (self,), ()))
         return out
 
     def cos(self):
-        out = Tensor(np.cos(self.data), requires_grad=self.requires_grad,
+        out = Tensor(_bk_cos(self.data), requires_grad=self.requires_grad,
                      _ctx=Context(CosBackward, (self,), ()))
         return out
 
@@ -1614,7 +1626,7 @@ class Tensor:
         return out
 
     def atan2(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         out = Tensor(np.arctan2(self.data, other.data), requires_grad=self.requires_grad or other.requires_grad,
                      _ctx=Context(Atan2Backward, (self, other), ()))
         return out
@@ -1630,7 +1642,7 @@ class Tensor:
         return out
 
     def tanh(self):
-        t = np.tanh(self.data)
+        t = _bk_tanh(self.data)
         out = Tensor(t, requires_grad=self.requires_grad,
                      _ctx=Context(TanhBackward, (self,), (t,)))
         return out
@@ -1659,13 +1671,13 @@ class Tensor:
         return self.clamp(min_val, max_val)
 
     def maximum(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         out = Tensor(np.maximum(self.data, other.data), requires_grad=self.requires_grad or other.requires_grad,
                      _ctx=Context(MaximumBackward, (self, other), ()))
         return out
 
     def minimum(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         out = Tensor(np.minimum(self.data, other.data), requires_grad=self.requires_grad or other.requires_grad,
                      _ctx=Context(MinimumBackward, (self, other), ()))
         return out
@@ -1687,7 +1699,7 @@ class Tensor:
                       _ctx=Context(TruncBackward, (self,), ()))
 
     def sigmoid(self):
-        s = 1 / (1 + np.exp(-np.clip(self.data, -500, 500)))
+        s = 1 / (1 + _bk_exp(-np.clip(self.data, -500, 500)))
         out = Tensor(s, requires_grad=self.requires_grad,
                      _ctx=Context(SigmoidBackward, (self,), (s,)))
         return out
@@ -1703,45 +1715,45 @@ class Tensor:
         return out
 
     def leaky_relu(self, alpha=0.01):
-        out = Tensor(np.where(self.data > 0, self.data, alpha * self.data), requires_grad=self.requires_grad,
+        out = Tensor(_bk_where(self.data > 0, self.data, alpha * self.data), requires_grad=self.requires_grad,
                      _ctx=Context(LeakyReLUBackward, (self,), (alpha,)))
         return out
 
     def elu(self, alpha=1.0):
-        out = Tensor(np.where(self.data > 0, self.data, alpha * (np.exp(self.data) - 1)), requires_grad=self.requires_grad,
+        out = Tensor(_bk_where(self.data > 0, self.data, alpha * (_bk_exp(self.data) - 1)), requires_grad=self.requires_grad,
                      _ctx=Context(ELUBackward, (self,), (alpha,)))
         return out
 
     def selu(self):
         lam = 1.0507009873554805
         alpha = 1.6732632423543772
-        out = Tensor(lam * np.where(self.data > 0, self.data, alpha * (np.exp(self.data) - 1)), requires_grad=self.requires_grad,
+        out = Tensor(lam * _bk_where(self.data > 0, self.data, alpha * (_bk_exp(self.data) - 1)), requires_grad=self.requires_grad,
                      _ctx=Context(SELUBackward, (self,), (alpha, lam)))
         return out
 
     def gelu(self):
         c = 0.7978845608028654
         k = 0.044715
-        t = np.tanh(c * (self.data + k * self.data ** 3))
+        t = _bk_tanh(c * (self.data + k * self.data ** 3))
         out = Tensor(0.5 * self.data * (1 + t), requires_grad=self.requires_grad,
                      _ctx=Context(GELUBackward2, (self,), ()))
         return out
 
     def silu(self):
-        s = 1 / (1 + np.exp(-np.clip(self.data, -500, 500)))
+        s = 1 / (1 + _bk_exp(-np.clip(self.data, -500, 500)))
         out = Tensor(self.data * s, requires_grad=self.requires_grad,
                      _ctx=Context(SiLUBackward2, (self,), ()))
         return out
 
     def mish(self):
-        sp = np.log1p(np.exp(self.data))
-        return self * np.tanh(sp)
+        sp = np.log1p(_bk_exp(self.data))
+        return self * _bk_tanh(sp)
 
     def hardswish(self):
         return self * Tensor(self.relu6().data + 3) / 6
 
     def softmax(self, axis=-1):
-        e = np.exp(self.data - self.data.max(axis=axis, keepdims=True))
+        e = _bk_exp(self.data - self.data.max(axis=axis, keepdims=True))
         s = e / (e.sum(axis=axis, keepdims=True) + 1e-8)
         out = Tensor(s, requires_grad=self.requires_grad,
                      _ctx=Context(SoftmaxBackward, (self,), (s, axis)))
@@ -1749,10 +1761,10 @@ class Tensor:
 
     def log_softmax(self, axis=-1):
         m = self.data.max(axis=axis, keepdims=True)
-        log_sum = np.log(np.sum(np.exp(self.data - m), axis=axis, keepdims=True) + 1e-8)
+        log_sum = _bk_log(_bk_sum(_bk_exp(self.data - m), axis=axis, keepdims=True) + 1e-8)
         s = self.data - m - log_sum
         out = Tensor(s, requires_grad=self.requires_grad,
-                     _ctx=Context(LogSoftmaxBackward, (self,), (np.exp(s), axis)))
+                     _ctx=Context(LogSoftmaxBackward, (self,), (_bk_exp(s), axis)))
         return out
 
     # ---- reductions ----
@@ -1827,7 +1839,7 @@ class Tensor:
 
     def logsumexp(self, axis=None, keepdims=False):
         m = self.data.max(axis=axis, keepdims=True)
-        out_data = m.squeeze(axis=axis if not keepdims else None) + np.log(np.sum(np.exp(self.data - m), axis=axis, keepdims=keepdims) + 1e-8)
+        out_data = m.squeeze(axis=axis if not keepdims else None) + _bk_log(_bk_sum(_bk_exp(self.data - m), axis=axis, keepdims=keepdims) + 1e-8)
         if not keepdims and axis is not None:
             out_data = out_data.squeeze(axis=axis)
         return Tensor(out_data, requires_grad=self.requires_grad,
@@ -1846,7 +1858,7 @@ class Tensor:
     # ---- linear algebra ----
 
     def matmul(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         req = self.requires_grad or other.requires_grad
         out = Tensor(self.data @ other.data, requires_grad=req,
                      _ctx=Context(MatMulBackward, (self, other), ()))
@@ -1856,23 +1868,23 @@ class Tensor:
         return self.matmul(other)
 
     def __rmatmul__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         return other.matmul(self)
 
     def outer(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         return self.reshape(-1, 1) * other.reshape(1, -1)
 
     def dot(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         return (self * other).sum()
 
     def inner(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         return self.reshape(-1).dot(other.reshape(-1))
 
     def cross(self, other, dim=-1):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         a, b = self.data, other.data
         if dim < 0: dim += a.ndim
         result = np.cross(a, b, axisa=dim, axisb=dim, axisc=dim)
@@ -1880,7 +1892,7 @@ class Tensor:
                       _ctx=Context(CrossBackward, (self, other), (dim,)))
 
     def tensordot(self, other, dims=2):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         if isinstance(dims, int):
             axes_a = list(range(-dims, 0))
             axes_b = list(range(dims))
@@ -1891,7 +1903,7 @@ class Tensor:
                       _ctx=Context(TensordotBackward, (self, other), (dims,)))
 
     def kron(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         return Tensor(np.kron(self.data, other.data), requires_grad=self.requires_grad or other.requires_grad,
                       _ctx=Context(KronBackward, (self, other), ()))
 
@@ -1924,33 +1936,33 @@ class Tensor:
                 Tensor(u, requires_grad=req, _ctx=ctx))
 
     def solve(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         result = np.linalg.solve(self.data + 1e-7 * np.eye(self.shape[-1]), other.data)
         return Tensor(result, requires_grad=self.requires_grad or other.requires_grad)
 
     def solve_triangular(self, b, upper=True):
-        b = b if isinstance(b, Tensor) else Tensor(np.array(b, dtype=np.float32))
+        b = b if isinstance(b, Tensor) else Tensor(_bk_from_list(b, dtype=np.float32))
         result = np.linalg.solve(self.data, b.data)
         return Tensor(result, requires_grad=self.requires_grad or b.requires_grad)
 
     def lstsq(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other, dtype=np.float32))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other, dtype=np.float32))
         result, _, _, _ = np.linalg.lstsq(self.data, other.data, rcond=None)
         return Tensor(result, requires_grad=self.requires_grad or other.requires_grad)
 
     def det(self):
         d = np.linalg.det(self.data)
-        return Tensor(np.array(d), requires_grad=self.requires_grad,
+        return Tensor(_bk_from_list(d), requires_grad=self.requires_grad,
                       _ctx=Context(DetBackward, (self,), (self.data, d)))
 
     def slogdet(self):
         sign, logabsdet = np.linalg.slogdet(self.data)
-        return Tensor(np.array(sign), requires_grad=False), \
-               Tensor(np.array(logabsdet), requires_grad=self.requires_grad,
+        return Tensor(_bk_from_list(sign), requires_grad=False), \
+               Tensor(_bk_from_list(logabsdet), requires_grad=self.requires_grad,
                       _ctx=Context(SlogdetBackward, (self,), (self.data, (sign, logabsdet))))
 
     def logdet(self):
-        return Tensor(np.log(np.abs(np.linalg.det(self.data)) + 1e-30), requires_grad=self.requires_grad)
+        return Tensor(_bk_log(_bk_abs(np.linalg.det(self.data)) + 1e-30), requires_grad=self.requires_grad)
 
     def eig(self, k=None):
         if k is None:
@@ -1966,7 +1978,7 @@ class Tensor:
     def einsum(self, equation, *others):
         tensors = [self] + list(others)
         arrays = [t.data if isinstance(t, Tensor) else t for t in tensors]
-        result = np.einsum(equation, *arrays)
+        result = _bk_einsum(equation, *arrays)
         req = any(t.requires_grad for t in tensors if isinstance(t, Tensor))
         return Tensor(result, requires_grad=req,
                       _ctx=Context(EinsumBackward, tensors, (equation, tensors)))
@@ -1983,20 +1995,20 @@ class Tensor:
         self._version += 1
 
     def gather(self, dim, index):
-        index = index if isinstance(index, Tensor) else Tensor(np.array(index, dtype=np.int64))
+        index = index if isinstance(index, Tensor) else Tensor(_bk_from_list(index, dtype=np.int64))
         result = np.take_along_axis(self.data, index.data, axis=dim)
         return Tensor(result, requires_grad=self.requires_grad,
                       _ctx=Context(GatherBackward, (self, index), (self.data, index.data, dim)))
 
     def scatter_(self, dim, index, src):
-        src = src if isinstance(src, Tensor) else Tensor(np.array(src, dtype=np.float32))
+        src = src if isinstance(src, Tensor) else Tensor(_bk_from_list(src, dtype=np.float32))
         np.put_along_axis(self.data, index.data, src.data, axis=dim)
         self._version += 1
         return self
 
     def scatter_add_(self, dim, index, src):
-        src = src if isinstance(src, Tensor) else Tensor(np.array(src, dtype=np.float32))
-        np.add.at(self.data, (index.data, np.arange(self.shape[1])) if dim == 1 else index.data, src.data)
+        src = src if isinstance(src, Tensor) else Tensor(_bk_from_list(src, dtype=np.float32))
+        np.add.at(self.data, (index.data, _bk_arange(self.shape[1])) if dim == 1 else index.data, src.data)
         self._version += 1
         return self
 
@@ -2009,20 +2021,20 @@ class Tensor:
         return Tensor(self.data[mask.data.astype(bool)], requires_grad=self.requires_grad)
 
     def index_put_(self, indices, values):
-        values = values if isinstance(values, Tensor) else Tensor(np.array(values, dtype=np.float32))
+        values = values if isinstance(values, Tensor) else Tensor(_bk_from_list(values, dtype=np.float32))
         self.data[indices] = values.data
         self._version += 1
         return self
 
     def where(self, condition, x, y):
-        x = x if isinstance(x, Tensor) else Tensor(np.array(x, dtype=np.float32))
-        y = y if isinstance(y, Tensor) else Tensor(np.array(y, dtype=np.float32))
-        result = np.where(condition.data if isinstance(condition, Tensor) else condition, x.data, y.data)
+        x = x if isinstance(x, Tensor) else Tensor(_bk_from_list(x, dtype=np.float32))
+        y = y if isinstance(y, Tensor) else Tensor(_bk_from_list(y, dtype=np.float32))
+        result = _bk_where(condition.data if isinstance(condition, Tensor) else condition, x.data, y.data)
         return Tensor(result, requires_grad=self.requires_grad or x.requires_grad or y.requires_grad,
                       _ctx=Context(WhereBackward, (self, x, y), (condition.data if isinstance(condition, Tensor) else condition, x, y)))
 
     def nonzero(self):
-        return Tensor(np.array(np.nonzero(self.data)[0]), requires_grad=False)
+        return Tensor(_bk_from_list(np.nonzero(self.data)[0]), requires_grad=False)
 
     def unique(self, sorted=True, return_counts=False):
         result = np.unique(self.data, return_counts=return_counts)
@@ -2097,27 +2109,27 @@ class Tensor:
     # ---- comparison ops ----
 
     def __eq__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other))
         return Tensor(self.data == other.data)
 
     def __ne__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other))
         return Tensor(self.data != other.data)
 
     def __lt__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other))
         return Tensor(self.data < other.data)
 
     def __le__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other))
         return Tensor(self.data <= other.data)
 
     def __gt__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other))
         return Tensor(self.data > other.data)
 
     def __ge__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(np.array(other))
+        other = other if isinstance(other, Tensor) else Tensor(_bk_from_list(other))
         return Tensor(self.data >= other.data)
 
     def __bool__(self):
@@ -2144,12 +2156,12 @@ class Tensor:
         log_probs = self.log_softmax(axis=-1)
         V = log_probs.shape[-1]
         if label_smoothing > 0:
-            one_hot = np.zeros((n, V), dtype=np.float32)
-            one_hot[np.arange(n), target_idx] = 1.0 - label_smoothing
+            one_hot = _bk_zeros((n, V), dtype=np.float32)
+            one_hot[_bk_arange(n), target_idx] = 1.0 - label_smoothing
             one_hot += label_smoothing / V
         else:
-            one_hot = np.zeros((n, V), dtype=np.float32)
-            one_hot[np.arange(n), target_idx] = 1.0
+            one_hot = _bk_zeros((n, V), dtype=np.float32)
+            one_hot[_bk_arange(n), target_idx] = 1.0
         one_hot_t = Tensor(one_hot, requires_grad=False)
         cross = -(log_probs * one_hot_t).sum(axis=-1) / n
         return cross.mean()
@@ -2178,25 +2190,25 @@ def cross_entropy(logits, target, label_smoothing=0.0):
     if isinstance(target, Tensor):
         target = target.data
     probs = logits.softmax(axis=-1)
-    log_probs = np.log(probs.data + 1e-8)
+    log_probs = _bk_log(probs.data + 1e-8)
     if label_smoothing > 0:
         V = probs.shape[-1]
-        loss = -(1 - label_smoothing) * log_probs[np.arange(target.shape[0]), target.astype(int)] - \
+        loss = -(1 - label_smoothing) * log_probs[_bk_arange(target.shape[0]), target.astype(int)] - \
                label_smoothing * log_probs.mean(axis=-1)
     else:
-        loss = -log_probs[np.arange(target.shape[0]), target.astype(int)]
+        loss = -log_probs[_bk_arange(target.shape[0]), target.astype(int)]
     return Tensor(loss.mean(), requires_grad=logits.requires_grad)
 
 def nll_loss(log_probs, target):
     if isinstance(target, Tensor):
         target = target.data
-    loss = -log_probs.data[np.arange(target.shape[0]), target]
+    loss = -log_probs.data[_bk_arange(target.shape[0]), target]
     return Tensor(loss.mean(), requires_grad=log_probs.requires_grad)
 
 def bce_loss(pred, target):
     if isinstance(target, Tensor):
         target = target.data
-    loss = -(target * np.log(pred.data + 1e-7) + (1 - target) * np.log(1 - pred.data + 1e-7))
+    loss = -(target * _bk_log(pred.data + 1e-7) + (1 - target) * _bk_log(1 - pred.data + 1e-7))
     return Tensor(loss.mean(), requires_grad=pred.requires_grad)
 
 def mse_loss(pred, target):
@@ -2213,7 +2225,7 @@ def huber_loss(pred, target, delta=1.0):
     if isinstance(target, Tensor):
         target = target.data
     diff = pred.data - target
-    loss = np.where(np.abs(diff) < delta, 0.5 * diff ** 2, delta * (np.abs(diff) - 0.5 * delta))
+    loss = _bk_where(_bk_abs(diff) < delta, 0.5 * diff ** 2, delta * (_bk_abs(diff) - 0.5 * delta))
     return Tensor(loss.mean(), requires_grad=pred.requires_grad)
 
 
@@ -2222,19 +2234,19 @@ def huber_loss(pred, target, delta=1.0):
 # ---------------------------------------------------------------------------
 
 def zeros(*shape, requires_grad=False):
-    return Tensor(np.zeros(shape, dtype=np.float32), requires_grad=requires_grad)
+    return Tensor(_bk_zeros(shape, dtype=np.float32), requires_grad=requires_grad)
 
 def ones(*shape, requires_grad=False):
-    return Tensor(np.ones(shape, dtype=np.float32), requires_grad=requires_grad)
+    return Tensor(_bk_ones(shape, dtype=np.float32), requires_grad=requires_grad)
 
 def full(*shape, fill_value, requires_grad=False):
-    return Tensor(np.full(shape, fill_value, dtype=np.float32), requires_grad=requires_grad)
+    return Tensor(_bk_full(shape, fill_value, dtype=np.float32), requires_grad=requires_grad)
 
 def arange(start, stop=None, step=1.0, requires_grad=False):
     if stop is None:
         stop = start
         start = 0
-    return Tensor(np.arange(start, stop, step, dtype=np.float32), requires_grad=requires_grad)
+    return Tensor(_bk_arange(start, stop, step, dtype=np.float32), requires_grad=requires_grad)
 
 def linspace(start, stop, num, requires_grad=False):
     return Tensor(np.linspace(start, stop, num, dtype=np.float32), requires_grad=requires_grad)
@@ -2243,7 +2255,7 @@ def eye(n, m=None, requires_grad=False):
     return Tensor(np.eye(n, m, dtype=np.float32), requires_grad=requires_grad)
 
 def empty(*shape, requires_grad=False):
-    return Tensor(np.empty(shape, dtype=np.float32), requires_grad=requires_grad)
+    return Tensor(_bk_empty(shape, dtype=np.float32), requires_grad=requires_grad)
 
 def tensor(data, requires_grad=False):
     return Tensor(data, requires_grad=requires_grad)
@@ -2269,18 +2281,18 @@ def uniform(low=0, high=1, size=None, requires_grad=False):
 def cat(tensors, dim=0):
     arrays = [t.data if isinstance(t, Tensor) else t for t in tensors]
     req = any(t.requires_grad for t in tensors if isinstance(t, Tensor))
-    return Tensor(np.concatenate(arrays, axis=dim), requires_grad=req)
+    return Tensor(_bk_concatenate(arrays, axis=dim), requires_grad=req)
 
 def stack(tensors, dim=0):
     arrays = [t.data if isinstance(t, Tensor) else t for t in tensors]
     req = any(t.requires_grad for t in tensors if isinstance(t, Tensor))
-    return Tensor(np.stack(arrays, axis=dim), requires_grad=req)
+    return Tensor(_bk_stack(arrays, axis=dim), requires_grad=req)
 
 def where(condition, x, y):
     if isinstance(condition, Tensor): condition = condition.data
     if isinstance(x, Tensor): x = x.data
     if isinstance(y, Tensor): y = y.data
-    return Tensor(np.where(condition, x, y))
+    return Tensor(_bk_where(condition, x, y))
 
 def unique(x, sorted=True, return_counts=False):
     return x.unique(sorted=sorted, return_counts=return_counts)
@@ -2294,7 +2306,7 @@ def topk(x, k, dim=-1, largest=True):
 def einsum(equation, *tensors):
     if tensors:
         return tensors[0].einsum(equation, *tensors[1:])
-    return Tensor(np.einsum(equation))
+    return Tensor(_bk_einsum(equation))
 
 def meshgrid(*tensors, indexing='ij'):
     arrays = [t.data if isinstance(t, Tensor) else t for t in tensors]
@@ -2548,20 +2560,20 @@ def gradient_checkpoint(function, *args, **kwargs):
 
 class SparseTensor:
     def __init__(self, indices, values, dense_shape):
-        self.indices = np.array(indices)
-        self.values = np.array(values, dtype=np.float32)
+        self.indices = _bk_from_list(indices)
+        self.values = _bk_from_list(values, dtype=np.float32)
         self.dense_shape = tuple(dense_shape)
 
     @classmethod
     def from_dense(cls, dense):
         if isinstance(dense, Tensor):
             dense = dense.data
-        indices = np.array(np.nonzero(dense))
+        indices = _bk_from_list(np.nonzero(dense))
         values = dense[dense != 0]
         return cls(indices, values, dense.shape)
 
     def to_dense(self):
-        out = np.zeros(self.dense_shape, dtype=np.float32)
+        out = _bk_zeros(self.dense_shape, dtype=np.float32)
         if self.indices.size > 0:
             out[tuple(self.indices)] = self.values
         return Tensor(out)

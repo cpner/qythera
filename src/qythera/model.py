@@ -2,7 +2,8 @@
 import hashlib
 import math
 import os
-import numpy as np
+from qythera.backend import HAS_NUMPY, np
+from qythera.backend import exp, tanh, where, einsum
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
@@ -430,7 +431,7 @@ class KVQuantizedCache:
             flat = np.pad(flat, (0, padded - len(flat)))
         groups = flat.reshape(num_groups, -1)
         scales = np.max(np.abs(groups), axis=1, keepdims=True)
-        scales = np.where(scales == 0, 1.0, scales)
+        scales = where(scales == 0, 1.0, scales)
         quantized = np.clip(np.round(groups / scales * (2 ** (self.bits - 1) - 1)),
                            -(2 ** (self.bits - 1)), 2 ** (self.bits - 1) - 1)
         return quantized.astype(np.float32), scales.astype(np.float32)
@@ -778,7 +779,7 @@ class Attention(Module):
         attn = q_scaled.matmul(k_t)
 
         causal_mask = self._make_causal_mask(S_q, S_kv, position)
-        attn = Tensor(np.where(causal_mask[None, None, :, :], attn.data, -1e9),
+        attn = Tensor(where(causal_mask[None, None, :, :], attn.data, -1e9),
                        requires_grad=attn.requires_grad)
 
         if self.config.sliding_window is not None and self.config.positional_encoding == "rope":
@@ -788,7 +789,7 @@ class Attention(Module):
                 end = min(start + i + 1, S_kv)
                 sw_mask[i, :start] = False
                 sw_mask[i, end:] = False
-            attn = Tensor(np.where(sw_mask[None, None, :, :], attn.data, -1e9),
+            attn = Tensor(where(sw_mask[None, None, :, :], attn.data, -1e9),
                            requires_grad=attn.requires_grad)
 
         if self.alibi is not None:
@@ -833,7 +834,7 @@ class Attention(Module):
             v_block = v_np[:, :, j_start:j_end, :]
 
             scale = self.scaling
-            scores = np.einsum('bhid,bhjd->bhij', q_np * scale, k_block)
+            scores = einsum('bhid,bhjd->bhij', q_np * scale, k_block)
 
             causal_mask = np.ones((S_q, j_end - j_start), dtype=np.bool_)
             for i in range(S_q):
@@ -842,7 +843,7 @@ class Attention(Module):
                         causal_mask[i, jj - j_start] = True
                     else:
                         causal_mask[i, jj - j_start] = False
-            scores = np.where(causal_mask[None, None, :, :], scores, -1e9)
+            scores = where(causal_mask[None, None, :, :], scores, -1e9)
 
             if self.config.sliding_window is not None:
                 sw_start = max(0, S_kv - self.config.sliding_window)
@@ -852,14 +853,14 @@ class Attention(Module):
                     for jj in range(j_start, j_end):
                         if jj < sw_start or jj >= end_pos:
                             sw_mask[i, jj - j_start] = False
-                scores = np.where(sw_mask[None, None, :, :], scores, -1e9)
+                scores = where(sw_mask[None, None, :, :], scores, -1e9)
 
             m_curr = scores.max(axis=-1, keepdims=True)
             m_new = np.maximum(m_prev, m_curr)
-            exp_scores = np.exp(scores - m_new)
-            l_new = l_prev * np.exp(m_prev - m_new) + exp_scores.sum(axis=-1, keepdims=True)
-            output = output * (l_prev * np.exp(m_prev - m_new) / l_new) + \
-                     np.einsum('bhij,bhjd->bhid', exp_scores, v_block) / l_new
+            exp_scores = exp(scores - m_new)
+            l_new = l_prev * exp(m_prev - m_new) + exp_scores.sum(axis=-1, keepdims=True)
+            output = output * (l_prev * exp(m_prev - m_new) / l_new) + \
+                     einsum('bhij,bhjd->bhid', exp_scores, v_block) / l_new
             m_prev = m_new
             l_prev = l_new
 
@@ -913,7 +914,7 @@ class CrossAttention(Module):
         attn = q_scaled.matmul(k_t)
 
         if mask is not None:
-            attn = Tensor(np.where(mask[None, None, :, :] if mask.ndim == 2 else mask, attn.data, -1e9),
+            attn = Tensor(where(mask[None, None, :, :] if mask.ndim == 2 else mask, attn.data, -1e9),
                            requires_grad=attn.requires_grad)
 
         attn = attn.softmax(axis=-1)
@@ -1053,12 +1054,12 @@ class Cosformer(Module):
         attn = Tensor(attn.data * self.scaling, requires_grad=attn.requires_grad)
 
         causal = self._causal_mask(max(S_q, S_kv))[:S_q, :S_kv]
-        attn = Tensor(np.where(causal[None, None, :, :], attn.data, -1e9),
+        attn = Tensor(where(causal[None, None, :, :], attn.data, -1e9),
                        requires_grad=attn.requires_grad)
 
         if mask is not None:
             mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
-            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+            attn = Tensor(where(mask_exp, attn.data, -1e9),
                            requires_grad=attn.requires_grad)
 
         attn = attn.softmax(axis=-1)
@@ -1107,14 +1108,14 @@ class AFT(Module):
         for i in range(S):
             for j in range(S):
                 if i >= j:
-                    exp_pos_bias[i, j] = np.exp(-float(pos_bias[i - j, 0]))
+                    exp_pos_bias[i, j] = exp(-float(pos_bias[i - j, 0]))
                 else:
-                    exp_pos_bias[i, j] = np.exp(-float(pos_bias[j - i, 0]))
+                    exp_pos_bias[i, j] = exp(-float(pos_bias[j - i, 0]))
 
         q_np = q.data
         v_np = v.data
 
-        pos_weighted_v = np.einsum('bhjd,ij->bhid', v_np, exp_pos_bias)
+        pos_weighted_v = einsum('bhjd,ij->bhid', v_np, exp_pos_bias)
         denom = exp_pos_bias.sum(axis=1, keepdims=True)
         pos_weighted_v = pos_weighted_v / (denom[np.newaxis, np.newaxis, :, :] + 1e-6)
 
@@ -1159,15 +1160,15 @@ class InfiniAttention(Module):
         return self.memory.copy(), self.memory_normalizer.copy()
 
     def _update_memory(self, k: np.ndarray, v: np.ndarray):
-        new_memory = np.einsum('bhsi,bhsj->bhij', v, k)
+        new_memory = einsum('bhsi,bhsj->bhij', v, k)
         new_normalizer = k.sum(axis=2)
         self.memory = self.memory + new_memory
         self.memory_normalizer = self.memory_normalizer + new_normalizer
 
     def _memory_attention(self, q: np.ndarray):
         B, H, S, D = q.shape
-        norm_factor = np.einsum('bhid,bhd->bhi', q, self.memory_normalizer) + 1e-6
-        memory_output = np.einsum('bhde,bhse->bhsd', self.memory, q)
+        norm_factor = einsum('bhid,bhd->bhi', q, self.memory_normalizer) + 1e-6
+        memory_output = einsum('bhde,bhse->bhsd', self.memory, q)
         memory_output = memory_output / norm_factor[:, :, :, np.newaxis]
         return memory_output
 
@@ -1180,7 +1181,7 @@ class InfiniAttention(Module):
         v = self.wv(normed).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
         gate_input = x.mean(axis=1, keepdims=True)
-        gate = Tensor(np.clip(1.0 / (1.0 + np.exp(-self.gate_linear(gate_input).data)), 0.01, 0.99),
+        gate = Tensor(np.clip(1.0 / (1.0 + exp(-self.gate_linear(gate_input).data)), 0.01, 0.99),
                        requires_grad=x.requires_grad)
         beta = float(gate.data.flatten()[0])
 
@@ -1201,7 +1202,7 @@ class InfiniAttention(Module):
             for j in range(S):
                 if j <= i:
                     causal_mask[i, j] = True
-        local_attn = Tensor(np.where(causal_mask[None, None, :, :], local_attn.data, -1e9),
+        local_attn = Tensor(where(causal_mask[None, None, :, :], local_attn.data, -1e9),
                              requires_grad=local_attn.requires_grad)
 
         local_attn = local_attn.softmax(axis=-1)
@@ -1262,7 +1263,7 @@ class FeedForward(Module):
             b = self.w3(x)
             c = 0.7978845608028654
             k = 0.044715
-            t = Tensor(np.tanh(c * (b.data + k * b.data ** 3)), requires_grad=b.requires_grad)
+            t = Tensor(tanh(c * (b.data + k * b.data ** 3)), requires_grad=b.requires_grad)
             gated = Tensor(a.data * 0.5 * (1 + t.data), requires_grad=a.requires_grad or t.requires_grad)
             out = self.w2(gated)
         elif act == "reglu":
@@ -1354,7 +1355,7 @@ class MoELayer(Module):
                 mask_e = (topk_idx_data == e).any(axis=-1)
                 if not mask_e.any():
                     continue
-                idx = np.where(mask_e)[0]
+                idx = where(mask_e)[0]
                 x_e = Tensor(x_flat.data[idx])
                 expert_out = self.experts[e](x_e)
                 for j in range(k):
@@ -1677,7 +1678,7 @@ class EncoderDecoderTransformer(Module):
         logits = self.head(dec_h)
 
         if self.config.logit_softcap > 0:
-            logits = Tensor(np.tanh(logits.data / self.config.logit_softcap) * self.config.logit_softcap,
+            logits = Tensor(tanh(logits.data / self.config.logit_softcap) * self.config.logit_softcap,
                             requires_grad=logits.requires_grad)
 
         return logits
@@ -1738,7 +1739,7 @@ class DeepSeekMoE(Module):
                 mask_e = (topk_idx.data == e).any(axis=-1)
                 if not mask_e.any():
                     continue
-                idx = np.where(mask_e)[0]
+                idx = where(mask_e)[0]
                 x_e = Tensor(x_flat.data[idx])
                 expert_out = self.routed_experts[e](x_e)
                 for j in range(k):
@@ -1802,7 +1803,7 @@ class MixtureOfDepths(Module):
 
     def _compute_routing(self, x: Tensor) -> Tuple[np.ndarray, np.ndarray]:
         router_logits = self.router(x)
-        router_probs = 1.0 / (1.0 + np.exp(-router_logits.data))
+        router_probs = 1.0 / (1.0 + exp(-router_logits.data))
         selected = (router_probs >= self.threshold).astype(np.float32)
         return router_probs, selected
 
@@ -1896,12 +1897,12 @@ class SparseAttention(Module):
         attn = q_scaled.matmul(k_t)
 
         sparse_mask = self._sparse_mask(L)
-        attn = Tensor(np.where(sparse_mask[None, None, :, :], attn.data, -1e9),
+        attn = Tensor(where(sparse_mask[None, None, :, :], attn.data, -1e9),
                        requires_grad=attn.requires_grad)
 
         if mask is not None:
             mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
-            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+            attn = Tensor(where(mask_exp, attn.data, -1e9),
                            requires_grad=attn.requires_grad)
 
         attn = attn.softmax(axis=-1)
@@ -1970,12 +1971,12 @@ class BigBirdAttention(Module):
         attn = q_scaled.matmul(k_t)
 
         bb_mask = self._bigbird_mask(L)
-        attn = Tensor(np.where(bb_mask[None, None, :, :], attn.data, -1e9),
+        attn = Tensor(where(bb_mask[None, None, :, :], attn.data, -1e9),
                        requires_grad=attn.requires_grad)
 
         if mask is not None:
             mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
-            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+            attn = Tensor(where(mask_exp, attn.data, -1e9),
                            requires_grad=attn.requires_grad)
 
         attn = attn.softmax(axis=-1)
@@ -2035,20 +2036,20 @@ class RingAttention(Module):
             if k_chunk.shape[2] == 0:
                 continue
 
-            scores = np.einsum('bhid,bhjd->bhij', q.data * self.scaling, k_chunk)
+            scores = einsum('bhid,bhjd->bhij', q.data * self.scaling, k_chunk)
 
             if mask is not None:
                 mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
                 chunk_mask = mask_exp[:, :, :, ring_step * chunk_size:(ring_step + 1) * chunk_size]
                 if chunk_mask.shape[-1] == scores.shape[-1]:
-                    scores = np.where(chunk_mask, scores, -1e9)
+                    scores = where(chunk_mask, scores, -1e9)
 
             m_curr = scores.max(axis=-1, keepdims=True)
             m_new = np.maximum(m_prev, m_curr)
-            exp_scores = np.exp(scores - m_new)
-            l_new = l_prev * np.exp(m_prev - m_new) + exp_scores.sum(axis=-1, keepdims=True)
-            output = output * (l_prev * np.exp(m_prev - m_new) / l_new) + \
-                     np.einsum('bhij,bhjd->bhid', exp_scores, v_chunk) / l_new
+            exp_scores = exp(scores - m_new)
+            l_new = l_prev * exp(m_prev - m_new) + exp_scores.sum(axis=-1, keepdims=True)
+            output = output * (l_prev * exp(m_prev - m_new) / l_new) + \
+                     einsum('bhij,bhjd->bhid', exp_scores, v_chunk) / l_new
             m_prev = m_new
             l_prev = l_new
 
@@ -2138,7 +2139,7 @@ class GLaMMoE(Module):
             mask_e = (topk_idx.data == e).any(axis=-1)
             if not mask_e.any():
                 continue
-            idx = np.where(mask_e)[0]
+            idx = where(mask_e)[0]
             x_e = Tensor(x_flat.data[idx])
             expert_out = self.experts[e](x_e)
             for j in range(k):
@@ -2219,7 +2220,7 @@ class AdaptiveComputationTime(Module):
         for step in range(max_steps):
             normed = self.norm(Tensor(x.data + output))
             halt_logits = self.halting_prob(normed)
-            halt_prob = 1.0 / (1.0 + np.exp(-halt_logits.data))
+            halt_prob = 1.0 / (1.0 + exp(-halt_logits.data))
 
             p = halt_prob * remainder
             remainder = remainder * (1.0 - halt_prob)
@@ -2388,7 +2389,7 @@ class Transformer(Module):
         logits = self.head(h)
 
         if self.config.logit_softcap > 0:
-            logits = Tensor(np.tanh(logits.data / self.config.logit_softcap) * self.config.logit_softcap,
+            logits = Tensor(tanh(logits.data / self.config.logit_softcap) * self.config.logit_softcap,
                             requires_grad=logits.requires_grad)
 
         return logits
@@ -2429,14 +2430,14 @@ class Transformer(Module):
             if top_p < 1.0:
                 sorted_idx = np.argsort(last_logits)[::-1]
                 sorted_logits = last_logits[sorted_idx].copy()
-                cum_probs = np.cumsum(np.exp(sorted_logits) / (np.exp(sorted_logits).sum() + 1e-8))
+                cum_probs = np.cumsum(exp(sorted_logits) / (exp(sorted_logits).sum() + 1e-8))
                 mask = cum_probs > top_p
                 mask[1:] = mask[:-1]
                 mask[0] = False
                 sorted_logits[mask] = -1e9
                 last_logits[sorted_idx] = sorted_logits
 
-            probs = np.exp(last_logits - last_logits.max())
+            probs = exp(last_logits - last_logits.max())
             probs = probs / (probs.sum() + 1e-8)
             next_id = int(np.random.choice(len(probs), p=probs))
             generated.append(next_id)
@@ -2622,12 +2623,12 @@ class PermutationAttention(Module):
                 for j in range(L):
                     perm_mask[b, inv_perm[i], inv_perm[j]] = (perms[b][j] <= perms[b][i])
 
-        attn = Tensor(np.where(perm_mask[:, None, :, :], attn.data, -1e9),
+        attn = Tensor(where(perm_mask[:, None, :, :], attn.data, -1e9),
                        requires_grad=attn.requires_grad)
 
         if mask is not None:
             mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
-            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+            attn = Tensor(where(mask_exp, attn.data, -1e9),
                            requires_grad=attn.requires_grad)
 
         attn = attn.softmax(axis=-1)
@@ -2748,7 +2749,7 @@ class TransformerXLBlock(Module):
                     causal_mask[i, j] = True
                 elif j < mem_len:
                     causal_mask[i, j] = True
-        attn = Tensor(np.where(causal_mask[None, None, :, :], attn.data, -1e9),
+        attn = Tensor(where(causal_mask[None, None, :, :], attn.data, -1e9),
                        requires_grad=attn.requires_grad)
 
         attn = attn.softmax(axis=-1)
@@ -2851,7 +2852,7 @@ class DisentangledAttention(Module):
         attn = self._disentangled_attention(q_content, k_content, q_pos, k_pos, B, L)
 
         causal_mask = np.triu(np.ones((L, L), dtype=np.bool_), k=1)
-        attn = Tensor(np.where(~causal_mask[None, None, :, :], attn.data, -1e9),
+        attn = Tensor(where(~causal_mask[None, None, :, :], attn.data, -1e9),
                        requires_grad=attn.requires_grad)
 
         attn = attn.softmax(axis=-1)
@@ -2915,16 +2916,16 @@ class GemmaAttention(Module):
         k_t = Tensor(k.data.transpose(0, 1, 3, 2), requires_grad=k.requires_grad)
         attn = q_scaled.matmul(k_t)
 
-        scores_capped = np.tanh(attn.data / self.logit_softcap) * self.logit_softcap
+        scores_capped = tanh(attn.data / self.logit_softcap) * self.logit_softcap
         attn = Tensor(scores_capped, requires_grad=attn.requires_grad)
 
         causal_mask = np.triu(np.ones((L, L), dtype=np.bool_), k=1)
-        attn = Tensor(np.where(~causal_mask[None, None, :, :], attn.data, -1e9),
+        attn = Tensor(where(~causal_mask[None, None, :, :], attn.data, -1e9),
                        requires_grad=attn.requires_grad)
 
         if mask is not None:
             mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
-            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+            attn = Tensor(where(mask_exp, attn.data, -1e9),
                            requires_grad=attn.requires_grad)
 
         attn = attn.softmax(axis=-1)
@@ -3092,12 +3093,12 @@ class PrefixAttention(Module):
         k_t = Tensor(k.data.transpose(0, 1, 3, 2), requires_grad=k.requires_grad)
         attn = q_scaled.matmul(k_t)
 
-        attn = Tensor(np.where(attn_mask[None, None, :, :], attn.data, -1e9),
+        attn = Tensor(where(attn_mask[None, None, :, :], attn.data, -1e9),
                        requires_grad=attn.requires_grad)
 
         if mask is not None:
             mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
-            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+            attn = Tensor(where(mask_exp, attn.data, -1e9),
                            requires_grad=attn.requires_grad)
 
         attn = attn.softmax(axis=-1)
@@ -3217,12 +3218,12 @@ class HierarchicalAttention(Module):
             v_w = v[:, :, start:end]
             w = end - start
             scale = d ** -0.5
-            scores = np.einsum('bhid,bhjd->bhij', q_w.data * scale, k_w.data)
+            scores = einsum('bhid,bhjd->bhij', q_w.data * scale, k_w.data)
             causal = np.triu(np.ones((w, w), dtype=np.bool_), k=1)
-            scores = np.where(~causal[None, None, :, :], scores, -1e9)
-            attn = np.exp(scores - scores.max(axis=-1, keepdims=True))
+            scores = where(~causal[None, None, :, :], scores, -1e9)
+            attn = exp(scores - scores.max(axis=-1, keepdims=True))
             attn = attn / (attn.sum(axis=-1, keepdims=True) + 1e-6)
-            out[:, :, start:end] = np.einsum('bhij,bhjd->bhid', attn, v_w.data)
+            out[:, :, start:end] = einsum('bhij,bhjd->bhid', attn, v_w.data)
 
         out = Tensor(out.transpose(0, 2, 1, 3).reshape(B, L, H * d), requires_grad=x.requires_grad)
         return self.wo(out)
@@ -3244,10 +3245,10 @@ class HierarchicalAttention(Module):
         v = self.global_wv(agg_t).reshape(B, num_windows, H, d).permute(0, 2, 1, 3)
 
         scale = d ** -0.5
-        scores = np.einsum('bhid,bhjd->bhij', q.data * scale, k.data)
-        attn = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        scores = einsum('bhid,bhjd->bhij', q.data * scale, k.data)
+        attn = exp(scores - scores.max(axis=-1, keepdims=True))
         attn = attn / (attn.sum(axis=-1, keepdims=True) + 1e-6)
-        global_out = np.einsum('bhij,bhjd->bhid', attn, v.data)
+        global_out = einsum('bhij,bhjd->bhid', attn, v.data)
 
         expanded = np.zeros((B, num_windows, H, d), dtype=np.float32)
         for i in range(num_windows):

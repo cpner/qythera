@@ -6,6 +6,8 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from functools import lru_cache
 from qythera.tensor import Tensor, no_grad, zeros, ones, randn, eye, Context, EmbeddingBackward, RMSNormBackward, LayerNormBackward, DropoutBackward, ConvBackward
+from qythera.backend import HAS_NUMPY, np
+from qythera.backend import sqrt, exp, tanh, where, einsum, full, mean
 
 # ---------------------------------------------------------------------------
 # Weight initialization
@@ -15,31 +17,31 @@ def kaiming_uniform_(tensor, fan_in, a=math.sqrt(5)):
     std = math.sqrt(2.0 / (1 + a ** 2) / fan_in)
     bound = math.sqrt(3.0) * std
     tensor.data = Tensor._rand_uniform(tensor.shape, -bound, bound).data if hasattr(Tensor, '_rand_uniform') else Tensor._rand_like(tensor).data * bound
-    import numpy as np
+
     tensor.data = np.random.uniform(-bound, bound, tensor.shape).astype(np.float32)
     return tensor
 
 def kaiming_normal_(tensor, fan_in):
-    import numpy as np
+
     std = math.sqrt(2.0 / fan_in)
     tensor.data = np.random.normal(0, std, tensor.shape).astype(np.float32)
     return tensor
 
 def xavier_uniform_(tensor, fan_in, fan_out):
-    import numpy as np
+
     std = math.sqrt(2.0 / (fan_in + fan_out))
     bound = math.sqrt(3.0) * std
     tensor.data = np.random.uniform(-bound, bound, tensor.shape).astype(np.float32)
     return tensor
 
 def xavier_normal_(tensor, fan_in, fan_out):
-    import numpy as np
+
     std = math.sqrt(2.0 / (fan_in + fan_out))
     tensor.data = np.random.normal(0, std, tensor.shape).astype(np.float32)
     return tensor
 
 def orthogonal_(tensor, gain=1.0):
-    import numpy as np
+
     shape = tensor.shape
     if len(shape) < 2:
         raise ValueError("Only tensors with 2+ dimensions are supported")
@@ -56,14 +58,14 @@ def orthogonal_(tensor, gain=1.0):
     return tensor
 
 def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
-    import numpy as np
+
     tmp = np.random.normal(mean, std, tensor.shape)
     tmp = np.clip(tmp, a * std + mean, b * std + mean)
     tensor.data = tmp.astype(np.float32)
     return tensor
 
 def lecun_normal_(tensor, fan_in):
-    import numpy as np
+
     std = math.sqrt(1.0 / fan_in)
     tensor.data = np.random.normal(0, std, tensor.shape).astype(np.float32)
     return tensor
@@ -305,7 +307,7 @@ class Linear(Module):
         self.out_features = out_features
         self.muP = muP
         self.is_output = is_output
-        import numpy as np
+    
         if muP:
             if is_output:
                 scale = 1.0 / in_features
@@ -338,7 +340,7 @@ class Linear(Module):
 class Embedding(Module):
     def __init__(self, num_embeddings, embedding_dim, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False):
         super().__init__()
-        import numpy as np
+    
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx
@@ -352,7 +354,7 @@ class Embedding(Module):
         self.register_parameter('weight', weight)
 
     def _clip_weights(self):
-        import numpy as np
+    
         if self.max_norm is not None:
             norms = np.linalg.norm(self.weight.data, ord=self.norm_type, axis=1)
             mask = norms > self.max_norm
@@ -361,7 +363,7 @@ class Embedding(Module):
                 self.weight.data[mask] = clipped
 
     def forward(self, input):
-        import numpy as np
+    
         indices = input.data.astype(int).flatten()
         self._clip_weights()
         out = self.weight.data[indices].reshape(*input.shape, self.embedding_dim)
@@ -397,14 +399,14 @@ class RMSNorm(Module):
         super().__init__()
         self.eps = eps
         if elementwise_affine:
-            import numpy as np
+        
             self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32), requires_grad=True))
         else:
             self.weight = None
 
     def forward(self, x):
-        import numpy as np
-        norm = np.sqrt(np.mean(x.data ** 2, axis=-1, keepdims=True) + self.eps)
+    
+        norm = sqrt(mean(x.data ** 2, axis=-1, keepdims=True) + self.eps)
         out = x.data / norm
         if self.weight is not None:
             out = out * self.weight.data
@@ -428,7 +430,7 @@ class LayerNorm(Module):
             normalized_shape = (normalized_shape,)
         self.normalized_shape = normalized_shape
         if elementwise_affine:
-            import numpy as np
+        
             self.register_parameter('weight', Tensor(np.ones(normalized_shape, dtype=np.float32), requires_grad=True))
             self.register_parameter('bias', Tensor(np.zeros(normalized_shape, dtype=np.float32), requires_grad=True))
         else:
@@ -436,10 +438,10 @@ class LayerNorm(Module):
             self.bias = None
 
     def forward(self, x):
-        import numpy as np
+    
         mean = x.data.mean(axis=-1, keepdims=True)
         var = x.data.var(axis=-1, keepdims=True, ddof=0)
-        x_norm = (x.data - mean) / np.sqrt(var + self.eps)
+        x_norm = (x.data - mean) / sqrt(var + self.eps)
         if self.weight is not None:
             x_norm = x_norm * self.weight.data
         if self.bias is not None:
@@ -466,7 +468,7 @@ class BatchNorm(Module):
         self.eps = eps
         self.momentum = momentum
         self.track_running_stats = track_running_stats
-        import numpy as np
+    
         if affine:
             self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
             self.register_parameter('bias', Tensor(np.zeros(num_features, dtype=np.float32)))
@@ -475,16 +477,16 @@ class BatchNorm(Module):
             self.register_buffer('running_var', Tensor(np.ones(num_features, dtype=np.float32)))
 
     def forward(self, x):
-        import numpy as np
+    
         if self.training:
             mean = x.data.mean(axis=0)
             var = x.data.var(axis=0, ddof=0)
             if self.track_running_stats:
                 self.running_mean.data = (1 - self.momentum) * self.running_mean.data + self.momentum * mean
                 self.running_var.data = (1 - self.momentum) * self.running_var.data + self.momentum * var
-            x_norm = (x.data - mean) / np.sqrt(var + self.eps)
+            x_norm = (x.data - mean) / sqrt(var + self.eps)
         else:
-            x_norm = (x.data - self.running_mean.data) / np.sqrt(self.running_var.data + self.eps)
+            x_norm = (x.data - self.running_mean.data) / sqrt(self.running_var.data + self.eps)
         if hasattr(self, 'weight') and self.weight is not None:
             x_norm = x_norm * self.weight.data
         if hasattr(self, 'bias') and self.bias is not None:
@@ -498,7 +500,7 @@ class BatchNorm1d(Module):
         self.eps = eps
         self.momentum = momentum
         self.track_running_stats = track_running_stats
-        import numpy as np
+    
         if affine:
             self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
             self.register_parameter('bias', Tensor(np.zeros(num_features, dtype=np.float32)))
@@ -507,16 +509,16 @@ class BatchNorm1d(Module):
             self.register_buffer('running_var', Tensor(np.ones(num_features, dtype=np.float32)))
 
     def forward(self, x):
-        import numpy as np
+    
         if self.training:
             mean = x.data.mean(axis=0)
             var = x.data.var(axis=0, ddof=0)
             if self.track_running_stats:
                 self.running_mean.data = (1 - self.momentum) * self.running_mean.data + self.momentum * mean
                 self.running_var.data = (1 - self.momentum) * self.running_var.data + self.momentum * var
-            x_norm = (x.data - mean) / np.sqrt(var + self.eps)
+            x_norm = (x.data - mean) / sqrt(var + self.eps)
         else:
-            x_norm = (x.data - self.running_mean.data) / np.sqrt(self.running_var.data + self.eps)
+            x_norm = (x.data - self.running_mean.data) / sqrt(self.running_var.data + self.eps)
         if hasattr(self, 'weight') and self.weight is not None:
             x_norm = x_norm * self.weight.data
         if hasattr(self, 'bias') and self.bias is not None:
@@ -530,7 +532,7 @@ class BatchNorm2d(Module):
         self.eps = eps
         self.momentum = momentum
         self.track_running_stats = track_running_stats
-        import numpy as np
+    
         if affine:
             self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
             self.register_parameter('bias', Tensor(np.zeros(num_features, dtype=np.float32)))
@@ -539,18 +541,18 @@ class BatchNorm2d(Module):
             self.register_buffer('running_var', Tensor(np.ones(num_features, dtype=np.float32)))
 
     def forward(self, x):
-        import numpy as np
+    
         if self.training:
             mean = x.data.mean(axis=(0, 2, 3), keepdims=True)
             var = x.data.var(axis=(0, 2, 3), keepdims=True, ddof=0)
             if self.track_running_stats:
                 self.running_mean.data = (1 - self.momentum) * self.running_mean.data + self.momentum * mean.squeeze()
                 self.running_var.data = (1 - self.momentum) * self.running_var.data + self.momentum * var.squeeze()
-            x_norm = (x.data - mean) / np.sqrt(var + self.eps)
+            x_norm = (x.data - mean) / sqrt(var + self.eps)
         else:
             rm = self.running_mean.data.reshape(1, -1, 1, 1)
             rv = self.running_var.data.reshape(1, -1, 1, 1)
-            x_norm = (x.data - rm) / np.sqrt(rv + self.eps)
+            x_norm = (x.data - rm) / sqrt(rv + self.eps)
         if hasattr(self, 'weight'):
             x_norm = x_norm * self.weight.data.reshape(1, -1, 1, 1)
         if hasattr(self, 'bias'):
@@ -564,7 +566,7 @@ class BatchNorm3d(Module):
         self.eps = eps
         self.momentum = momentum
         self.track_running_stats = track_running_stats
-        import numpy as np
+    
         if affine:
             self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
             self.register_parameter('bias', Tensor(np.zeros(num_features, dtype=np.float32)))
@@ -573,18 +575,18 @@ class BatchNorm3d(Module):
             self.register_buffer('running_var', Tensor(np.ones(num_features, dtype=np.float32)))
 
     def forward(self, x):
-        import numpy as np
+    
         if self.training:
             mean = x.data.mean(axis=(0, 2, 3, 4), keepdims=True)
             var = x.data.var(axis=(0, 2, 3, 4), keepdims=True, ddof=0)
             if self.track_running_stats:
                 self.running_mean.data = (1 - self.momentum) * self.running_mean.data + self.momentum * mean.squeeze()
                 self.running_var.data = (1 - self.momentum) * self.running_var.data + self.momentum * var.squeeze()
-            x_norm = (x.data - mean) / np.sqrt(var + self.eps)
+            x_norm = (x.data - mean) / sqrt(var + self.eps)
         else:
             rm = self.running_mean.data.reshape(1, -1, 1, 1, 1)
             rv = self.running_var.data.reshape(1, -1, 1, 1, 1)
-            x_norm = (x.data - rm) / np.sqrt(rv + self.eps)
+            x_norm = (x.data - rm) / sqrt(rv + self.eps)
         if hasattr(self, 'weight'):
             x_norm = x_norm * self.weight.data.reshape(1, -1, 1, 1, 1)
         if hasattr(self, 'bias'):
@@ -597,20 +599,20 @@ class PowerNorm(Module):
         super().__init__()
         self.eps = eps
         self.momentum = momentum
-        import numpy as np
+    
         if affine:
             self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
             self.register_parameter('bias', Tensor(np.zeros(num_features, dtype=np.float32)))
         self.register_buffer('running_mean_x2', Tensor(np.ones(num_features, dtype=np.float32)))
 
     def forward(self, x):
-        import numpy as np
+    
         if self.training:
-            mean_x2 = np.mean(x.data ** 2, axis=0)
+            mean_x2 = mean(x.data ** 2, axis=0)
             self.running_mean_x2.data = (1 - self.momentum) * self.running_mean_x2.data + self.momentum * mean_x2
-            x_norm = x.data / np.sqrt(self.running_mean_x2.data + self.eps)
+            x_norm = x.data / sqrt(self.running_mean_x2.data + self.eps)
         else:
-            x_norm = x.data / np.sqrt(self.running_mean_x2.data + self.eps)
+            x_norm = x.data / sqrt(self.running_mean_x2.data + self.eps)
         if hasattr(self, 'weight') and self.weight is not None:
             x_norm = x_norm * self.weight.data
         if hasattr(self, 'bias') and self.bias is not None:
@@ -623,20 +625,20 @@ class GroupNorm(Module):
         super().__init__()
         self.num_groups = num_groups
         self.eps = eps
-        import numpy as np
+    
         if affine:
             self.register_parameter('weight', Tensor(np.ones(num_channels, dtype=np.float32)))
             self.register_parameter('bias', Tensor(np.zeros(num_channels, dtype=np.float32)))
 
     def forward(self, x):
-        import numpy as np
+    
         shape = x.data.shape
         G = self.num_groups
         C = shape[1] if len(shape) > 1 else 1
         x_reshaped = x.data.reshape(shape[0], G, -1, *shape[2:])
         mean = x_reshaped.mean(axis=(2, 3), keepdims=True)
         var = x_reshaped.var(axis=(2, 3), keepdims=True, ddof=0)
-        x_norm = (x_reshaped - mean) / np.sqrt(var + self.eps)
+        x_norm = (x_reshaped - mean) / sqrt(var + self.eps)
         x_norm = x_norm.reshape(shape)
         if hasattr(self, 'weight'):
             x_norm = x_norm * self.weight.data
@@ -649,16 +651,16 @@ class InstanceNorm(Module):
     def __init__(self, num_features, eps=1e-5, affine=False):
         super().__init__()
         self.eps = eps
-        import numpy as np
+    
         if affine:
             self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
             self.register_parameter('bias', Tensor(np.zeros(num_features, dtype=np.float32)))
 
     def forward(self, x):
-        import numpy as np
+    
         mean = x.data.mean(axis=(2, 3), keepdims=True)
         var = x.data.var(axis=(2, 3), keepdims=True, ddof=0)
-        x_norm = (x.data - mean) / np.sqrt(var + self.eps)
+        x_norm = (x.data - mean) / sqrt(var + self.eps)
         if hasattr(self, 'weight'):
             x_norm = x_norm * self.weight.data.reshape(1, -1, 1, 1)
         if hasattr(self, 'bias'):
@@ -676,7 +678,7 @@ class Dropout(Module):
         self.p = p
 
     def forward(self, x):
-        import numpy as np
+    
         if not self.training or self.p == 0:
             return x
         scale = 1.0 / (1.0 - self.p)
@@ -691,7 +693,7 @@ class Dropout2d(Module):
         self.p = p
 
     def forward(self, x):
-        import numpy as np
+    
         if not self.training or self.p == 0:
             return x
         shape = x.data.shape
@@ -705,7 +707,7 @@ class AlphaDropout(Module):
         self.p = p
 
     def forward(self, x):
-        import numpy as np
+    
         if not self.training or self.p == 0:
             return x
         alpha = 1.6732632423543772
@@ -733,7 +735,7 @@ class Conv1d(Module):
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
-        import numpy as np
+    
         fan_in = in_channels // groups * kernel_size
         weight = Tensor(np.random.randn(out_channels, in_channels // groups, kernel_size).astype(np.float32) * math.sqrt(2.0 / fan_in))
         self.register_parameter('weight', weight)
@@ -743,7 +745,7 @@ class Conv1d(Module):
             self.bias = None
 
     def forward(self, x):
-        import numpy as np
+    
         B, C, L = x.data.shape
         K = self.kernel_size
         P = self.padding
@@ -759,7 +761,7 @@ class Conv1d(Module):
         for g in range(self.groups):
             w = self.weight.data[g * self.out_channels // self.groups:(g + 1) * self.out_channels // self.groups]
             c_in = cols[:, g * self.in_channels // self.groups:(g + 1) * self.in_channels // self.groups].reshape(B, -1, L_out)
-            out[:, g * self.out_channels // self.groups:(g + 1) * self.out_channels // self.groups] = np.einsum('bik,bjk->bij', w.reshape(self.out_channels // self.groups, -1), c_in)
+            out[:, g * self.out_channels // self.groups:(g + 1) * self.out_channels // self.groups] = einsum('bik,bjk->bij', w.reshape(self.out_channels // self.groups, -1), c_in)
         if self.bias is not None:
             out = out + self.bias.data.reshape(1, -1, 1)
         return Tensor(out, requires_grad=x.requires_grad,
@@ -776,7 +778,7 @@ class Conv2d(Module):
         self.padding = padding if isinstance(padding, tuple) else (padding, padding)
         self.dilation = dilation if isinstance(dilation, tuple) else (dilation, dilation)
         self.groups = groups
-        import numpy as np
+    
         KH, KW = self.kernel_size
         fan_in = in_channels // groups * KH * KW
         weight = Tensor(np.random.randn(out_channels, in_channels // groups, KH, KW).astype(np.float32) * math.sqrt(2.0 / fan_in))
@@ -787,7 +789,7 @@ class Conv2d(Module):
             self.bias = None
 
     def forward(self, x):
-        import numpy as np
+    
         B, C, H, W = x.data.shape
         KH, KW = self.kernel_size
         SH, SW = self.stride
@@ -809,7 +811,7 @@ class Conv2d(Module):
         out = np.zeros((B, self.out_channels, H_out * W_out))
         for g in range(G):
             w = self.weight.data[g * Og:(g + 1) * Og].reshape(Og, -1)
-            out[:, g * Og:(g + 1) * Og] = np.einsum('ij,bjk->bik', w, cols[:, g])
+            out[:, g * Og:(g + 1) * Og] = einsum('ij,bjk->bik', w, cols[:, g])
         out = out.reshape(B, self.out_channels, H_out, W_out)
         if self.bias is not None:
             out = out + self.bias.data.reshape(1, -1, 1, 1)
@@ -831,7 +833,7 @@ class Conv3d(Module):
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
-        import numpy as np
+    
         KD, KH, KW = kernel_size
         fan_in = in_channels // groups * KD * KH * KW
         weight = Tensor(np.random.randn(out_channels, in_channels // groups, KD, KH, KW).astype(np.float32) * math.sqrt(2.0 / fan_in))
@@ -842,7 +844,7 @@ class Conv3d(Module):
             self.bias = None
 
     def forward(self, x):
-        import numpy as np
+    
         B, C, D, H, W = x.data.shape
         KD, KH, KW = self.kernel_size
         SD, SH, SW = self.stride
@@ -867,7 +869,7 @@ class Conv3d(Module):
         out = np.zeros((B, self.out_channels, D_out * H_out * W_out))
         for g in range(G):
             w = self.weight.data[g * Og:(g + 1) * Og].reshape(Og, -1)
-            out[:, g * Og:(g + 1) * Og] = np.einsum('ij,bjk->bik', w, cols[:, g])
+            out[:, g * Og:(g + 1) * Og] = einsum('ij,bjk->bik', w, cols[:, g])
         out = out.reshape(B, self.out_channels, D_out, H_out, W_out)
         if self.bias is not None:
             out = out + self.bias.data.reshape(1, -1, 1, 1, 1)
@@ -885,7 +887,7 @@ class ConvTransposed1d(Module):
         self.padding = padding
         self.output_padding = output_padding
         self.groups = groups
-        import numpy as np
+    
         weight = Tensor(np.random.randn(in_channels, out_channels // groups, kernel_size).astype(np.float32) * 0.02)
         self.register_parameter('weight', weight)
         if bias:
@@ -894,7 +896,7 @@ class ConvTransposed1d(Module):
             self.bias = None
 
     def forward(self, x):
-        import numpy as np
+    
         B, C, L_in = x.data.shape
         K = self.kernel_size
         S = self.stride
@@ -907,7 +909,7 @@ class ConvTransposed1d(Module):
             for j in range(L_in):
                 pos = start + j * S
                 if 0 <= pos < L_out:
-                    out[:, :, pos] += np.einsum('bgc,goc->bo', x_t[:, :, :, j], self.weight.data[:, :, i])
+                    out[:, :, pos] += einsum('bgc,goc->bo', x_t[:, :, :, j], self.weight.data[:, :, i])
         if self.bias is not None:
             out = out + self.bias.data.reshape(1, -1, 1)
         return Tensor(out, requires_grad=x.requires_grad)
@@ -926,7 +928,7 @@ class ConvTransposed2d(Module):
         self.padding = padding
         self.output_padding = output_padding
         self.groups = groups
-        import numpy as np
+    
         weight = Tensor(np.random.randn(in_channels, out_channels // groups, *kernel_size).astype(np.float32) * 0.02)
         self.register_parameter('weight', weight)
         if bias:
@@ -935,7 +937,7 @@ class ConvTransposed2d(Module):
             self.bias = None
 
     def forward(self, x):
-        import numpy as np
+    
         B, C, H_in, W_in = x.data.shape
         KH, KW = self.kernel_size
         SH, SW = self.stride
@@ -976,7 +978,7 @@ class ConvTransposed3d(Module):
         self.padding = padding
         self.output_padding = output_padding
         self.groups = groups
-        import numpy as np
+    
         weight = Tensor(np.random.randn(in_channels, out_channels // groups, *kernel_size).astype(np.float32) * 0.02)
         self.register_parameter('weight', weight)
         if bias:
@@ -985,7 +987,7 @@ class ConvTransposed3d(Module):
             self.bias = None
 
     def forward(self, x):
-        import numpy as np
+    
         B, C, D_in, H_in, W_in = x.data.shape
         KD, KH, KW = self.kernel_size
         SD, SH, SW = self.stride
@@ -1026,7 +1028,7 @@ class DepthwiseConv2d(Module):
         self.stride = stride if isinstance(stride, tuple) else (stride, stride)
         self.padding = padding if isinstance(padding, tuple) else (padding, padding)
         self.dilation = dilation if isinstance(dilation, tuple) else (dilation, dilation)
-        import numpy as np
+    
         weight = Tensor(np.random.randn(in_channels, 1, *kernel_size).astype(np.float32) * 0.02)
         self.register_parameter('weight', weight)
 
@@ -1057,7 +1059,7 @@ class AvgPool(Module):
         self.padding = padding if isinstance(padding, tuple) else (padding, padding)
 
     def forward(self, x):
-        import numpy as np
+    
         B, C, H, W = x.data.shape
         KH, KW = self.kernel_size
         SH, SW = self.stride
@@ -1081,7 +1083,7 @@ class MaxPool(Module):
         self.padding = padding if isinstance(padding, tuple) else (padding, padding)
 
     def forward(self, x):
-        import numpy as np
+    
         B, C, H, W = x.data.shape
         KH, KW = self.kernel_size
         SH, SW = self.stride
@@ -1089,7 +1091,7 @@ class MaxPool(Module):
         H_out = (H + 2 * PH - KH) // SH + 1
         W_out = (W + 2 * PW - KW) // SW + 1
         x_padded = np.pad(x.data, ((0,0),(0,0),(PH,PH),(PW,PW)), constant_values=-1e9) if any(p>0 for p in self.padding) else x.data
-        out = np.full((B, C, H_out, W_out), -1e9)
+        out = full((B, C, H_out, W_out), -1e9)
         for i in range(KH):
             for j in range(KW):
                 out = np.maximum(out, x_padded[:, :, i:i+H_out*SH:SH, j:j+W_out*SW:SW])
@@ -1102,7 +1104,7 @@ class AdaptiveAvgPool(Module):
         self.output_size = output_size if isinstance(output_size, tuple) else (output_size, output_size)
 
     def forward(self, x):
-        import numpy as np
+    
         B, C, H, W = x.data.shape
         OH, OW = self.output_size
         kernel_h = H // OH
@@ -1117,7 +1119,7 @@ class AdaptiveMaxPool(Module):
         self.output_size = output_size if isinstance(output_size, tuple) else (output_size, output_size)
 
     def forward(self, x):
-        import numpy as np
+    
         B, C, H, W = x.data.shape
         OH, OW = self.output_size
         kernel_h = H // OH
@@ -1138,7 +1140,7 @@ class Upsample(Module):
         self.mode = mode
 
     def _bilinear_1d(self, arr, size, axis):
-        import numpy as np
+    
         n_in = arr.shape[axis]
         n_out = size
         out = np.zeros((n_out,) + arr.shape[1:] if axis == 0 else arr.shape[:axis] + (n_out,) + arr.shape[axis + 1:], dtype=np.float32)
@@ -1158,7 +1160,7 @@ class Upsample(Module):
         return out
 
     def _bilinear_2d(self, arr, h_out, w_out):
-        import numpy as np
+    
         B, C, H, W = arr.shape
         out = np.zeros((B, C, h_out, w_out), dtype=np.float32)
         for i in range(h_out):
@@ -1180,18 +1182,18 @@ class Upsample(Module):
         return out
 
     def _bicubic_kernel(self, t):
-        import numpy as np
+    
         t = np.abs(t)
         t2 = t ** 2
         t3 = t ** 3
-        return np.where(
+        return where(
             t < 1,
             1.5 * t3 - 2.5 * t2 + 1,
-            np.where(t < 2, -0.5 * t3 + 2.5 * t2 - 4 * t + 2, 0.0)
+            where(t < 2, -0.5 * t3 + 2.5 * t2 - 4 * t + 2, 0.0)
         )
 
     def _bicubic_2d(self, arr, h_out, w_out):
-        import numpy as np
+    
         B, C, H, W = arr.shape
         out = np.zeros((B, C, h_out, w_out), dtype=np.float32)
         for i in range(h_out):
@@ -1210,7 +1212,7 @@ class Upsample(Module):
         return out
 
     def forward(self, x):
-        import numpy as np
+    
         if self.scale_factor is not None:
             sf = self.scale_factor if isinstance(self.scale_factor, tuple) else (self.scale_factor, self.scale_factor)
             if self.mode == 'nearest':
@@ -1391,9 +1393,9 @@ class WeightNorm(Module):
         self.dim = dim
 
     def forward(self, x):
-        import numpy as np
+    
         w = getattr(self.module, self.name)
-        norm = np.sqrt(np.sum(w.data ** 2, axis=self.dim, keepdims=True) + 1e-8)
+        norm = sqrt(np.sum(w.data ** 2, axis=self.dim, keepdims=True) + 1e-8)
         setattr(self.module, self.name, Tensor(w.data / norm, requires_grad=w.requires_grad))
         out = self.module(x)
         setattr(self.module, self.name, w)
@@ -1409,7 +1411,7 @@ class SpectralNorm(Module):
         self.u = None
 
     def forward(self, x):
-        import numpy as np
+    
         w = getattr(self.module, self.name)
         shape = w.data.shape
         mat = w.data.reshape(shape[0], -1)
@@ -1455,11 +1457,11 @@ class LeakyReLU(Module):
 class PReLU(Module):
     def __init__(self, num_parameters=1, init=0.25):
         super().__init__()
-        import numpy as np
-        self.register_parameter('weight', Tensor(np.full(num_parameters, init, dtype=np.float32)))
+    
+        self.register_parameter('weight', Tensor(full(num_parameters, init, dtype=np.float32)))
     def forward(self, x):
-        import numpy as np
-        return Tensor(np.where(x.data > 0, x.data, self.weight.data * x.data), requires_grad=x.requires_grad)
+    
+        return Tensor(where(x.data > 0, x.data, self.weight.data * x.data), requires_grad=x.requires_grad)
 
 class ELU(Module):
     def __init__(self, alpha=1.0):
@@ -1482,9 +1484,9 @@ class SiLU(Module):
 
 class Mish(Module):
     def forward(self, x):
-        import numpy as np
-        sp = np.log1p(np.exp(x.data))
-        return Tensor(x.data * np.tanh(sp), requires_grad=x.requires_grad)
+    
+        sp = np.log1p(exp(x.data))
+        return Tensor(x.data * tanh(sp), requires_grad=x.requires_grad)
 
 class Hardswish(Module):
     def forward(self, x):
@@ -1495,9 +1497,9 @@ class GLU(Module):
         super().__init__()
         self.dim = dim
     def forward(self, x):
-        import numpy as np
+    
         a, b = np.split(x.data, 2, axis=self.dim)
-        sig = 1 / (1 + np.exp(-np.clip(b, -500, 500)))
+        sig = 1 / (1 + exp(-np.clip(b, -500, 500)))
         return Tensor(a * sig, requires_grad=x.requires_grad)
 
 class SwiGLU(Module):
@@ -1505,9 +1507,9 @@ class SwiGLU(Module):
         super().__init__()
         self.dim = dim
     def forward(self, x):
-        import numpy as np
+    
         a, b = np.split(x.data, 2, axis=self.dim)
-        sig = 1 / (1 + np.exp(-np.clip(b, -500, 500)))
+        sig = 1 / (1 + exp(-np.clip(b, -500, 500)))
         return Tensor(a * b * sig, requires_grad=x.requires_grad)
 
 class GEGLU(Module):
@@ -1515,11 +1517,11 @@ class GEGLU(Module):
         super().__init__()
         self.dim = dim
     def forward(self, x):
-        import numpy as np
+    
         a, b = np.split(x.data, 2, axis=self.dim)
         c = 0.7978845608028654
         k = 0.044715
-        t = np.tanh(c * (b + k * b ** 3))
+        t = tanh(c * (b + k * b ** 3))
         return Tensor(a * 0.5 * b * (1 + t), requires_grad=x.requires_grad)
 
 class ReGLU(Module):
@@ -1527,7 +1529,7 @@ class ReGLU(Module):
         super().__init__()
         self.dim = dim
     def forward(self, x):
-        import numpy as np
+    
         a, b = np.split(x.data, 2, axis=self.dim)
         return Tensor(a * np.maximum(0, b), requires_grad=x.requires_grad)
 
@@ -1563,7 +1565,7 @@ class Sparsemax(Module):
         self.dim = dim
 
     def forward(self, x):
-        import numpy as np
+    
         data = x.data
         if self.dim != -1 and self.dim != len(data.shape) - 1:
             data = np.moveaxis(data, self.dim, -1)
@@ -1589,7 +1591,7 @@ class Entmax(Module):
         self.dim = dim
 
     def forward(self, x):
-        import numpy as np
+    
         if self.alpha == 1.0:
             return x.softmax(self.dim)
         if self.alpha == 2.0:
