@@ -5,10 +5,316 @@ import time
 import re
 import json
 import hashlib
-from typing import Dict, List, Set, Optional, Any, Tuple
+import os
+import struct
+import threading
+from typing import Dict, List, Set, Optional, Any, Tuple, Callable
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass, field
+from enum import Enum
 import heapq
+
+
+class _EntryType(Enum):
+    WRITE = 1
+    DELETE = 2
+    LINK = 3
+    MOUNT = 4
+    CHECKPOINT = 5
+
+
+@dataclass
+class _LogEntry:
+    position: int
+    entry_type: _EntryType
+    path: str
+    data: Optional[Dict] = None
+    timestamp: float = 0.0
+    checksum: int = 0
+
+    def __post_init__(self):
+        if self.timestamp == 0.0:
+            self.timestamp = time.time()
+        if self.checksum == 0:
+            payload = json.dumps({"op": self.entry_type.value, "path": self.path, "data": self.data}, sort_keys=True).encode()
+            self.checksum = struct.unpack('I', hashlib.md5(payload).digest()[:4])[0]
+
+    def to_dict(self) -> Dict:
+        return {
+            "position": self.position,
+            "entry_type": self.entry_type.value,
+            "path": self.path,
+            "data": self.data,
+            "timestamp": self.timestamp,
+            "checksum": self.checksum,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> '_LogEntry':
+        return cls(
+            position=d["position"],
+            entry_type=_EntryType(d["entry_type"]),
+            path=d["path"],
+            data=d.get("data"),
+            timestamp=d.get("timestamp", 0.0),
+            checksum=d.get("checksum", 0),
+        )
+
+
+class TransactionLog:
+    """Append-only WAL for crash recovery with fsync and checkpointing."""
+
+    def __init__(self, path: Optional[str] = None):
+        self._path = path
+        self._lock = threading.Lock()
+        self.entries: List[_LogEntry] = []
+        self.position = 0
+        self._checkpoint_pos = 0
+        if path and os.path.exists(path):
+            self._recover()
+
+    def append(self, operation: str, path: str, data: Optional[Dict] = None) -> _LogEntry:
+        entry_type_map = {
+            "write": _EntryType.WRITE,
+            "delete": _EntryType.DELETE,
+            "link": _EntryType.LINK,
+            "mount": _EntryType.MOUNT,
+            "commit": _EntryType.CHECKPOINT,
+        }
+        entry_type = entry_type_map.get(operation, _EntryType.WRITE)
+        with self._lock:
+            entry = _LogEntry(position=self.position, entry_type=entry_type, path=path, data=data)
+            self.entries.append(entry)
+            self.position += 1
+            self._flush(entry)
+        return entry
+
+    def _flush(self, entry: _LogEntry):
+        if not self._path:
+            return
+        with open(self._path, "a") as f:
+            f.write(json.dumps(entry.to_dict()) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def get_entries(self, after: Optional[int] = None) -> List[_LogEntry]:
+        if after is None:
+            return list(self.entries)
+        return [e for e in self.entries if e.position > after]
+
+    def checkpoint(self, fs: 'KnowledgeFileSystem') -> int:
+        pos = self.position
+        self._checkpoint_pos = pos
+        self.append("commit", "", {})
+        return pos
+
+    def replay(self, fs: 'KnowledgeFileSystem', from_position: int = 0):
+        for entry in self.get_entries(from_position):
+            if entry.entry_type == _EntryType.WRITE:
+                if entry.data:
+                    node = KnowledgeNode(
+                        content=entry.data.get("content", ""),
+                        node_id=entry.data.get("node_id", ""),
+                    )
+                    fs._write_raw(entry.path, node)
+            elif entry.entry_type == _EntryType.DELETE:
+                fs._delete_raw(entry.path)
+
+    def _recover(self):
+        if not self._path or not os.path.exists(self._path):
+            return
+        self.entries.clear()
+        self.position = 0
+        last_valid = -1
+        with open(self._path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    entry = _LogEntry.from_dict(d)
+                    payload = json.dumps({"op": entry.entry_type.value, "path": entry.path, "data": entry.data}, sort_keys=True).encode()
+                    expected_crc = struct.unpack('I', hashlib.md5(payload).digest()[:4])[0]
+                    if entry.checksum != expected_crc:
+                        continue
+                    self.entries.append(entry)
+                    self.position = entry.position + 1
+                    last_valid = entry.position
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+    def compact(self, up_to: int):
+        if self._path:
+            remaining = [e for e in self.entries if e.position > up_to]
+            with open(self._path, "w") as f:
+                for e in remaining:
+                    f.write(json.dumps(e.to_dict()) + "\n")
+        self.entries = [e for e in self.entries if e.position > up_to]
+        self._checkpoint_pos = up_to
+
+
+class GarbageCollector:
+    """Reference-counting GC for orphaned nodes."""
+
+    def __init__(self, fs: 'KnowledgeFileSystem'):
+        self.fs = fs
+        self._ref_counts: Dict[str, int] = defaultdict(int)
+        self._roots: Set[str] = set()
+
+    def scan(self) -> Dict[str, Any]:
+        self._ref_counts.clear()
+        self._roots.clear()
+
+        for path, node in self.fs.vfs_get_all():
+            if isinstance(node, KnowledgeNode):
+                self._roots.add(node.node_id)
+                for rel_type, targets in node.relations.items():
+                    for tid in targets:
+                        self._ref_counts[tid] += 1
+
+        orphans = []
+        for node_id in list(self.fs.nodes.keys()):
+            if self._ref_counts[node_id] == 0 and node_id not in self._roots:
+                orphans.append(node_id)
+
+        return {
+            "total_nodes": len(self.fs.nodes),
+            "roots": len(self._roots),
+            "ref_counted": len(self._ref_counts),
+            "orphans": len(orphans),
+            "orphan_ids": orphans,
+        }
+
+    def collect(self, dry_run: bool = False) -> List[str]:
+        info = self.scan()
+        removed = []
+        for node_id in info["orphan_ids"]:
+            if node_id in self.fs.nodes:
+                if not dry_run:
+                    path = self.fs._find_path(node_id)
+                    if path:
+                        self.fs.delete(path)
+                    else:
+                        self.fs.nodes.pop(node_id, None)
+                        self.fs.index.nodes.pop(node_id, None)
+                removed.append(node_id)
+        return removed
+
+    def add_root(self, node_id: str):
+        self._roots.add(node_id)
+
+    def pin(self, node_id: str):
+        self._roots.add(node_id)
+
+    def unpin(self, node_id: str):
+        self._roots.discard(node_id)
+
+
+class ImportExport:
+    """JSON serialization with embedding compression."""
+
+    @staticmethod
+    def export_json(fs: 'KnowledgeFileSystem', compress_embeddings: bool = True) -> str:
+        nodes_data = {}
+        for node_id, node in fs.nodes.items():
+            emb = node.embedding
+            if compress_embeddings:
+                emb_list = quantize_embedding(emb)
+            else:
+                emb_list = emb.tolist()
+            nodes_data[node_id] = {
+                "content": node.content,
+                "embedding": emb_list,
+                "relations": node.relations,
+                "timestamps": node.timestamps,
+                "metadata": node.metadata,
+                "node_id": node.node_id,
+            }
+
+        index_data = {
+            "entry_point": fs.index.entry_point,
+            "max_level": fs.index.max_level,
+            "nodes": {},
+        }
+        for nid, hnsw_node in fs.index.nodes.items():
+            index_data["nodes"][nid] = {
+                "vector": quantize_embedding(hnsw_node.vector) if compress_embeddings else hnsw_node.vector.tolist(),
+                "level": hnsw_node.level,
+                "neighbors": {str(k): v for k, v in hnsw_node.neighbors.items()},
+            }
+
+        export = {
+            "version": 1,
+            "nodes": nodes_data,
+            "index": index_data,
+            "mount_points": fs.mount_points,
+            "stats": fs.stats(),
+        }
+        return json.dumps(export, indent=2)
+
+    @staticmethod
+    def import_json(fs: 'KnowledgeFileSystem', data: str, decompress_embeddings: bool = True) -> Dict[str, Any]:
+        export = json.loads(data)
+        imported_count = 0
+        skipped_count = 0
+
+        for node_id, nd in export.get("nodes", {}).items():
+            if node_id in fs.nodes:
+                skipped_count += 1
+                continue
+            emb_data = nd["embedding"]
+            if decompress_embeddings and isinstance(emb_data, list) and len(emb_data) < 64:
+                embedding = dequantize_embedding(emb_data)
+            else:
+                embedding = np.array(emb_data, dtype=np.float32)
+
+            node = KnowledgeNode(
+                content=nd["content"],
+                embedding=embedding,
+                relations=nd.get("relations", {}),
+                timestamps=nd.get("timestamps", {}),
+                metadata=nd.get("metadata", {}),
+                node_id=node_id,
+            )
+            fs._write_raw(f"imported/{node_id}", node)
+            imported_count += 1
+
+        for nid, idx_data in export.get("index", {}).get("nodes", {}).items():
+            if nid in fs.index.nodes:
+                neighbors = {int(k): v for k, v in idx_data.get("neighbors", {}).items()}
+                fs.index.nodes[nid].neighbors = neighbors
+
+        fs.mount_points.update(export.get("mount_points", {}))
+
+        return {"imported": imported_count, "skipped": skipped_count, "total": len(export.get("nodes", {}))}
+
+    @staticmethod
+    def export_file(fs: 'KnowledgeFileSystem', filepath: str, compress_embeddings: bool = True):
+        data = ImportExport.export_json(fs, compress_embeddings)
+        with open(filepath, 'w') as f:
+            f.write(data)
+
+    @staticmethod
+    def import_file(fs: 'KnowledgeFileSystem', filepath: str, decompress_embeddings: bool = True) -> Dict[str, Any]:
+        with open(filepath, 'r') as f:
+            data = f.read()
+        return ImportExport.import_json(fs, data, decompress_embeddings)
+
+
+def quantize_embedding(emb: np.ndarray, bits: int = 8) -> List[float]:
+    """Quantize float32 embedding to uint8 for compression."""
+    mn, mx = float(emb.min()), float(emb.max())
+    rng = mx - mn if mx != mn else 1.0
+    quantized = ((emb - mn) / rng * 255).clip(0, 255).astype(np.uint8)
+    return [mn, rng] + quantized.tolist()
+
+
+def dequantize_embedding(data: List[float], bits: int = 8) -> np.ndarray:
+    """Dequantize uint8 back to float32."""
+    mn, rng = data[0], data[1]
+    raw = np.array(data[2:], dtype=np.float32)
+    return (raw / 255.0 * rng + mn).astype(np.float32)
 
 
 @dataclass
@@ -39,44 +345,6 @@ class KnowledgeNode:
         if rel_type in self.relations:
             self.relations[rel_type] = [t for t in self.relations[rel_type] if t != target_id]
             self.timestamps["modified"] = time.time()
-
-
-class TransactionLog:
-    def __init__(self):
-        self.entries: List[Dict] = []
-        self.position = 0
-
-    def append(self, operation: str, path: str, data: Optional[Dict] = None):
-        entry = {
-            "position": self.position,
-            "operation": operation,
-            "path": path,
-            "data": data,
-            "timestamp": time.time(),
-        }
-        self.entries.append(entry)
-        self.position += 1
-        return entry
-
-    def get_entries(self, after: Optional[int] = None) -> List[Dict]:
-        if after is None:
-            return self.entries
-        return [e for e in self.entries if e["position"] > after]
-
-    def replay(self, fs: 'KnowledgeFileSystem'):
-        for entry in self.entries:
-            if entry["operation"] == "write":
-                if entry["data"]:
-                    node = KnowledgeNode(
-                        content=entry["data"].get("content", ""),
-                        node_id=entry["data"].get("node_id", ""),
-                    )
-                    fs._write_raw(entry["path"], node)
-            elif entry["operation"] == "delete":
-                fs._delete_raw(entry["path"])
-
-    def compact(self, up_to: int):
-        self.entries = [e for e in self.entries if e["position"] > up_to]
 
 
 @dataclass
@@ -267,12 +535,14 @@ def parse_uri(uri: str) -> Tuple[str, str, str]:
 
 
 class KnowledgeFileSystem:
-    def __init__(self):
+    def __init__(self, log_path: Optional[str] = None):
         self.vfs = VFS()
         self.index = HNSWIndex()
-        self.transaction_log = TransactionLog()
+        self.transaction_log = TransactionLog(path=log_path)
         self.nodes: Dict[str, KnowledgeNode] = {}
         self.mount_points: Dict[str, str] = {}
+        self.gc = GarbageCollector(self)
+        self.import_export = ImportExport()
 
     def mount(self, path: str, domain: str):
         self.mount_points[path] = domain
@@ -455,4 +725,18 @@ if __name__ == "__main__":
     print("\n7. Transaction log:")
     print(f"   Total transactions: {len(fs.transaction_log.entries)}")
     for entry in fs.transaction_log.get_entries()[:5]:
-        print(f"   [{entry['operation']}] {entry['path']}")
+        print(f"   [{entry.entry_type.name}] {entry.path}")
+
+    print("\n8. GarbageCollector:")
+    gc_info = fs.gc.scan()
+    print(f"   Roots: {gc_info['roots']}, Orphans: {gc_info['orphans']}")
+    orphans = fs.gc.collect(dry_run=True)
+    print(f"   Orphan IDs (dry run): {orphans}")
+
+    print("\n9. ImportExport (JSON with embedding compression):")
+    exported = ImportExport.export_json(fs, compress_embeddings=True)
+    print(f"   Exported size: {len(exported)} bytes")
+    fs2 = KnowledgeFileSystem()
+    result = ImportExport.import_json(fs2, exported, decompress_embeddings=True)
+    print(f"   Imported: {result['imported']}, Skipped: {result['skipped']}")
+    print(f"   Reimported stats: {fs2.stats()}")

@@ -7,7 +7,11 @@ import sys
 import time
 import threading
 import queue
+import hashlib
+import statistics
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from enum import Enum
+from collections import deque
 
 import numpy as np
 
@@ -188,6 +192,242 @@ class HealthCheck:
 
 
 # ---------------------------------------------------------------------------
+# CircuitBreaker
+# ---------------------------------------------------------------------------
+
+class _CircuitState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class CircuitBreaker:
+    """Circuit breaker: open after N failures, half-open after cooldown."""
+
+    def __init__(self, failure_threshold: int = 5, cooldown_seconds: float = 30.0,
+                 half_open_max: int = 1):
+        self._failure_threshold = failure_threshold
+        self._cooldown = cooldown_seconds
+        self._half_open_max = half_open_max
+        self._state = _CircuitState.CLOSED
+        self._failure_count = 0
+        self._success_count = 0
+        self._last_failure_time: float = 0.0
+        self._half_open_attempts = 0
+        self._lock = threading.Lock()
+
+    @property
+    def state(self) -> _CircuitState:
+        with self._lock:
+            if self._state == _CircuitState.OPEN:
+                if time.time() - self._last_failure_time >= self._cooldown:
+                    self._state = _CircuitState.HALF_OPEN
+                    self._half_open_attempts = 0
+            return self._state
+
+    def record_success(self):
+        with self._lock:
+            if self._state == _CircuitState.HALF_OPEN:
+                self._success_count += 1
+                if self._success_count >= self._half_open_max:
+                    self._state = _CircuitState.CLOSED
+                    self._failure_count = 0
+                    self._success_count = 0
+            elif self._state == _CircuitState.CLOSED:
+                self._failure_count = 0
+
+    def record_failure(self):
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            if self._state == _CircuitState.HALF_OPEN:
+                self._state = _CircuitState.OPEN
+                self._success_count = 0
+            elif self._failure_count >= self._failure_threshold:
+                self._state = _CircuitState.OPEN
+
+    def allow_request(self) -> bool:
+        state = self.state
+        if state == _CircuitState.CLOSED:
+            return True
+        if state == _CircuitState.HALF_OPEN:
+            with self._lock:
+                if self._half_open_attempts < self._half_open_max:
+                    self._half_open_attempts += 1
+                    return True
+            return False
+        return False
+
+    def reset(self):
+        with self._lock:
+            self._state = _CircuitState.CLOSED
+            self._failure_count = 0
+            self._success_count = 0
+            self._half_open_attempts = 0
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "state": self.state.value,
+            "failure_count": self._failure_count,
+            "failure_threshold": self._failure_threshold,
+            "cooldown_seconds": self._cooldown,
+        }
+
+
+# ---------------------------------------------------------------------------
+# RequestDeduplication
+# ---------------------------------------------------------------------------
+
+class RequestDeduplication:
+    """Cache identical prompts to avoid redundant inference."""
+
+    def __init__(self, max_size: int = 128, ttl_seconds: float = 300.0):
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+        self._cache: Dict[str, Tuple[Any, float]] = {}
+        self._access_order: deque = deque()
+        self._lock = threading.Lock()
+        self._hits = 0
+        self._misses = 0
+
+    def _make_key(self, messages: List[Dict], model: str, temperature: float,
+                  max_tokens: int) -> str:
+        payload = json.dumps({
+            "messages": messages,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    def get(self, messages: List[Dict], model: str, temperature: float,
+            max_tokens: int) -> Optional[Any]:
+        key = self._make_key(messages, model, temperature, max_tokens)
+        with self._lock:
+            if key in self._cache:
+                value, ts = self._cache[key]
+                if time.time() - ts < self._ttl:
+                    self._hits += 1
+                    return value
+                else:
+                    del self._cache[key]
+                    self._access_order.remove(key)
+            self._misses += 1
+        return None
+
+    def put(self, messages: List[Dict], model: str, temperature: float,
+            max_tokens: int, value: Any):
+        key = self._make_key(messages, model, temperature, max_tokens)
+        with self._lock:
+            if len(self._cache) >= self._max_size:
+                oldest = self._access_order.popleft()
+                self._cache.pop(oldest, None)
+            self._cache[key] = (value, time.time())
+            self._access_order.append(key)
+
+    def invalidate(self, messages: List[Dict], model: str, temperature: float,
+                   max_tokens: int):
+        key = self._make_key(messages, model, temperature, max_tokens)
+        with self._lock:
+            self._cache.pop(key, None)
+            try:
+                self._access_order.remove(key)
+            except ValueError:
+                pass
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+            self._access_order.clear()
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            total = self._hits + self._misses
+            return {
+                "size": len(self._cache),
+                "max_size": self._max_size,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": round(self._hits / max(total, 1), 3),
+            }
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+class Metrics:
+    """Track tokens/sec, TTFT, latency distribution."""
+
+    def __init__(self, window_size: int = 1000):
+        self._window_size = window_size
+        self._latencies: deque = deque(maxlen=window_size)
+        self._ttfts: deque = deque(maxlen=window_size)
+        self._tokens_per_sec: deque = deque(maxlen=window_size)
+        self._total_tokens = 0
+        self._total_requests = 0
+        self._total_latency_ms = 0.0
+        self._start_time = time.time()
+        self._lock = threading.Lock()
+
+    def record_request(self, latency_ms: float, ttft_ms: Optional[float] = None,
+                       tokens_generated: int = 0, generation_time_ms: float = 0.0):
+        with self._lock:
+            self._latencies.append(latency_ms)
+            self._total_requests += 1
+            self._total_latency_ms += latency_ms
+
+            if ttft_ms is not None:
+                self._ttfts.append(ttft_ms)
+
+            if tokens_generated > 0 and generation_time_ms > 0:
+                tps = tokens_generated / (generation_time_ms / 1000.0)
+                self._tokens_per_sec.append(tps)
+                self._total_tokens += tokens_generated
+
+    def _percentile(self, data: deque, p: float) -> float:
+        if not data:
+            return 0.0
+        sorted_data = sorted(data)
+        k = (len(sorted_data) - 1) * p
+        f = int(k)
+        c = f + 1
+        if c >= len(sorted_data):
+            return sorted_data[-1]
+        return sorted_data[f] + (k - f) * (sorted_data[c] - sorted_data[f])
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            uptime = time.time() - self._start_time
+            avg_lat = self._total_latency_ms / max(self._total_requests, 1)
+            avg_tps = statistics.mean(self._tokens_per_sec) if self._tokens_per_sec else 0.0
+
+            return {
+                "total_requests": self._total_requests,
+                "total_tokens": self._total_tokens,
+                "uptime_seconds": round(uptime, 1),
+                "avg_latency_ms": round(avg_lat, 2),
+                "p50_latency_ms": round(self._percentile(self._latencies, 0.5), 2),
+                "p95_latency_ms": round(self._percentile(self._latencies, 0.95), 2),
+                "p99_latency_ms": round(self._percentile(self._latencies, 0.99), 2),
+                "avg_ttft_ms": round(statistics.mean(self._ttfts), 2) if self._ttfts else 0.0,
+                "p50_ttft_ms": round(self._percentile(self._ttfts, 0.5), 2),
+                "avg_tokens_per_sec": round(avg_tps, 2),
+                "requests_per_second": round(self._total_requests / max(uptime, 1), 2),
+            }
+
+    def reset(self):
+        with self._lock:
+            self._latencies.clear()
+            self._ttfts.clear()
+            self._tokens_per_sec.clear()
+            self._total_tokens = 0
+            self._total_requests = 0
+            self._total_latency_ms = 0.0
+            self._start_time = time.time()
+
+
+# ---------------------------------------------------------------------------
 # BatchScheduler
 # ---------------------------------------------------------------------------
 
@@ -237,6 +477,9 @@ class RouteHandler:
         self.tokenizer = tokenizer
         self.health = HealthCheck()
         self.batch = BatchScheduler()
+        self.circuit = CircuitBreaker()
+        self.dedup = RequestDeduplication()
+        self.metrics = Metrics()
         self.routes: Dict[Tuple[str, str], Callable] = {}
         self._register_defaults()
 
@@ -245,6 +488,7 @@ class RouteHandler:
         self.routes[("GET", "/health")] = self._health_check
         self.routes[("GET", "/v1/models")] = self._list_models
         self.routes[("POST", "/v1/chat/completions")] = self._chat_completions
+        self.routes[("GET", "/metrics")] = self._metrics
 
     def handle(self, request: Dict[str, Any]) -> bytes:
         method = request.get("method", "")
@@ -273,6 +517,15 @@ class RouteHandler:
     def _health_check(self, request: Dict) -> bytes:
         return ResponseBuilder.json(self.health.get_stats())
 
+    def _metrics(self, request: Dict) -> bytes:
+        return ResponseBuilder.json({
+            "health": self.health.get_stats(),
+            "circuit_breaker": self.circuit.get_stats(),
+            "dedup": self.dedup.get_stats(),
+            "metrics": self.metrics.get_stats(),
+            "batch": self.batch.get_stats(),
+        })
+
     def _list_models(self, request: Dict) -> bytes:
         return ResponseBuilder.json({"data": [{"id": "vaelon", "object": "model"}]})
 
@@ -282,10 +535,22 @@ class RouteHandler:
         if not messages:
             return ResponseBuilder.bad_request("messages required")
 
+        if not self.circuit.allow_request():
+            self.circuit.record_failure()
+            return ResponseBuilder.json({"error": "circuit breaker open, service degraded"}, 503)
+
         stream = body.get("stream", False)
         max_tokens = body.get("max_tokens", 256)
         temperature = body.get("temperature", 1.0)
         top_k = body.get("top_k", 50)
+
+        model_name = body.get("model", "vaelon")
+
+        if not stream and temperature > 0:
+            cached = self.dedup.get(messages, model_name, temperature, max_tokens)
+            if cached is not None:
+                self.circuit.record_success()
+                return ResponseBuilder.json(cached)
 
         conv_id = body.get("conversation_id", f"conv_{int(time.time()*1000)}")
         history = self._get_conversation(conv_id)
@@ -306,26 +571,35 @@ class RouteHandler:
                 return self._stream_chat(conv_id, history, max_tokens,
                                          temperature, top_k, t0, slot_id, body)
             else:
+                gen_start = time.time()
                 response_text = self._generate_autoregressive(
                     history, max_tokens, temperature, top_k)
+                gen_time_ms = (time.time() - gen_start) * 1000
                 latency = time.time() - t0
-                self.health.record_request(latency * 1000)
+                latency_ms = latency * 1000
+                self.health.record_request(latency_ms)
+                self.circuit.record_success()
+                self.metrics.record_request(latency_ms, tokens_generated=len(response_text.split()), generation_time_ms=gen_time_ms)
                 history.append({"role": "assistant", "content": response_text})
                 self._save_conversation(conv_id, history)
-                return ResponseBuilder.json({
+                resp = {
                     "id": f"c{int(time.time()*1000)}",
                     "object": "chat.completion",
-                    "model": body.get("model", "vaelon"),
+                    "model": model_name,
                     "conversation_id": conv_id,
                     "choices": [{
                         "index": 0,
                         "message": {"role": "assistant", "content": response_text},
                         "finish_reason": "stop",
                     }],
-                    "latency_ms": round(latency * 1000, 1),
-                })
+                    "latency_ms": round(latency_ms, 1),
+                }
+                if temperature > 0:
+                    self.dedup.put(messages, model_name, temperature, max_tokens, resp)
+                return ResponseBuilder.json(resp)
         except Exception as e:
             self.health.record_request(0, error=True)
+            self.circuit.record_failure()
             return ResponseBuilder.json({"error": str(e)}, 500)
         finally:
             if slot_id is not None:
