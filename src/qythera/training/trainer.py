@@ -65,6 +65,7 @@ class GradScaler:
                 if p.grad is not None:
                     g = p.grad.data if isinstance(p.grad, Tensor) else p.grad
                     p.grad = Tensor(g / self.scale)
+        optimizer.step()
         self.steps_since_last_scale += 1
         if self.steps_since_last_scale >= self.growth_interval:
             self.scale *= self.growth_factor

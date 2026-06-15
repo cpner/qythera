@@ -271,7 +271,7 @@ def cmd_quantize(args):
 # ---------------------------------------------------------------------------
 
 def cmd_serve(args):
-    from qythera.server import main as server_main
+    from qythera.inference.server import main as server_main
     sys.argv = ["server.py", "--port", str(args.port)]
     if args.model_path:
         sys.argv.extend(["--model-path", args.model_path])

@@ -505,7 +505,7 @@ class Adan(Optimizer):
                 state['prev_grad'] = g.copy()
                 g_diff = g - prev_grad
                 state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * (g + b2 * g_diff)
-                state['exp_avg_sq'] = b2 * state['exp_avg_sq'] + (1 - b2) * (g + b2 * g_diff) ** 2
+                state['exp_avg_sq'] = b3 * state['exp_avg_sq'] + (1 - b3) * (g + b2 * g_diff) ** 2
                 update = state['exp_avg'] / (np.sqrt(state['exp_avg_sq']) + eps)
                 p.data -= lr * (update + wd * p.data)
 

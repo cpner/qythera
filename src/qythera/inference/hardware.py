@@ -1,6 +1,9 @@
+import ctypes
 import os
 import platform
 import re
+import subprocess
+import sys
 from typing import Dict, List, Optional
 
 
@@ -22,54 +25,96 @@ def detect_cpu_count() -> int:
 
 
 def detect_ram() -> Dict[str, float]:
-    """Parse /proc/meminfo or return fallback estimate."""
+    """Detect RAM across Linux, macOS, and Windows."""
+    sysname = platform.system()
     try:
-        with open("/proc/meminfo", "r") as f:
-            info = {}
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 2:
-                    key = parts[0].rstrip(":")
-                    val_kb = int(parts[1])
-                    info[key] = val_kb
-            total = info.get("MemTotal", 0)
-            available = info.get("MemAvailable", info.get("MemFree", 0))
+        if sysname == "Linux":
+            with open("/proc/meminfo", "r") as f:
+                info = {}
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        key = parts[0].rstrip(":")
+                        val_kb = int(parts[1])
+                        info[key] = val_kb
+                total = info.get("MemTotal", 0)
+                available = info.get("MemAvailable", info.get("MemFree", 0))
+                return {
+                    "total_gb": round(total / 1048576, 2),
+                    "available_gb": round(available / 1048576, 2),
+                    "used_gb": round((total - available) / 1048576, 2),
+                    "total_kb": total,
+                }
+        elif sysname == "Darwin":
+            out = subprocess.check_output(["sysctl", "-n", "hw.memsize"]).decode().strip()
+            total_bytes = int(out)
+            total_kb = total_bytes // 1024
+            total_gb = total_bytes / (1024 ** 3)
             return {
-                "total_gb": round(total / 1048576, 2),
-                "available_gb": round(available / 1048576, 2),
-                "used_gb": round((total - available) / 1048576, 2),
-                "total_kb": total,
+                "total_gb": round(total_gb, 2),
+                "available_gb": round(total_gb * 0.8, 2),
+                "used_gb": round(total_gb * 0.2, 2),
+                "total_kb": total_kb,
             }
-    except FileNotFoundError:
-        page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
-        pages = os.sysconf("SC_PHYS_PAGES") if hasattr(os, "sysconf") else 16384
-        total_bytes = page_size * pages
-        total_gb = total_bytes / (1024 ** 3)
-        return {
-            "total_gb": round(total_gb, 2),
-            "available_gb": round(total_gb * 0.8, 2),
-            "used_gb": round(total_gb * 0.2, 2),
-            "total_kb": int(total_bytes / 1024),
-        }
+        elif sysname == "Windows":
+            kernel32 = ctypes.windll.kernel32
+            c_ulonglong = ctypes.c_ulonglong
+            total_kb = c_ulonglong()
+            kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(total_kb))
+            total_kb = total_kb.value
+            total_gb = total_kb / (1024 ** 2)
+            return {
+                "total_gb": round(total_gb, 2),
+                "available_gb": round(total_gb * 0.8, 2),
+                "used_gb": round(total_gb * 0.2, 2),
+                "total_kb": total_kb,
+            }
+    except Exception:
+        pass
+    page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+    pages = os.sysconf("SC_PHYS_PAGES") if hasattr(os, "sysconf") else 16384
+    total_bytes = page_size * pages
+    total_gb = total_bytes / (1024 ** 3)
+    return {
+        "total_gb": round(total_gb, 2),
+        "available_gb": round(total_gb * 0.8, 2),
+        "used_gb": round(total_gb * 0.2, 2),
+        "total_kb": int(total_bytes / 1024),
+    }
 
 
 def detect_simd() -> List[str]:
-    """Detect SIMD capabilities from /proc/cpuinfo."""
+    """Detect SIMD capabilities across Linux, macOS, and Windows."""
     features = []
+    sysname = platform.system()
     try:
-        with open("/proc/cpuinfo", "r") as f:
-            for line in f:
-                if line.startswith("flags") or line.startswith("Features"):
-                    parts = line.split(":")
-                    if len(parts) >= 2:
-                        flags = parts[1].split()
-                        simd_flags = {"avx", "avx2", "avx512", "sse", "sse2", "sse4", "sse4_1",
-                                      "sse4_2", "neon", "asimd"}
-                        for flag in flags:
-                            if flag.lower() in simd_flags or flag.lower().startswith("avx"):
-                                features.append(flag.upper())
-                        break
-    except FileNotFoundError:
+        if sysname == "Linux":
+            with open("/proc/cpuinfo", "r") as f:
+                for line in f:
+                    if line.startswith("flags") or line.startswith("Features"):
+                        parts = line.split(":")
+                        if len(parts) >= 2:
+                            flags = parts[1].split()
+                            simd_flags = {"avx", "avx2", "avx512", "sse", "sse2", "sse4", "sse4_1",
+                                          "sse4_2", "neon", "asimd"}
+                            for flag in flags:
+                                if flag.lower() in simd_flags or flag.lower().startswith("avx"):
+                                    features.append(flag.upper())
+                            break
+        elif sysname == "Darwin":
+            out = subprocess.check_output(["sysctl", "-n", "machdep.cpu.features"]).decode().strip()
+            simd_flags = {"AVX", "AVX2", "AVX512", "SSE", "SSE2", "SSE3", "SSE4.1", "SSE4.2", "NEON"}
+            for flag in out.split():
+                clean = flag.replace(".", "_")
+                if clean.upper() in simd_flags or clean.upper().startswith("AVX"):
+                    features.append(flag.upper())
+        elif sysname == "Windows":
+            out = subprocess.check_output(["wmic", "cpu", "get", "Features"], stderr=subprocess.DEVNULL).decode().strip()
+            simd_flags = {"AVX", "AVX2", "AVX512", "SSE", "SSE2", "SSE3", "SSE41", "SSE42"}
+            for flag in out.split():
+                if flag.upper() in simd_flags:
+                    features.append(flag.upper())
+    except Exception:
         pass
     if not features:
         arch = detect_arch()

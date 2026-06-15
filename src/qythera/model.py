@@ -2448,7 +2448,7 @@ class Transformer(Module):
                                       mla_cache=cache if self.config.use_mla else None, position=pos)
 
         cache.reset()
-        return ids
+        return ids[len(prompt_ids.data.flatten()):]
 
     def init_kv_cache(self):
         if self.config.use_mla:

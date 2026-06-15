@@ -6,6 +6,7 @@ import mmap
 import os
 import re
 import struct
+import sys
 from collections import Counter, defaultdict
 import functools
 from typing import Iterator, List, Optional, Tuple
@@ -29,7 +30,11 @@ class MMapDataset:
         self.item_size = self.dtype.itemsize
         self.num_sequences = max(0, (self.total_tokens - 1) // seq_len)
         self._file = open(bin_path, "rb")
-        self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        file_size = os.path.getsize(bin_path)
+        if sys.platform == 'win32':
+            self._mm = mmap.mmap(self._file.fileno(), file_size, access=mmap.ACCESS_READ)
+        else:
+            self._mm = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
 
     def __len__(self):
         return self.num_sequences

@@ -9,6 +9,8 @@ import threading
 import queue
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import numpy as np
+
 try:
     from qythera.model import Transformer, TransformerConfig
     from qythera.tokenizer import BPETokenizer
@@ -398,7 +400,8 @@ class RawSocketHTTPServer:
         print(f"\n  Qythera: http://localhost:{port}")
 
         signal.signal(signal.SIGINT, lambda s, f: self.stop())
-        signal.signal(signal.SIGTERM, lambda s, f: self.stop())
+        if sys.platform != 'win32':
+            signal.signal(signal.SIGTERM, lambda s, f: self.stop())
 
         while self._running:
             try:

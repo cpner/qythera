@@ -219,7 +219,9 @@ class DivBackward:
     @staticmethod
     def backward(ctx, grad):
         a, b = ctx.inputs
-        return _unbroadcast(grad / b.data, a.shape), _unbroadcast(-grad * a.data / (b.data ** 2), b.shape)
+        eps = 1e-8
+        b_plus_eps = b.data + eps
+        return _unbroadcast(grad / b_plus_eps, a.shape), _unbroadcast(-grad * a.data / (b_plus_eps ** 2), b.shape)
 
 class PowBackward:
     @staticmethod

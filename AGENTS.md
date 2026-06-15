@@ -16,7 +16,7 @@ logits = m(Tensor(np.random.randint(0, 100, (1, 16))))
 print(logits.shape)
 "
 pip install .
-PYTHONPATH=src python3 -m qythera.inference.cli serve --port 8080
+python3 -m qythera.inference.cli serve --port 8080
 ```
 
 ## Structure

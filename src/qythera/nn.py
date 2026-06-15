@@ -151,15 +151,18 @@ class Module:
 
     def load_state_dict(self, state_dict, strict=True):
         missing, unexpected = [], []
-        my_state = self.state_dict()
+        param_dict = {}
+        for name, p in self.named_parameters():
+            param_dict[name] = p
         for k, v in state_dict.items():
-            if k in my_state:
-                if isinstance(my_state[k], Tensor):
-                    my_state[k].data = v.data if isinstance(v, Tensor) else v
+            if k in param_dict:
+                p = param_dict[k]
+                v_data = v.data if isinstance(v, Tensor) else v
+                p.data = v_data.copy()
             elif strict:
                 unexpected.append(k)
         if strict:
-            for k in my_state:
+            for k in param_dict:
                 if k not in state_dict:
                     missing.append(k)
         return missing, unexpected

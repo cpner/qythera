@@ -47,7 +47,7 @@ html,body{height:100%;background:#09090b;color:#fafafa;font-family:system-ui,san
 <button onclick="S()" style="padding:8px 14px;border-radius:14px;background:linear-gradient(135deg,#7c3aed,#3b82f6);border:none;color:white;cursor:pointer;flex-shrink:0;font-size:14px">➤</button>
 </div></div></div>
 <script>
-var API='api.php',n=0;
+var API='/v1/chat/completions',n=0;
 function S(t){var i=document.getElementById('i');var m=t||i.value.trim();if(!m)return;if(t)i.value='';var w=document.getElementById('w');if(w)w.remove();var d=document.getElementById('m');
 var u=document.createElement('div');u.className='mu';u.innerHTML='<div style="font-size:12px;white-space:pre-wrap;word-break:break-word">'+H(m)+'</div>';d.appendChild(u);
 var ty=document.createElement('div');ty.className='ma';ty.innerHTML='<span class="d"></span><span class="d"></span><span class="d"></span>';d.appendChild(ty);d.scrollTop=d.scrollHeight;
