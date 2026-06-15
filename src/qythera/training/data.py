@@ -7,6 +7,7 @@ import os
 import re
 import struct
 from collections import Counter, defaultdict
+import functools
 from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -448,3 +449,116 @@ class HTMLCleaner:
         text = re.sub(r'<[^>]+>', ' ', text)
         text = html.unescape(text)
         return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# ExactDeduplicator – suffix array, find and remove duplicate substrings
+# ---------------------------------------------------------------------------
+
+class ExactDeduplicator:
+    def __init__(self, min_length: int = 50):
+        self.min_length = min_length
+
+    def deduplicate(self, documents: List[str]) -> List[str]:
+        if not documents:
+            return []
+        if len(documents) == 1:
+            return list(documents)
+
+        sep = "\x00"
+        concat = sep.join(documents)
+        n = len(concat)
+
+        sa = list(range(n))
+        rank = [ord(concat[i]) for i in range(n)]
+        k = 1
+        tmp = [0] * n
+        while True:
+            def cmp_key(a):
+                return (rank[a], rank[a + k] if a + k < n else -1)
+            sa.sort(key=cmp_key)
+            tmp[sa[0]] = 0
+            for i in range(1, n):
+                tmp[sa[i]] = tmp[sa[i - 1]]
+                if cmp_key(sa[i]) != cmp_key(sa[i - 1]):
+                    tmp[sa[i]] += 1
+            rank, tmp = tmp, rank
+            if rank[sa[-1]] == n - 1:
+                break
+            k <<= 1
+
+        inv_sa = [0] * n
+        for i, s in enumerate(sa):
+            inv_sa[s] = i
+
+        lcp = [0] * n
+        h = 0
+        for i in range(n):
+            if inv_sa[i] > 0:
+                j = sa[inv_sa[i] - 1]
+                while i + h < n and j + h < n and concat[i + h] == concat[j + h]:
+                    h += 1
+                lcp[inv_sa[i]] = h
+                if h > 0:
+                    h -= 1
+
+        doc_id = []
+        cur = 0
+        for ch in concat:
+            if ch == sep:
+                cur += 1
+            doc_id.append(cur)
+
+        uf = UnionFind(len(documents))
+        for i in range(1, n):
+            if lcp[i] >= self.min_length:
+                d1 = doc_id[sa[i - 1]]
+                d2 = doc_id[sa[i]]
+                if d1 != d2:
+                    uf.union(d1, d2)
+
+        groups = defaultdict(list)
+        for i in range(len(documents)):
+            groups[uf.find(i)].append(i)
+        return [documents[indices[0]] for indices in groups.values()]
+
+
+# ---------------------------------------------------------------------------
+# CurriculumScheduler – sort by difficulty, start with easiest
+# ---------------------------------------------------------------------------
+
+class CurriculumScheduler:
+    def __init__(self, strategy: str = "easy_first"):
+        self.strategy = strategy
+
+    def sort(self, dataset: list) -> list:
+        scored = [(self._score(x), i, x) for i, x in enumerate(dataset)]
+        if self.strategy == "easy_first":
+            scored.sort(key=lambda t: (t[0], t[1]))
+        elif self.strategy == "hard_first":
+            scored.sort(key=lambda t: (-t[0], t[1]))
+        else:
+            raise ValueError(f"unknown strategy: {self.strategy}")
+        return [t[2] for t in scored]
+
+    def _score(self, x):
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, dict):
+            return float(x.get("perplexity", 0))
+        if hasattr(x, "perplexity"):
+            return float(x.perplexity)
+        return float(x)
+
+
+# ---------------------------------------------------------------------------
+# ImportanceSampler – weight examples by inverse frequency
+# ---------------------------------------------------------------------------
+
+class ImportanceSampler:
+    def __init__(self, frequencies):
+        self.weights = np.array(1.0 / np.asarray(frequencies, dtype=np.float64))
+        self.weights /= self.weights.sum()
+
+    def sample(self, batch_size: int) -> np.ndarray:
+        return np.random.choice(len(self.weights), batch_size, p=self.weights)

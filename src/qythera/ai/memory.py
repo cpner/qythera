@@ -6,6 +6,8 @@ import re
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+from qythera.nn import Module, Linear
+from qythera.tensor import Tensor
 
 
 # ---------------------------------------------------------------------------
@@ -368,3 +370,109 @@ class AssociativeRecall:
     def clear(self):
         self.patterns.clear()
         self._matrix = None
+
+
+# ---------------------------------------------------------------------------
+# DNC - Differentiable Neural Computer
+# ---------------------------------------------------------------------------
+
+class DNC(Module):
+    """Differentiable Neural Computer with external memory matrix."""
+
+    def __init__(self, input_size: int, hidden_size: int, memory_size: int):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.memory_size = memory_size
+        self.memory: Optional[Tensor] = None
+        self.controller = Linear(input_size + memory_size, hidden_size)
+        self.read_head = Linear(hidden_size, memory_size)
+        self.write_head = Linear(hidden_size, memory_size)
+        self.erase_head = Linear(hidden_size, memory_size)
+        self.add_head = Linear(hidden_size, memory_size)
+
+    def _init_memory(self, batch_size: int):
+        self.memory = Tensor(np.zeros((batch_size, self.memory_size, self.memory_size), dtype=np.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        import numpy as np
+        batch, seq_len, _ = x.shape
+        self._init_memory(batch)
+        output = []
+        prev_read = np.zeros((batch, self.memory_size), dtype=np.float32)
+
+        for t in range(seq_len):
+            xt = x.data[:, t, :]
+            controller_input = np.concatenate([xt, prev_read], axis=-1)
+            h = self.controller(Tensor(controller_input.astype(np.float32)))
+
+            r_weights = self.read_head(h).softmax(axis=-1)
+            read_vec = r_weights.matmul(self.memory)
+            prev_read = read_vec.data.reshape(batch, self.memory_size)
+
+            erase = self.erase_head(h).softmax(axis=-1)
+            add = self.add_head(h).softmax(axis=-1)
+            write_weights = self.write_head(h).softmax(axis=-1)
+
+            erase_term = Tensor((1.0 - erase.data * write_weights.data).astype(np.float32))
+            self.memory = Tensor((self.memory.data * erase_term.data).astype(np.float32))
+            outer = write_weights.data.reshape(batch, self.memory_size, 1) * add.data.reshape(batch, 1, self.memory_size)
+            self.memory = Tensor((self.memory.data + outer).astype(np.float32))
+
+            step_out = np.concatenate([h.data, prev_read], axis=-1)
+            output.append(Tensor(step_out.astype(np.float32)))
+
+        return Tensor(np.stack([o.data for o in output], axis=1))
+
+
+# ---------------------------------------------------------------------------
+# MemoryAugmentedTransformer
+# ---------------------------------------------------------------------------
+
+class MemoryAugmentedTransformer(Module):
+    """Transformer with external memory matrix for augmented recall."""
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__()
+        cfg = config or {}
+        self.d_model = cfg.get("d_model", 256)
+        self.memory_size = cfg.get("memory_size", 128)
+        self.memory: Optional[Tensor] = None
+        self.key_proj = Linear(self.d_model, self.d_model)
+        self.query_proj = Linear(self.d_model, self.d_model)
+        self.value_proj = Linear(self.d_model, self.d_model)
+        self.output_proj = Linear(self.d_model * 2, self.d_model)
+        self.write_key_head = Linear(self.d_model, self.memory_size)
+        self.write_val_head = Linear(self.d_model, self.d_model)
+
+    def _init_memory(self, batch_size: int):
+        self.memory = Tensor(np.zeros((batch_size, self.memory_size, self.d_model), dtype=np.float32))
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        import numpy as np
+        if self.memory is None:
+            self._init_memory(x.shape[0])
+
+        q = self.query_proj(x)
+        k = self.key_proj(x)
+        v = self.value_proj(x)
+
+        scale = math.sqrt(self.d_model)
+
+        mem_k = self.key_proj(self.memory)
+        scores = q.matmul(mem_k.transpose(-2, -1)) / scale
+
+        if mask is not None:
+            scores = Tensor((scores.data + mask.data * -1e9).astype(np.float32))
+
+        attn = scores.softmax(axis=-1)
+        r = attn.matmul(self.memory)
+
+        write_w = self.write_key_head(x).softmax(axis=-1)
+        write_v = self.write_val_head(x)
+        outer = np.einsum('bsm,bsd->bmd', write_w.data, write_v.data)
+        self.memory = Tensor((self.memory.data + outer).astype(np.float32))
+
+        combined = Tensor(np.concatenate([x.data, r.data], axis=-1).astype(np.float32))
+        out = self.output_proj(combined)
+        return out

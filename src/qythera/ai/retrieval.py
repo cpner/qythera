@@ -1,4 +1,4 @@
-"""Retrieval modules: BM25, Dense, Hybrid, ColBERT, InvertedIndex."""
+"""Retrieval modules: BM25, Dense, Hybrid, ColBERT, InvertedIndex, HyDE, RAPTOR, RRF."""
 
 import math
 from collections import defaultdict, Counter
@@ -222,3 +222,71 @@ class InvertedIndex:
         results = [(did, score) for did, score in doc_scores.items()]
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
+
+
+class HyDERetriever:
+    def __init__(self, retriever, lm):
+        self.retriever = retriever
+        self.lm = lm
+
+    def retrieve(self, query: str, top_k: int = 5):
+        hypothetical = self.lm.generate(f"Write a document that answers: {query}")
+        return self.retriever.retrieve(hypothetical, top_k)
+
+
+class RAPTORRetriever:
+    def __init__(self, chunk_size: int = 512):
+        self.chunk_size = chunk_size
+        self.tree: Dict[int, List[str]] = {}
+
+    def _chunk(self, text: str) -> List[str]:
+        return [text[i:i + self.chunk_size] for i in range(0, len(text), self.chunk_size)]
+
+    def _cluster(self, chunks: List[str]) -> List[List[str]]:
+        if len(chunks) <= 2:
+            return [chunks]
+        n = len(chunks)
+        mid = n // 2
+        return [chunks[:mid], chunks[mid:]]
+
+    def _summarize(self, cluster: List[str]) -> str:
+        return " ".join(chunk[:100] for chunk in cluster)
+
+    def build_tree(self, documents: List[str]) -> Dict[int, List[str]]:
+        level = 0
+        current = []
+        for doc in documents:
+            current.extend(self._chunk(doc))
+        while len(current) > 1:
+            clusters = self._cluster(current)
+            summaries = [self._summarize(c) for c in clusters]
+            self.tree[level] = current
+            current = summaries
+            level += 1
+        self.tree[level] = current
+        return self.tree
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Tuple[int, str]]:
+        results = []
+        for level_chunks in self.tree.values():
+            for i, chunk in enumerate(level_chunks):
+                score = 1.0 if query.lower() in chunk.lower() else 0.0
+                if score > 0:
+                    results.append((score, chunk))
+        results.sort(key=lambda x: x[0], reverse=True)
+        return results[:top_k]
+
+
+class ReciprocalRankFusion:
+    def __init__(self, retrievers, k: int = 60):
+        self.retrievers = retrievers
+        self.k = k
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Tuple[int, float]]:
+        scores: Dict[int, float] = defaultdict(float)
+        for retriever in self.retrievers:
+            results = retriever.search(query, top_k=top_k * 2)
+            for rank, (doc_id, _) in enumerate(results):
+                scores[doc_id] += 1.0 / (self.k + rank + 1)
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return ranked[:top_k]

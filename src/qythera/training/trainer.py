@@ -135,6 +135,24 @@ class StochasticDepth:
         return (x * mask) + residual
 
 
+class GradNormHistory:
+    def __init__(self, window: int = 100):
+        self.history: List[float] = []
+        self.window = window
+
+    def update(self, norm: float):
+        self.history.append(norm)
+        if len(self.history) > self.window:
+            self.history.pop(0)
+
+    def is_anomaly(self, norm: float) -> bool:
+        if len(self.history) < self.window:
+            return False
+        mean = np.mean(self.history)
+        std = np.std(self.history)
+        return abs(norm - mean) > 3 * std
+
+
 class Trainer:
     def __init__(self, model: Module, optimizer: 'optim.Optimizer',
                  scheduler: Optional[Any] = None,
@@ -457,6 +475,13 @@ class Trainer:
         for p in self.model.parameters():
             if p.grad is not None and not isinstance(p.grad, Tensor):
                 p.grad = Tensor(p.grad.copy())
+
+        if not hasattr(self, 'grad_norms'):
+            self.grad_norms: Dict[str, float] = {}
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                grad_norm = np.linalg.norm(param.grad.data)
+                self.grad_norms[name] = grad_norm
 
         step_log = {"loss": total_loss, "lr": self.optimizer.param_groups[0]["lr"]}
 

@@ -1,4 +1,5 @@
 """Complete transformer model built on qythera's own tensor engine and nn modules."""
+import hashlib
 import math
 import os
 import numpy as np
@@ -576,6 +577,102 @@ class MLACache:
 
     def get_seq_len(self, layer: int = 0):
         return self.cur_len[layer]
+
+
+class ScissorHandsCache(Module):
+    def __init__(self, max_size: int, pivot_ratio: float = 0.1):
+        super().__init__()
+        self.max_size = max_size
+        self.pivot_size = int(max_size * pivot_ratio)
+        self.k_cache = None
+        self.v_cache = None
+        self.attention_accum = None
+        self.cur_len = 0
+
+    def update(self, new_k: np.ndarray, new_v: np.ndarray,
+               attn_scores: Optional[np.ndarray] = None):
+        n = new_k.shape[2]
+        total = self.cur_len + n
+
+        if self.k_cache is None or total > self.max_size:
+            if self.k_cache is None:
+                self.k_cache = new_k.copy()
+                self.v_cache = new_v.copy()
+                self.attention_accum = np.zeros(n, dtype=np.float32)
+                if attn_scores is not None:
+                    self.attention_accum += attn_scores.flatten()[:n]
+                self.cur_len = n
+            else:
+                self._evict_and_compact()
+                self.k_cache = np.concatenate([self.k_cache, new_k], axis=2)
+                self.v_cache = np.concatenate([self.v_cache, new_v], axis=2)
+                new_accum = np.zeros(n, dtype=np.float32)
+                if attn_scores is not None:
+                    new_accum += attn_scores.flatten()[:n]
+                self.attention_accum = np.concatenate([self.attention_accum, new_accum])
+                self.cur_len = self.k_cache.shape[2]
+        else:
+            self.k_cache = np.concatenate([self.k_cache, new_k], axis=2)
+            self.v_cache = np.concatenate([self.v_cache, new_v], axis=2)
+            new_accum = np.zeros(n, dtype=np.float32)
+            if attn_scores is not None:
+                new_accum += attn_scores.flatten()[:n]
+            self.attention_accum = np.concatenate([self.attention_accum, new_accum])
+            self.cur_len = self.k_cache.shape[2]
+
+        if attn_scores is not None:
+            self.attention_accum[:self.cur_len - n] *= 0.99
+            self.attention_accum[self.cur_len - n:self.cur_len] += attn_scores.flatten()[:n]
+
+        return self.k_cache.copy(), self.v_cache.copy()
+
+    def _evict_and_compact(self):
+        k = self.k_cache
+        v = self.v_cache
+        c = self.cur_len
+
+        pivot_k = k[:, :, :self.pivot_size].copy()
+        pivot_v = v[:, :, :self.pivot_size].copy()
+        pivot_attn = self.attention_accum[:self.pivot_size].copy()
+
+        recent_k = k[:, :, c - self.pivot_size:].copy()
+        recent_v = v[:, :, c - self.pivot_size:].copy()
+        recent_attn = self.attention_accum[c - self.pivot_size:].copy()
+
+        self.k_cache = np.concatenate([pivot_k, recent_k], axis=2)
+        self.v_cache = np.concatenate([pivot_v, recent_v], axis=2)
+        self.attention_accum = np.concatenate([pivot_attn, recent_attn])
+        self.cur_len = 2 * self.pivot_size
+
+    def get(self):
+        if self.k_cache is None:
+            return np.zeros((1, 0, 0), dtype=np.float32), np.zeros((1, 0, 0), dtype=np.float32)
+        return self.k_cache.copy(), self.v_cache.copy()
+
+    def reset(self):
+        self.k_cache = None
+        self.v_cache = None
+        self.attention_accum = None
+        self.cur_len = 0
+
+    def get_seq_len(self):
+        return self.cur_len
+
+
+class PrefixCache:
+    def __init__(self):
+        self.cache = {}
+
+    def get(self, token_ids: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        h = hashlib.sha256(token_ids.tobytes()).hexdigest()
+        return self.cache.get(h)
+
+    def set(self, token_ids: np.ndarray, k_cache: np.ndarray, v_cache: np.ndarray):
+        h = hashlib.sha256(token_ids.tobytes()).hexdigest()
+        self.cache[h] = (k_cache, v_cache)
+
+    def clear(self):
+        self.cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -3005,4 +3102,228 @@ class PrefixAttention(Module):
         out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
         out = out.reshape(B, L, self.num_heads * self.head_dim)
         return self.o_proj(out)
+
+
+# ---------------------------------------------------------------------------
+# FunnelTransformer (reduce sequence length via pooling)
+# ---------------------------------------------------------------------------
+
+class FunnelTransformer(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        c = config
+
+        self.embed = Embedding(c.vocab_size, c.embed_dim)
+        self.pool_every = max(1, c.num_layers // 4)
+
+        self.layers = ModuleList([
+            TransformerBlock(c, i) for i in range(c.num_layers)
+        ])
+
+        self.pool_projections = ModuleList()
+        for i in range(c.num_layers):
+            if (i + 1) % self.pool_every == 0 and (i + 1) < c.num_layers:
+                self.pool_projections.append(Linear(c.embed_dim, c.embed_dim, bias=False))
+            else:
+                self.pool_projections.append(None)
+
+        if c.norm_type == "rms":
+            self.norm = NNRMSNorm(c.embed_dim, eps=c.rms_eps)
+        else:
+            self.norm = LayerNorm(c.embed_dim)
+        self.head = Linear(c.embed_dim, c.vocab_size, bias=False)
+
+    def _pool(self, x: Tensor) -> Tensor:
+        B, L, D = x.shape
+        if L <= 1:
+            return x
+        pad_len = L % 2
+        if pad_len > 0:
+            x = Tensor(np.pad(x.data, ((0, 0), (0, pad_len), (0, 0))), requires_grad=x.requires_grad)
+        B, L2, D = x.shape
+        x = x.reshape(B, L2 // 2, 2, D)
+        x = Tensor(x.data.mean(axis=2), requires_grad=x.requires_grad)
+        return x
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        if isinstance(x, np.ndarray):
+            x = Tensor(x)
+        if x.ndim == 2:
+            x = self.embed(x)
+        h = x
+
+        for i, layer in enumerate(self.layers):
+            h, _ = layer(h)
+            proj = self.pool_projections[i]
+            if proj is not None:
+                pooled = self._pool(h)
+                h = proj(pooled)
+
+        h = self.norm(h)
+        return self.head(h)
+
+
+# ---------------------------------------------------------------------------
+# HierarchicalAttention (local window + global across windows)
+# ---------------------------------------------------------------------------
+
+class HierarchicalAttention(Module):
+    def __init__(self, config: TransformerConfig, window_size: int = 256):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.window_size = window_size
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+
+        self.local_wq = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.local_wk = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.local_wv = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+
+        self.global_wq = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.global_wk = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.global_wv = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+
+        self.wo = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+        self.merge = Linear(self.embed_dim * 2, self.embed_dim, bias=config.bias)
+        self.ffn = FeedForward(config)
+
+        if config.norm_type == "rms":
+            self.norm1 = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+            self.norm2 = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        else:
+            self.norm1 = LayerNorm(config.embed_dim)
+            self.norm2 = LayerNorm(config.embed_dim)
+
+    def _local_attention(self, x: Tensor) -> Tensor:
+        B, L, D = x.shape
+        H, d = self.num_heads, self.head_dim
+        q = self.local_wq(x).reshape(B, L, H, d).permute(0, 2, 1, 3)
+        k = self.local_wk(x).reshape(B, L, H, d).permute(0, 2, 1, 3)
+        v = self.local_wv(x).reshape(B, L, H, d).permute(0, 2, 1, 3)
+
+        out = np.zeros((B, H, L, d), dtype=np.float32)
+        for start in range(0, L, self.window_size):
+            end = min(start + self.window_size, L)
+            q_w = q[:, :, start:end]
+            k_w = k[:, :, start:end]
+            v_w = v[:, :, start:end]
+            w = end - start
+            scale = d ** -0.5
+            scores = np.einsum('bhid,bhjd->bhij', q_w.data * scale, k_w.data)
+            causal = np.triu(np.ones((w, w), dtype=np.bool_), k=1)
+            scores = np.where(~causal[None, None, :, :], scores, -1e9)
+            attn = np.exp(scores - scores.max(axis=-1, keepdims=True))
+            attn = attn / (attn.sum(axis=-1, keepdims=True) + 1e-6)
+            out[:, :, start:end] = np.einsum('bhij,bhjd->bhid', attn, v_w.data)
+
+        out = Tensor(out.transpose(0, 2, 1, 3).reshape(B, L, H * d), requires_grad=x.requires_grad)
+        return self.wo(out)
+
+    def _global_attention(self, x: Tensor) -> Tensor:
+        B, L, D = x.shape
+        H, d = self.num_heads, self.head_dim
+        num_windows = max(1, (L + self.window_size - 1) // self.window_size)
+
+        agg = np.zeros((B, num_windows, D), dtype=np.float32)
+        for i in range(num_windows):
+            s = i * self.window_size
+            e = min(s + self.window_size, L)
+            agg[:, i] = x.data[:, s:e].mean(axis=1)
+
+        agg_t = Tensor(agg, requires_grad=x.requires_grad)
+        q = self.global_wq(agg_t).reshape(B, num_windows, H, d).permute(0, 2, 1, 3)
+        k = self.global_wk(agg_t).reshape(B, num_windows, H, d).permute(0, 2, 1, 3)
+        v = self.global_wv(agg_t).reshape(B, num_windows, H, d).permute(0, 2, 1, 3)
+
+        scale = d ** -0.5
+        scores = np.einsum('bhid,bhjd->bhij', q.data * scale, k.data)
+        attn = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        attn = attn / (attn.sum(axis=-1, keepdims=True) + 1e-6)
+        global_out = np.einsum('bhij,bhjd->bhid', attn, v.data)
+
+        expanded = np.zeros((B, num_windows, H, d), dtype=np.float32)
+        for i in range(num_windows):
+            expanded[:, i] = global_out[:, i]
+        expanded = np.repeat(expanded, self.window_size, axis=1)[:, :L]
+
+        out = Tensor(expanded.transpose(0, 2, 1, 3).reshape(B, L, H * d), requires_grad=x.requires_grad)
+        return self.wo(out)
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        if isinstance(x, np.ndarray):
+            x = Tensor(x)
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        normed = self.norm1(x)
+        local_out = self._local_attention(normed)
+        global_out = self._global_attention(normed)
+        combined = Tensor(np.concatenate([local_out.data, global_out.data], axis=-1), requires_grad=x.requires_grad)
+        h = x + self.merge(combined)
+        h = h + self.ffn(self.norm2(h))
+        return h
+
+
+# ---------------------------------------------------------------------------
+# ELECTRA (generator + discriminator)
+# ---------------------------------------------------------------------------
+
+class ELECTRA(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.generator = Transformer(config)
+        self.discriminator = Transformer(config)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if isinstance(x, np.ndarray):
+            x = Tensor(x)
+        disc_logits = self.discriminator(x)
+        return disc_logits
+
+
+# ---------------------------------------------------------------------------
+# BERTEncoder (bidirectional attention + [CLS] token)
+# ---------------------------------------------------------------------------
+
+class BERTEncoder(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        c = config
+
+        self.embed = Embedding(c.vocab_size, c.embed_dim)
+        self.cls_token = Embedding(1, c.embed_dim)
+        self.mask_token = Embedding(1, c.embed_dim)
+
+        self.layers = ModuleList([
+            TransformerBlock(c, i) for i in range(c.num_layers)
+        ])
+
+        if c.norm_type == "rms":
+            self.norm = NNRMSNorm(c.embed_dim, eps=c.rms_eps)
+        else:
+            self.norm = LayerNorm(c.embed_dim)
+
+        self.head = Linear(c.embed_dim, c.vocab_size, bias=False)
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        if isinstance(x, np.ndarray):
+            x = Tensor(x)
+        B, L = x.shape
+
+        cls = self.cls_token(Tensor(np.zeros((B, 1), dtype=np.int32)))
+        h = self.embed(x)
+        h = Tensor(np.concatenate([cls.data, h.data], axis=1), requires_grad=h.requires_grad)
+
+        for layer in self.layers:
+            h, _ = layer(h)
+
+        h = self.norm(h)
+        cls_out = Tensor(h.data[:, 0:1], requires_grad=h.requires_grad)
+        return self.head(cls_out).reshape(B, self.config.vocab_size)
 

@@ -430,6 +430,188 @@ class MedusaHeads:
         pass
 
 
+class MCTSNode:
+    def __init__(self, token_id: int, parent: Optional['MCTSNode'] = None):
+        self.token_id = token_id
+        self.parent = parent
+        self.children: List['MCTSNode'] = []
+        self.visits = 0
+        self.value = 0.0
+        self.prob = 0.0
+        self.is_expanded = False
+
+    def ucb1(self, exploration: float = 1.414) -> float:
+        if self.visits == 0:
+            return float('inf')
+        return self.value / self.visits + exploration * np.sqrt(np.log(self.parent.visits) / self.visits)
+
+
+class MCTSGenerator:
+    def __init__(self, model, reward_model, num_simulations: int = 10,
+                 exploration: float = 1.414, top_k: int = 5):
+        self.model = model
+        self.reward_model = reward_model
+        self.num_simulations = num_simulations
+        self.exploration = exploration
+        self.top_k = top_k
+
+    def generate(self, prompt_ids: List[int], max_tokens: int = 50) -> List[int]:
+        root = MCTSNode(token_id=-1)
+        generated: List[int] = list(prompt_ids)
+
+        for step in range(max_tokens):
+            for _ in range(self.num_simulations):
+                node = self._select(root)
+                child = self._expand(node, generated)
+                reward = self._simulate(generated + [child.token_id])
+                self._backprop(child, reward)
+
+            best_child = max(root.children, key=lambda c: c.visits)
+            generated.append(best_child.token_id)
+            root = best_child
+            root.parent = None
+
+        return generated
+
+    def _select(self, node: MCTSNode) -> MCTSNode:
+        while node.is_expanded and node.children:
+            node = max(node.children, key=lambda c: c.ucb1(self.exploration))
+        return node
+
+    def _expand(self, node: MCTSNode, context: List[int]) -> MCTSNode:
+        if node.is_expanded:
+            return node
+        node.is_expanded = True
+
+        from qythera.tensor import Tensor
+        inp = Tensor(np.array([context], dtype=np.int32))
+        logits = self.model.forward(inp)
+        probs = softmax(logits.data[0, -1])
+        top_indices = np.argsort(probs)[-self.top_k:]
+
+        for idx in top_indices:
+            child = MCTSNode(token_id=int(idx), parent=node)
+            child.prob = float(probs[idx])
+            node.children.append(child)
+
+        if not node.children:
+            child = MCTSNode(token_id=int(np.argmax(probs)), parent=node)
+            child.prob = float(np.max(probs))
+            node.children.append(child)
+
+        return node.children[0]
+
+    def _simulate(self, context: List[int]) -> float:
+        return self.reward_model.score(context)
+
+    def _backprop(self, node: MCTSNode, reward: float):
+        current = node
+        while current:
+            current.visits += 1
+            current.value += reward
+            current = current.parent
+
+
+class DiverseBeamSearch:
+    def __init__(self, model, beam_width: int = 5, diversity_penalty: float = 0.5,
+                 length_penalty: float = 0.6):
+        self.model = model
+        self.beam_width = beam_width
+        self.diversity_penalty = diversity_penalty
+        self.length_penalty = length_penalty
+
+    def generate(self, prompt_ids: List[int], max_tokens: int = 50) -> List[List[int]]:
+        beams: List[Tuple[List[int], float]] = [(list(prompt_ids), 0.0)]
+        completed: List[Tuple[List[int], float]] = []
+
+        for _ in range(max_tokens):
+            all_candidates: List[Tuple[List[int], float]] = []
+            seen_tokens_per_beam: List[set] = [set() for _ in beams]
+
+            for beam_idx, (seq, score) in enumerate(beams):
+                if len(seq) > 0 and seq[-1] == 0:
+                    completed.append((seq, score))
+                    continue
+
+                from qythera.tensor import Tensor
+                inp = Tensor(np.array([seq], dtype=np.int32))
+                logits = self.model.forward(inp)
+                probs = softmax(logits.data[0, -1])
+
+                for i in range(self.beam_width):
+                    token_idx = int(np.argmax(probs))
+                    token_prob = float(probs[token_idx])
+
+                    diversity_penalty = 0.0
+                    for other_idx, other_seen in enumerate(seen_tokens_per_beam):
+                        if other_idx != beam_idx and token_idx in other_seen:
+                            diversity_penalty += self.diversity_penalty
+
+                    new_score = score + np.log(token_prob + 1e-10) - diversity_penalty
+                    all_candidates.append((seq + [token_idx], new_score))
+                    probs = probs.copy()
+                    probs[token_idx] = -np.inf
+
+            if not all_candidates:
+                break
+
+            all_candidates.extend(completed)
+            all_candidates.sort(key=lambda x: x[1], reverse=True)
+
+            beams = []
+            seen_tokens_per_beam = []
+            for seq, score in all_candidates[:self.beam_width]:
+                if len(seq) > 0 and seq[-1] == 0:
+                    completed.append((seq, score))
+                else:
+                    beams.append((seq, score))
+                    seen_tokens_per_beam.append(set(seq[len(prompt_ids):]))
+
+            if not beams:
+                break
+
+        results = completed if completed else beams
+        normalized = []
+        for seq, score in results:
+            length = len(seq) - len(prompt_ids)
+            norm_score = score / max(length ** self.length_penalty, 1e-10)
+            normalized.append((seq, norm_score))
+        normalized.sort(key=lambda x: x[1], reverse=True)
+        return [seq for seq, _ in normalized[:self.beam_width]]
+
+
+class ContrastiveSearch:
+    def __init__(self, model, alpha: float = 0.6, top_k: int = 5):
+        self.model = model
+        self.alpha = alpha
+        self.top_k = top_k
+
+    def generate(self, prompt_ids: List[int], max_tokens: int = 50) -> List[int]:
+        generated = list(prompt_ids)
+
+        for _ in range(max_tokens):
+            from qythera.tensor import Tensor
+
+            inp = Tensor(np.array([generated], dtype=np.int32))
+            logits = self.model.forward(inp)
+            next_token_logits = logits.data[0, -1]
+
+            top_k_idx = np.argsort(next_token_logits)[-self.top_k:]
+
+            scores = np.zeros(self.top_k)
+            for i, idx in enumerate(top_k_idx):
+                token_logit = next_token_logits[idx]
+                other_logits = np.delete(next_token_logits, idx)
+                max_other_logit = np.max(other_logits)
+                degeneration_penalty = max(0, token_logit - max_other_logit)
+                scores[i] = (1 - self.alpha) * token_logit - self.alpha * degeneration_penalty
+
+            best_idx = top_k_idx[np.argmax(scores)]
+            generated.append(int(best_idx))
+
+        return generated
+
+
 class ContinuousBatcher:
     def __init__(self, max_batch_size: int = 32, max_seq_len: int = 2048,
                  pad_token_id: int = 0):
