@@ -137,47 +137,28 @@ class GradientXInput:
         return grad
 
 
+class AttentionRollout:
+    """Multiply attention matrices across layers for rollout visualization."""
+
+    def rollout(self, attention_matrices):
+        result = attention_matrices[0]
+        for attn in attention_matrices[1:]:
+            if result.ndim == 4:
+                result = np.einsum('bhij,bhjk->bhik', result, attn)
+            else:
+                result = np.einsum('bij,bjk->bik', result, attn)
+        return result
+
+
 class LogitLens:
     """Project intermediate residual stream to vocabulary logits."""
 
-    def __init__(self, projection: Optional[np.ndarray] = None):
-        self.projection = projection
+    def __init__(self, model, lm_head):
+        self.model = model
+        self.lm_head = lm_head
 
-    def explain(self, model: Any, input_array: np.ndarray, position: int = 0) -> dict:
-        """Project hidden state to vocabulary.
-
-        Args:
-            model: must expose get_residual(input, layer) -> np.ndarray
-            input_array: input tokens or embeddings
-            position: token position to analyze
-        """
-        results = []
-        n_layers = getattr(model, "n_layers", 10)
-        for layer_idx in range(n_layers):
-            hidden = model.get_residual(input_array, layer_idx)
-            if hidden.ndim > 1:
-                hidden = hidden[position]
-            if self.projection is not None:
-                logits = hidden @ self.projection.T
-            else:
-                logits = hidden
-            top_k_idx = np.argsort(-logits)[:5]
-            top_k_vals = logits[top_k_idx]
-            results.append({
-                "layer": layer_idx,
-                "top_tokens": top_k_idx.tolist(),
-                "top_logits": top_k_vals.tolist(),
-            })
-        return {"per_layer": results, "position": position}
-
-    def get_convergence_point(self, results: dict) -> int:
-        per_layer = results["per_layer"]
-        for i in range(1, len(per_layer)):
-            prev = set(per_layer[i - 1]["top_tokens"])
-            curr = set(per_layer[i]["top_tokens"])
-            if prev == curr:
-                return per_layer[i]["layer"]
-        return per_layer[-1]["layer"]
+    def project(self, hidden_states):
+        return self.lm_head(hidden_states)
 
 
 class CausalTracing:

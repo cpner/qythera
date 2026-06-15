@@ -2446,3 +2446,563 @@ class Transformer(Module):
             state[k] = Tensor(data[k])
         model.load_state_dict(state)
         return model
+
+
+
+# ---------------------------------------------------------------------------
+# XLNet Permutation Attention
+# ---------------------------------------------------------------------------
+
+class PermutationAttention(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** -0.5
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.q_proj = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.k_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.v_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.o_proj = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+
+        q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        if self.num_kv_groups > 1:
+            k = Tensor(np.repeat(k.data, self.num_kv_groups, axis=1), requires_grad=k.requires_grad)
+            v = Tensor(np.repeat(v.data, self.num_kv_groups, axis=1), requires_grad=v.requires_grad)
+
+        perms = []
+        for _ in range(B):
+            perm = np.random.permutation(L)
+            perms.append(perm)
+
+        q_np = q.data
+        k_np = k.data
+        v_np = v.data
+
+        b_idx = np.arange(B)[:, None, None, None]
+        h_idx = np.arange(self.num_heads)[None, :, None, None]
+        d_idx = np.arange(self.head_dim)[None, None, None, :]
+        perms_arr = np.array(perms)
+        p_idx = perms_arr[:, None, :, None]
+
+        perm_q = q_np[b_idx, h_idx, p_idx, d_idx]
+        k_groups = self.num_kv_groups
+        k_h = k_np.shape[1]
+        hk_idx = np.arange(k_h)[None, :, None, None]
+        kd_idx = np.arange(self.head_dim)[None, None, None, :]
+        perm_k = k_np[b_idx[:, :, :, :1], hk_idx, p_idx, kd_idx]
+        perm_v = v_np[b_idx[:, :, :, :1], hk_idx, p_idx, kd_idx]
+
+        q_p = Tensor(perm_q, requires_grad=q.requires_grad)
+        k_p = Tensor(perm_k, requires_grad=k.requires_grad)
+        v_p = Tensor(perm_v, requires_grad=v.requires_grad)
+
+        q_scaled = Tensor(q_p.data * self.scaling, requires_grad=q_p.requires_grad)
+        k_t = Tensor(k_p.data.transpose(0, 1, 3, 2), requires_grad=k_p.requires_grad)
+        attn = q_scaled.matmul(k_t)
+
+        perm_mask = np.zeros((B, L, L), dtype=np.bool_)
+        for b in range(B):
+            inv_perm = np.argsort(perms[b])
+            for i in range(L):
+                for j in range(L):
+                    perm_mask[b, inv_perm[i], inv_perm[j]] = (perms[b][j] <= perms[b][i])
+
+        attn = Tensor(np.where(perm_mask[:, None, :, :], attn.data, -1e9),
+                       requires_grad=attn.requires_grad)
+
+        if mask is not None:
+            mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
+            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+                           requires_grad=attn.requires_grad)
+
+        attn = attn.softmax(axis=-1)
+        out = attn.matmul(v_p)
+
+        inv_perms = np.array([np.argsort(p) for p in perms])
+        b_idx2 = np.arange(B)[:, None, None, None]
+        h_idx2 = np.arange(self.num_heads)[None, :, None, None]
+        d_idx2 = np.arange(self.head_dim)[None, None, None, :]
+        ip_idx = inv_perms[:, None, :, None]
+
+        out_unperm = out.data[b_idx2, h_idx2, ip_idx, d_idx2]
+        out = Tensor(out_unperm, requires_grad=out.requires_grad)
+
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        return self.o_proj(out)
+
+
+# ---------------------------------------------------------------------------
+# Transformer-XL Block with Segment Recurrence
+# ---------------------------------------------------------------------------
+
+class TransformerXLBlock(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** -0.5
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.q_proj = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.k_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.v_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.o_proj = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+        self.ffn = FeedForward(config)
+
+        if config.norm_type == "rms":
+            self.attn_norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+            self.ffn_norm = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+            self.norm_r = NNRMSNorm(config.embed_dim, eps=config.rms_eps)
+        else:
+            self.attn_norm = LayerNorm(config.embed_dim)
+            self.ffn_norm = LayerNorm(config.embed_dim)
+            self.norm_r = LayerNorm(config.embed_dim)
+
+        self.r_proj = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+
+        self.memory = None
+
+    def _rel_shift(self, x):
+        B, H, L_q, L_kv = x.shape
+        if L_kv > L_q:
+            x = x[:, :, :, :L_q]
+        zero_pad = np.zeros((B, H, L_q, 1), dtype=x.dtype)
+        x_padded = np.concatenate([zero_pad, x], axis=3)
+        x_padded = x_padded.reshape(B, H, L_q + 1, L_kv)
+        x = x_padded[:, :, 1:, :]
+        return x
+
+    def forward(self, x: Tensor, memory=None) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+        h = self.attn_norm(x)
+
+        q = self.q_proj(h).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        if memory is not None and memory.shape[0] == B:
+            memory_h = self.norm_r(Tensor(memory, requires_grad=h.requires_grad))
+            k_cat = self.k_proj(memory_h).reshape(B, memory.shape[1], self.num_kv_heads, self.head_dim)
+            v_cat = self.v_proj(memory_h).reshape(B, memory.shape[1], self.num_kv_heads, self.head_dim)
+        else:
+            k_cat = np.zeros((B, 0, self.num_kv_heads, self.head_dim), dtype=np.float32)
+            v_cat = np.zeros((B, 0, self.num_kv_heads, self.head_dim), dtype=np.float32)
+
+        k_new = self.k_proj(h).reshape(B, L, self.num_kv_heads, self.head_dim)
+        v_new = self.v_proj(h).reshape(B, L, self.num_kv_heads, self.head_dim)
+
+        k = Tensor(np.concatenate([k_cat, k_new.data], axis=1).transpose(0, 2, 1, 3).reshape(
+            B, self.num_kv_heads, -1, self.head_dim), requires_grad=h.requires_grad)
+        v = Tensor(np.concatenate([v_cat, v_new.data], axis=1).transpose(0, 2, 1, 3).reshape(
+            B, self.num_kv_heads, -1, self.head_dim), requires_grad=h.requires_grad)
+
+        S_kv = k.shape[2]
+
+        if self.num_kv_groups > 1:
+            k = Tensor(np.repeat(k.data, self.num_kv_groups, axis=1), requires_grad=k.requires_grad)
+            v = Tensor(np.repeat(v.data, self.num_kv_groups, axis=1), requires_grad=v.requires_grad)
+
+        with no_grad():
+            positions = Tensor(np.arange(S_kv, dtype=np.float32))
+            pos_emb = self.r_proj(Tensor(positions.data.reshape(-1, 1).repeat(self.embed_dim, axis=1))).data
+            pos_emb = pos_emb.reshape(S_kv, self.num_heads, self.head_dim)
+            pos_emb = Tensor(pos_emb.transpose(1, 0, 2)[np.newaxis].repeat(B, axis=0))
+
+        q_scaled = Tensor(q.data * self.scaling, requires_grad=q.requires_grad)
+        k_t = Tensor(k.data.transpose(0, 1, 3, 2), requires_grad=k.requires_grad)
+        content_score = q_scaled.matmul(k_t)
+
+        with no_grad():
+            q_for_pos = q.data
+            pos_t = Tensor(pos_emb.data.transpose(0, 1, 3, 2), requires_grad=pos_emb.requires_grad)
+        pos_score = q_scaled.matmul(pos_t)
+
+        attn = content_score + pos_score
+
+        causal_mask = np.zeros((L, S_kv), dtype=np.bool_)
+        mem_len = S_kv - L
+        for i in range(L):
+            for j in range(S_kv):
+                if j >= mem_len and (j - mem_len) <= i:
+                    causal_mask[i, j] = True
+                elif j < mem_len:
+                    causal_mask[i, j] = True
+        attn = Tensor(np.where(causal_mask[None, None, :, :], attn.data, -1e9),
+                       requires_grad=attn.requires_grad)
+
+        attn = attn.softmax(axis=-1)
+        out = attn.matmul(v)
+
+        self.memory = Tensor(h.data.copy(), requires_grad=h.requires_grad)
+
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        attn_out = self.o_proj(out)
+        h2 = x + attn_out
+        h2 = h2 + self.ffn(self.ffn_norm(h2))
+        return h2
+
+
+# ---------------------------------------------------------------------------
+# DeBERTa Disentangled Attention
+# ---------------------------------------------------------------------------
+
+class DisentangledAttention(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** -0.5
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.content_proj = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.k_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.v_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.o_proj = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+        self.pos_proj_q = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.pos_proj_k = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+
+        self.rel_embeddings = Embedding(config.max_seq_len * 2, self.embed_dim)
+
+    def _disentangled_attention(self, q_content, k_content, q_pos, k_pos, B, L):
+        c2c = q_content.matmul(Tensor(k_content.data.transpose(0, 1, 3, 2), requires_grad=k_content.requires_grad))
+
+        rel_idx = np.arange(-L + 1, L, dtype=np.int32)
+        rel_idx = np.clip(rel_idx + L, 0, self.config.max_seq_len * 2 - 1)
+        rel_emb = self.rel_embeddings(Tensor(rel_idx))
+        k_pos_proj = self.pos_proj_k(rel_emb)
+        k_pos_proj_data = k_pos_proj.data[np.newaxis].repeat(B, axis=0)
+        k_pos_emb = Tensor(k_pos_proj_data, requires_grad=k_pos_proj.requires_grad)
+        k_pos_emb = k_pos_emb.reshape(B, self.num_heads, 2 * L - 1, self.head_dim)
+
+        k_pos_t = Tensor(k_pos_emb.data.transpose(0, 1, 3, 2), requires_grad=k_pos_emb.requires_grad)
+        c2p = q_content.matmul(k_pos_t)
+
+        c2p_expanded = np.zeros((B, self.num_heads, L, L), dtype=np.float32)
+        for i in range(L):
+            for j in range(L):
+                idx = i - j + L - 1
+                if 0 <= idx < 2 * L - 1:
+                    c2p_expanded[:, :, i, j] = c2p.data[:, :, i, idx]
+
+        p2c = q_pos.matmul(Tensor(k_content.data.transpose(0, 1, 3, 2), requires_grad=k_content.requires_grad))
+        p2c_t = np.zeros((B, self.num_heads, L, L), dtype=np.float32)
+        for i in range(L):
+            for j in range(L):
+                if j < p2c.shape[2] and i < p2c.shape[3]:
+                    p2c_t[:, :, i, j] = p2c.data[:, :, j, i]
+
+        attn = (c2c.data + c2p_expanded + p2c_t) * self.scaling
+        return Tensor(attn, requires_grad=q_content.requires_grad)
+
+    def forward(self, x: Tensor, pos=None) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+
+        q_content = self.content_proj(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k_content = self.k_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        if pos is None:
+            with no_grad():
+                positions = Tensor(np.arange(L, dtype=np.int32))
+                pos_emb = self.rel_embeddings(positions)
+        else:
+            pos_emb = self.rel_embeddings(pos)
+
+        pos_emb_data = pos_emb.data[np.newaxis].repeat(B, axis=0)
+        pos_emb_b = Tensor(pos_emb_data, requires_grad=pos_emb.requires_grad)
+
+        q_pos = self.pos_proj_q(pos_emb_b).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k_pos = self.pos_proj_k(pos_emb_b).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        if self.num_kv_groups > 1:
+            k_content = Tensor(np.repeat(k_content.data, self.num_kv_groups, axis=1),
+                               requires_grad=k_content.requires_grad)
+            v = Tensor(np.repeat(v.data, self.num_kv_groups, axis=1), requires_grad=v.requires_grad)
+
+        attn = self._disentangled_attention(q_content, k_content, q_pos, k_pos, B, L)
+
+        causal_mask = np.triu(np.ones((L, L), dtype=np.bool_), k=1)
+        attn = Tensor(np.where(~causal_mask[None, None, :, :], attn.data, -1e9),
+                       requires_grad=attn.requires_grad)
+
+        attn = attn.softmax(axis=-1)
+        out = attn.matmul(v)
+
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        return self.o_proj(out)
+
+
+# ---------------------------------------------------------------------------
+# Gemma Attention with Logit Softcapping
+# ---------------------------------------------------------------------------
+
+class GemmaAttention(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** -0.5
+        self.logit_softcap = config.logit_softcap if config.logit_softcap > 0 else 30.0
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.q_proj = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.k_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.v_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.o_proj = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+        if config.rope_dim is not None:
+            rope_d = min(config.rope_dim, self.head_dim)
+        else:
+            rope_d = self.head_dim
+        self.rope = RoPE(rope_d, max_seq_len=config.max_seq_len, base=config.rope_base)
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+
+        q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        with no_grad():
+            q_np = Tensor(q.data)
+            k_np = Tensor(k.data)
+            q_rot = self.rope.apply_rotary(q_np, offset=0)
+            k_rot = self.rope.apply_rotary(k_np, offset=0)
+        q = Tensor(q_rot.data, requires_grad=q.requires_grad)
+        k = Tensor(k_rot.data, requires_grad=k.requires_grad)
+
+        if self.num_kv_groups > 1:
+            k = Tensor(np.repeat(k.data, self.num_kv_groups, axis=1), requires_grad=k.requires_grad)
+            v = Tensor(np.repeat(v.data, self.num_kv_groups, axis=1), requires_grad=v.requires_grad)
+
+        q_scaled = Tensor(q.data * self.scaling, requires_grad=q.requires_grad)
+        k_t = Tensor(k.data.transpose(0, 1, 3, 2), requires_grad=k.requires_grad)
+        attn = q_scaled.matmul(k_t)
+
+        scores_capped = np.tanh(attn.data / self.logit_softcap) * self.logit_softcap
+        attn = Tensor(scores_capped, requires_grad=attn.requires_grad)
+
+        causal_mask = np.triu(np.ones((L, L), dtype=np.bool_), k=1)
+        attn = Tensor(np.where(~causal_mask[None, None, :, :], attn.data, -1e9),
+                       requires_grad=attn.requires_grad)
+
+        if mask is not None:
+            mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
+            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+                           requires_grad=attn.requires_grad)
+
+        attn = attn.softmax(axis=-1)
+        out = attn.matmul(v)
+
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        return self.o_proj(out)
+
+
+# ---------------------------------------------------------------------------
+# Cross-Layer KV Sharing
+# ---------------------------------------------------------------------------
+
+class CrossLayerKVShare(Module):
+    def __init__(self, layers: list, share_every: int = 2):
+        super().__init__()
+        self.layers = ModuleList(layers)
+        self.share_every = share_every
+        self.kv_cache_shared = {}
+        self.config = layers[0].config if hasattr(layers[0], 'config') else None
+        if self.config is not None:
+            self.embed = Embedding(self.config.vocab_size, self.config.embed_dim)
+        else:
+            self.embed = None
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        if x.ndim == 2 and self.embed is not None:
+            x = self.embed(x)
+        B, L, D = x.shape
+        h = x
+        shared_kv = None
+
+        for i, layer in enumerate(self.layers):
+            if i % self.share_every == 0:
+                if hasattr(layer, 'attn'):
+                    h_norm = layer.attn_norm(h) if hasattr(layer, 'attn_norm') else h
+                    attn_mod = layer.attn
+                    k = attn_mod.k_proj(h_norm).reshape(B, L, attn_mod.num_kv_heads, attn_mod.head_dim)
+                    v = attn_mod.v_proj(h_norm).reshape(B, L, attn_mod.num_kv_heads, attn_mod.head_dim)
+                    shared_kv = (k, v)
+                else:
+                    shared_kv = None
+
+            if hasattr(layer, 'memory'):
+                layer.memory = h.data.copy() if layer.memory is None else layer.memory
+
+            out = layer(h)
+            if isinstance(out, tuple):
+                h = out[0]
+            else:
+                h = out
+
+        return h
+
+
+# ---------------------------------------------------------------------------
+# UL2 Mixture of Denoisers
+# ---------------------------------------------------------------------------
+
+class UL2Denoiser(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.mode_embeddings = Embedding(3, config.embed_dim)
+        self.mode_map = {'R': 0, 'S': 1, 'X': 2}
+
+        self.transformer = Transformer(config)
+
+        self.corruption_rate = 0.15
+
+    def _corrupt(self, x: Tensor, mode: str) -> Tensor:
+        B, L, D = x.shape
+        corrupted = x.data.copy()
+
+        if mode == 'R':
+            mask = np.random.random((B, L)) < self.corruption_rate
+            corrupted[mask] = 0.0
+        elif mode == 'S':
+            span_len = max(1, L // 8)
+            start = np.random.randint(0, max(1, L - span_len + 1))
+            corrupted[:, start:start + span_len] = 0.0
+        elif mode == 'X':
+            mask = np.random.random((B, L)) < self.corruption_rate * 2
+            corrupted[mask] = 0.0
+            perm = np.random.permutation(L)
+            corrupted = corrupted[:, perm]
+
+        return Tensor(corrupted, requires_grad=x.requires_grad)
+
+    def forward(self, x: Tensor, mode: str = 'R') -> Tensor:
+        if isinstance(x, np.ndarray):
+            x = Tensor(x)
+        if x.ndim == 2:
+            x = self.transformer.embed(x)
+
+        mode_id = self.mode_map.get(mode, 0)
+        with no_grad():
+            mode_emb = self.mode_embeddings(Tensor(np.array([mode_id], dtype=np.int32)))
+        mode_emb_broadcast = Tensor(
+            np.broadcast_to(mode_emb.data, (x.shape[0], 1, self.embed_dim)),
+            requires_grad=x.requires_grad
+        )
+        x = Tensor(np.concatenate([mode_emb_broadcast.data, x.data], axis=1),
+                     requires_grad=x.requires_grad)
+
+        x = self._corrupt(x, mode)
+
+        h = x
+        for layer in self.transformer.layers:
+            h, _ = layer(h)
+        h = self.transformer.norm(h)
+
+        return h
+
+
+# ---------------------------------------------------------------------------
+# Prefix-LM Attention (bidirectional prefix + causal completion)
+# ---------------------------------------------------------------------------
+
+class PrefixAttention(Module):
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = config.embed_dim // config.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim ** -0.5
+
+        self.embed = Embedding(config.vocab_size, config.embed_dim)
+        self.q_proj = Linear(self.embed_dim, self.num_heads * self.head_dim, bias=config.bias)
+        self.k_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.v_proj = Linear(self.embed_dim, self.num_kv_heads * self.head_dim, bias=config.bias)
+        self.o_proj = Linear(self.num_heads * self.head_dim, self.embed_dim, bias=config.bias)
+
+    def forward(self, x: Tensor, prefix_len: int = 0, mask=None) -> Tensor:
+        if x.ndim == 2:
+            x = self.embed(x)
+        B, L, D = x.shape
+
+        q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        if self.num_kv_groups > 1:
+            k = Tensor(np.repeat(k.data, self.num_kv_groups, axis=1), requires_grad=k.requires_grad)
+            v = Tensor(np.repeat(v.data, self.num_kv_groups, axis=1), requires_grad=v.requires_grad)
+
+        if prefix_len <= 0:
+            prefix_len = 0
+
+        attn_mask = np.zeros((L, L), dtype=np.bool_)
+        for i in range(L):
+            for j in range(L):
+                if j < prefix_len:
+                    attn_mask[i, j] = True
+                else:
+                    if j <= i:
+                        attn_mask[i, j] = True
+
+        q_scaled = Tensor(q.data * self.scaling, requires_grad=q.requires_grad)
+        k_t = Tensor(k.data.transpose(0, 1, 3, 2), requires_grad=k.requires_grad)
+        attn = q_scaled.matmul(k_t)
+
+        attn = Tensor(np.where(attn_mask[None, None, :, :], attn.data, -1e9),
+                       requires_grad=attn.requires_grad)
+
+        if mask is not None:
+            mask_exp = mask[None, None, :, :] if mask.ndim == 2 else mask
+            attn = Tensor(np.where(mask_exp, attn.data, -1e9),
+                           requires_grad=attn.requires_grad)
+
+        attn = attn.softmax(axis=-1)
+        out = attn.matmul(v)
+
+        out = Tensor(out.data.transpose(0, 2, 1, 3), requires_grad=out.requires_grad)
+        out = out.reshape(B, L, self.num_heads * self.head_dim)
+        return self.o_proj(out)
+

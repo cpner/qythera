@@ -489,3 +489,30 @@ class BackdoorDetector:
             "clustering": cluster_result,
             "spectral": spectral_result,
         }
+
+
+class ModelInversionDefense:
+    def __init__(self, noise_std=0.01):
+        self.noise_std = noise_std
+
+    def defend(self, output):
+        return output + np.random.normal(0, self.noise_std, output.shape)
+
+
+class WatermarkDetector:
+    def __init__(self, green_ratio=0.5, threshold=4.0):
+        self.green_ratio = green_ratio
+        self.threshold = threshold
+
+    def detect(self, tokens, prev_token=None):
+        green_list = self._get_green_list(prev_token)
+        green_count = sum(1 for t in tokens if t in green_list)
+        mu = len(tokens) * self.green_ratio
+        sigma = np.sqrt(len(tokens) * self.green_ratio * (1 - self.green_ratio))
+        z = (green_count - mu) / (sigma + 1e-8)
+        return abs(z) > self.threshold
+
+    def _get_green_list(self, prev_token):
+        import hashlib
+        h = hashlib.md5(str(prev_token).encode()).hexdigest()
+        return set(range(int(h[:8], 16) % 1000, int(h[:8], 16) % 1000 + 500))

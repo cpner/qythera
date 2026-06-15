@@ -1329,6 +1329,166 @@ class EXL2:
 
 
 # ---------------------------------------------------------------------------
+# OmniQuant: Learnable Equivalent Transformation
+# ---------------------------------------------------------------------------
+
+class OmniQuant:
+    """OmniQuant: learnable equivalent transformation for quantization.
+
+    Learns per-channel scales and zero-points via gradient-free optimization
+    (Hill-climbing search) to minimize quantization error while keeping the
+    weight distribution well-suited for low-bit integer representation.
+    """
+
+    def __init__(self, bits: int = 8, group_size: int = 128, n_search: int = 20):
+        self.bits = bits
+        self.group_size = group_size
+        self.n_search = n_search
+
+    def quantize(self, weight: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Quantize weight using learnable equivalent transformation.
+
+        Args:
+            weight: Weight matrix of any shape.
+
+        Returns:
+            Tuple of (quantized, metadata).
+        """
+        weight = weight.astype(np.float32)
+        original_shape = weight.shape
+        flat = weight.reshape(-1)
+        n = flat.size
+
+        n_groups = max(1, math.ceil(n / self.group_size))
+        padded_n = n_groups * self.group_size
+        padded = np.zeros(padded_n, dtype=np.float32)
+        padded[:n] = flat
+        groups = padded.reshape(n_groups, self.group_size)
+
+        qmax = (1 << (self.bits - 1)) - 1
+
+        best_scale = np.ones(n_groups, dtype=np.float32)
+        best_zp = np.zeros(n_groups, dtype=np.float32)
+
+        best_err = float("inf")
+        rng = np.random.RandomState(0)
+
+        for _ in range(self.n_search):
+            cand_scale = best_scale * (0.8 + 0.4 * rng.rand(n_groups))
+            cand_zp = best_zp + rng.randn(n_groups).astype(np.float32) * 0.01
+
+            cand_scale = np.maximum(cand_scale, 1e-8)
+            scaled = groups / cand_scale.reshape(-1, 1) + cand_zp.reshape(-1, 1)
+            q = np.round(scaled).astype(np.int32)
+            q = np.clip(q, -qmax - 1, qmax)
+            recon = (q - cand_zp.reshape(-1, 1)) * cand_scale.reshape(-1, 1)
+            err = float(np.mean((groups - recon) ** 2))
+
+            if err < best_err:
+                best_err = err
+                best_scale = cand_scale
+                best_zp = cand_zp
+
+        scaled = groups / best_scale.reshape(-1, 1) + best_zp.reshape(-1, 1)
+        q = np.round(scaled).astype(np.int32)
+        q = np.clip(q, -qmax - 1, qmax)
+        q_flat = q.reshape(-1)[:n]
+
+        self._metadata = {
+            "original_shape": original_shape,
+            "bits": self.bits,
+            "group_size": self.group_size,
+            "scale": best_scale,
+            "zero_point": best_zp,
+            "n_groups": n_groups,
+            "method": "OmniQuant",
+        }
+        return q_flat.astype(np.float32)
+
+    def dequantize(self, quantized: np.ndarray) -> np.ndarray:
+        metadata = self._metadata
+        scale = metadata["scale"]
+        zp = metadata["zero_point"]
+        n_groups = metadata["n_groups"]
+        original_shape = metadata["original_shape"]
+        n = quantized.size
+        padded_n = n_groups * metadata["group_size"]
+        q_padded = np.zeros(padded_n, dtype=np.float32)
+        q_padded[:n] = quantized.astype(np.float32)
+        groups = q_padded.reshape(n_groups, metadata["group_size"])
+        recon = (groups - zp.reshape(-1, 1)) * scale.reshape(-1, 1)
+        return recon.reshape(-1)[:n].reshape(original_shape)
+
+
+# ---------------------------------------------------------------------------
+# SpQR: Sparse-Quantized Representation
+# ---------------------------------------------------------------------------
+
+class SpQR:
+    """SpQR: sparse-quantized representation.
+
+    Identifies outlier weights by magnitude and keeps them in FP16,
+    while quantizing remaining weights to low-bit integers. This
+    preserves accuracy on critical weights while compressing the rest.
+    """
+
+    def __init__(self, bits: int = 4, outlier_threshold: float = 0.01):
+        self.bits = bits
+        self.threshold = outlier_threshold
+
+    def quantize(self, weight: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Quantize weight with outlier preservation in FP16.
+
+        Args:
+            weight: Weight matrix of any shape.
+
+        Returns:
+            Tuple of (quantized_weight, outlier_indices) where
+            quantized_weight has FP16 outliers mixed in, and
+            outlier_indices has shape (n_outliers,) with flat indices.
+        """
+        weight = weight.astype(np.float32)
+        flat = weight.reshape(-1)
+
+        abs_weights = np.abs(flat)
+        threshold_val = self.threshold * np.max(abs_weights)
+        if threshold_val < 1e-8:
+            threshold_val = self.threshold * np.mean(abs_weights) + 1e-8
+
+        outlier_mask = abs_weights > threshold_val
+        outlier_indices = np.where(outlier_mask)[0]
+
+        non_outlier_flat = flat.copy()
+        non_outlier_flat[outlier_mask] = 0.0
+
+        qmax = (1 << (self.bits - 1)) - 1
+        abs_max = np.max(np.abs(non_outlier_flat))
+        abs_max = max(abs_max, 1e-8)
+        scale = abs_max / qmax
+        q = np.round(non_outlier_flat / scale).astype(np.int32)
+        q = np.clip(q, -qmax - 1, qmax)
+
+        result = q.astype(np.float32) * scale
+        result[outlier_mask] = flat[outlier_mask]
+        result = result.astype(np.float16)
+
+        metadata = {
+            "original_shape": weight.shape,
+            "bits": self.bits,
+            "threshold": self.threshold,
+            "scale": scale,
+            "outlier_count": int(np.sum(outlier_mask)),
+            "outlier_indices": outlier_indices,
+            "method": "SpQR",
+        }
+
+        return result, outlier_indices
+
+    def dequantize(self, quantized: np.ndarray, metadata: Dict[str, Any]) -> np.ndarray:
+        return quantized.astype(np.float32).reshape(metadata["original_shape"])
+
+
+# ---------------------------------------------------------------------------
 # Module exports
 # ---------------------------------------------------------------------------
 
@@ -1344,6 +1504,8 @@ __all__ = [
     "KVCacheQuantization",
     "QuaRot",
     "EXL2",
+    "OmniQuant",
+    "SpQR",
     "quantize_tensor",
     "dequantize_tensor",
     "measure_quantization_error",

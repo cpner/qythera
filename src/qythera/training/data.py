@@ -1,11 +1,12 @@
 """Data pipeline. Pure Python + NumPy."""
+import html
 import json
 import math
 import mmap
 import os
 import re
 import struct
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -369,3 +370,81 @@ class TokenDataset:
         inp = np.array(chunk[: self.seq_len], dtype=np.int64)
         tgt = np.array(chunk[1: self.seq_len + 1], dtype=np.int64)
         return inp, tgt
+
+
+# ---------------------------------------------------------------------------
+# PerplexityFilter – remove outlier documents by n-gram perplexity
+# ---------------------------------------------------------------------------
+
+class PerplexityFilter:
+    def __init__(self, ngram: int = 5, lower_percentile: float = 5,
+                 upper_percentile: float = 95):
+        self.ngram = ngram
+        self.lower = lower_percentile
+        self.upper = upper_percentile
+
+    def filter(self, documents: List[str]) -> List[str]:
+        scores = [self._score(doc) for doc in documents]
+        lo, hi = np.percentile(scores, [self.lower, self.upper])
+        return [doc for doc, s in zip(documents, scores) if lo <= s <= hi]
+
+    def _score(self, doc: str) -> float:
+        tokens = doc.lower().split()
+        if len(tokens) < self.ngram:
+            return 0.0
+        ngrams = Counter()
+        for i in range(len(tokens) - self.ngram + 1):
+            ng = tuple(tokens[i:i + self.ngram])
+            ngrams[ng] += 1
+        total = sum(ngrams.values())
+        if total == 0:
+            return 0.0
+        log_prob = 0.0
+        for count in ngrams.values():
+            log_prob += count * math.log(count / total)
+        return -log_prob / total
+
+
+# ---------------------------------------------------------------------------
+# LanguageIdentifier – character 3-gram language model
+# ---------------------------------------------------------------------------
+
+class LanguageIdentifier:
+    def __init__(self):
+        self.models: dict = {}
+
+    def add_language(self, lang: str, texts: List[str]):
+        counts: Counter = Counter()
+        for text in texts:
+            lower = text.lower()
+            for i in range(len(lower) - 2):
+                counts[lower[i:i + 3]] += 1
+        total = sum(counts.values())
+        self.models[lang] = {ng: c / total for ng, c in counts.items()}
+
+    def identify(self, text: str) -> str:
+        if not self.models:
+            return ""
+        lower = text.lower()
+        return max(self.models.keys(), key=lambda l: self._loglik(lower, l))
+
+    def _loglik(self, text: str, lang: str) -> float:
+        model = self.models[lang]
+        log_prob = 0.0
+        for i in range(len(text) - 2):
+            ng = text[i:i + 3]
+            log_prob += math.log(model.get(ng, 1e-12))
+        return log_prob
+
+
+# ---------------------------------------------------------------------------
+# HTMLCleaner – strip tags, decode entities, remove scripts/styles
+# ---------------------------------------------------------------------------
+
+class HTMLCleaner:
+    def clean(self, html_text: str) -> str:
+        text = re.sub(r'<script[^>]*>.*?</script>', '', html_text, flags=re.DOTALL)
+        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = html.unescape(text)
+        return text.strip()

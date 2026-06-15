@@ -390,8 +390,8 @@ class Lion(Optimizer):
 # ---------------------------------------------------------------------------
 
 class Muon(Optimizer):
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.05, ns_iterations=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, weight_decay=weight_decay, ns_iterations=ns_iterations)
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_iterations=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_iterations=ns_iterations)
         super().__init__(params, defaults)
 
     def newton_schulz(self, G, iterations=5):
@@ -403,26 +403,19 @@ class Muon(Optimizer):
 
     def step(self):
         for group in self.param_groups:
-            lr, momentum, wd, ns_iter = group['lr'], group['momentum'], group['weight_decay'], group['ns_iterations']
             for p in group['params']:
-                if p.grad is None:
-                    continue
+                if p.grad is None: continue
                 g = p.grad.data
                 state = self.state.setdefault(id(p), {'momentum_buffer': np.zeros_like(p.data)})
                 buf = state['momentum_buffer']
-                buf = momentum * buf + g
+                buf = group['momentum'] * buf + g
                 if group['nesterov']:
-                    g = g + momentum * buf
+                    g = g + group['momentum'] * buf
                 else:
                     g = buf
-                state['momentum_buffer'] = buf
                 if p.data.ndim >= 2:
-                    orth = self.newton_schulz(g, ns_iter)
-                    p.data -= lr * orth
-                else:
-                    p.data -= lr * g
-                if wd != 0:
-                    p.data *= (1 - lr * wd)
+                    g = self.newton_schulz(g, group['ns_iterations'])
+                p.data -= group['lr'] * g
 
 
 # ---------------------------------------------------------------------------
@@ -473,12 +466,10 @@ class Sophia(Optimizer):
 
     def step(self):
         for group in self.param_groups:
-            lr, wd, eps = group['lr'], group['weight_decay'], group['eps']
+            lr, wd, eps, clip = group['lr'], group['weight_decay'], group['eps'], group['clip_threshold']
             b1, b2 = group['betas']
-            clip = group['clip_threshold']
             for p in group['params']:
-                if p.grad is None:
-                    continue
+                if p.grad is None: continue
                 g = p.grad.data
                 state = self.state.setdefault(id(p), {'step': 0, 'exp_avg': np.zeros_like(p.data), 'hessian': np.ones_like(p.data)})
                 state['step'] += 1

@@ -966,3 +966,41 @@ class ILQLTrainer:
         if key not in self.q_values:
             return np.zeros(100)
         return self.q_values[key].copy()
+
+
+class RewardModelEnsemble:
+    def __init__(self, models, aggregation='mean'):
+        self.models = models
+        self.aggregation = aggregation
+
+    def score(self, x):
+        scores = [m.score(x) for m in self.models]
+        if self.aggregation == 'mean':
+            return np.mean(scores, axis=0)
+        return np.min(scores, axis=0)
+
+
+class ProcessRewardModel(Module):
+    def __init__(self, config):
+        super().__init__()
+        self.step_head = Linear(config.embed_dim, 1)
+
+    def forward(self, hidden_states):
+        return self.step_head(hidden_states)
+
+
+class SelfPlay:
+    def __init__(self, model, reward_model):
+        self.model = model
+        self.reward_model = reward_model
+
+    def step(self, prompts):
+        completions = [self.model.generate(p) for p in prompts]
+        rewards = [self.reward_model.score(c) for c in completions]
+        pairs = []
+        for i in range(0, len(completions) - 1, 2):
+            if rewards[i] >= rewards[i + 1]:
+                pairs.append((completions[i], completions[i + 1]))
+            else:
+                pairs.append((completions[i + 1], completions[i]))
+        return pairs

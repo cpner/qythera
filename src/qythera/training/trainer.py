@@ -140,6 +140,9 @@ class Trainer:
                  scheduler: Optional[Any] = None,
                  gradient_accumulation_steps: int = 1,
                  max_grad_norm: float = 1.0,
+                 gradient_noise: float = 0.0,
+                 batch_size_warmup_steps: int = 0,
+                 initial_batch_size: int = 32,
                  loss_spike_threshold: float = 2.0,
                  loss_spike_window: int = 100,
                  loss_spike_lr_factor: float = 0.8,
@@ -150,6 +153,7 @@ class Trainer:
                  vocab_size: int = 32000,
                  label_smoothing_ignore_index: int = -100,
                  stochastic_depth_prob: float = 0.0,
+                 weight_decay: float = 0.0,
                  checkpoint_dir: str = "checkpoints",
                  checkpoint_every: int = 1000,
                  checkpoint_keep: int = 5,
@@ -160,8 +164,30 @@ class Trainer:
         for p in self.model.parameters():
             p.requires_grad_(True)
         self.model.train()
+        self.weight_decay = weight_decay
+        self.gradient_noise = gradient_noise
+        self.batch_size_warmup_steps = batch_size_warmup_steps
+        self.initial_batch_size = initial_batch_size
         self.optimizer = optimizer
-        self.optimizer.param_groups[0]["params"] = [p for p in self.model.parameters() if p.requires_grad]
+        if self.weight_decay > 0:
+            no_decay = ['bias', 'norm', 'weight']
+            decay_params = [p for n, p in self.model.named_parameters()
+                            if p.requires_grad and not any(nd in n for nd in no_decay)]
+            no_decay_params = [p for n, p in self.model.named_parameters()
+                               if p.requires_grad and any(nd in n for nd in no_decay)]
+            self.optimizer.param_groups.clear()
+            self.optimizer.param_groups.append({
+                'params': decay_params,
+                **self.optimizer.defaults,
+                'weight_decay': self.weight_decay
+            })
+            self.optimizer.param_groups.append({
+                'params': no_decay_params,
+                **self.optimizer.defaults,
+                'weight_decay': 0.0
+            })
+        else:
+            self.optimizer.param_groups[0]["params"] = [p for p in self.model.parameters() if p.requires_grad]
         self.scheduler = scheduler
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
@@ -394,6 +420,15 @@ class Trainer:
         if loss_mask is not None and isinstance(loss_mask, np.ndarray):
             loss_mask = Tensor(loss_mask)
 
+        if self.batch_size_warmup_steps > 0 and self.global_step < self.batch_size_warmup_steps:
+            current_batch = int(self.initial_batch_size +
+                (data.shape[0] - self.initial_batch_size) * self.global_step / self.batch_size_warmup_steps)
+            current_batch = max(1, min(current_batch, data.shape[0]))
+            data = data[:current_batch]
+            targets = targets[:current_batch]
+            if loss_mask is not None:
+                loss_mask = loss_mask[:current_batch]
+
         self.optimizer.zero_grad(set_to_none=True)
 
         if self.stochastic_depth is not None:
@@ -442,6 +477,12 @@ class Trainer:
 
         grad_norm = self._clip_gradients()
         step_log["grad_norm"] = grad_norm
+
+        if self.gradient_noise > 0:
+            noise_std = self.gradient_noise / math.sqrt(1 + self.global_step)
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    p.grad.data += np.random.normal(0, noise_std, p.grad.data.shape)
 
         if self.grad_scaler:
             self.grad_scaler.step(self.optimizer)

@@ -776,3 +776,69 @@ class PassAtK:
             "n_problems": len(per_problem),
             "per_problem": per_problem,
         }
+
+
+# ---------------------------------------------------------------------------
+# BoolQ: Yes/No Questions on Passages
+# ---------------------------------------------------------------------------
+
+class BoolQ:
+    """BoolQ: yes/no questions on passages."""
+
+    def evaluate(self, model_fn, data):
+        correct = 0
+        for passage, question, answer in data:
+            logits = model_fn(f"{passage} {question}")
+            pred = 'yes' if logits[0] > logits[1] else 'no'
+            correct += (pred == answer)
+        return correct / len(data)
+
+
+# ---------------------------------------------------------------------------
+# PIQA: Physical Intuition QA
+# ---------------------------------------------------------------------------
+
+class PIQA:
+    """PIQA: physical intuition, binary choice."""
+
+    def evaluate(self, model_fn, data):
+        correct = 0
+        for question, option1, option2, answer in data:
+            logits = model_fn(f"{question} {option1} {option2}")
+            pred = 0 if logits[0] > logits[1] else 1
+            correct += (pred == answer)
+        return correct / len(data)
+
+
+# ---------------------------------------------------------------------------
+# CommonsenseQA: Commonsense Reasoning
+# ---------------------------------------------------------------------------
+
+class CommonsenseQA:
+    """CommonsenseQA: commonsense reasoning, 5 options."""
+
+    def evaluate(self, model_fn, data):
+        correct = 0
+        for question, options, answer in data:
+            logits = model_fn(f"{question} {' '.join(options)}")
+            pred = np.argmax(logits)
+            correct += (pred == answer)
+        return correct / len(data)
+
+
+# ---------------------------------------------------------------------------
+# TriviaQA: Trivia Questions with Exact Match
+# ---------------------------------------------------------------------------
+
+class TriviaQA:
+    """TriviaQA: trivia questions, exact match."""
+
+    def evaluate(self, model_fn, data):
+        em_score = 0
+        for question, answer in data:
+            pred = model_fn(question)
+            em_score += self._exact_match(pred, answer)
+        return em_score / len(data)
+
+    def _exact_match(self, pred, answer):
+        return pred.lower().strip() == answer.lower().strip()

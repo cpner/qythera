@@ -201,14 +201,16 @@ class T5RelativeBias:
 
     def _bucket(self, rel):
         rel = np.minimum(np.abs(rel), self.max_distance)
-        small = rel < (self.num_buckets - 1) / 2
-        large = self.num_buckets - 1 - ((self.num_buckets - 1) * (rel - (self.num_buckets - 1) / 2) / (self.max_distance - (self.num_buckets - 1) / 2 + 1e-8)).astype(int)
+        half = self.num_buckets // 2
+        small = rel < half
+        log_max = np.log(self.max_distance / half)
+        large = half + (np.log(rel.astype(np.float32) / half + 1e-10) / log_max * (half - 1)).astype(int)
         large = np.clip(large, 0, self.num_buckets - 1)
         return np.where(small, rel.astype(int), large)
 
-    def forward(self, q_len, k_len):
-        ctx = np.arange(q_len)[:, None]
-        mem = np.arange(k_len)[None, :]
+    def forward(self, query_len, key_len):
+        ctx = np.arange(query_len)[:, None]
+        mem = np.arange(key_len)[None, :]
         buckets = self._bucket(mem - ctx)
         return self.bias[:, buckets].sum(axis=0)
 

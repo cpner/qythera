@@ -296,13 +296,21 @@ class Module:
 # ---------------------------------------------------------------------------
 
 class Linear(Module):
-    def __init__(self, in_features, out_features, bias=True, muP=False):
+    def __init__(self, in_features, out_features, bias=True, muP=False, is_output=False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.muP = muP
+        self.is_output = is_output
         import numpy as np
-        weight = Tensor(np.random.randn(out_features, in_features).astype(np.float32) * math.sqrt(2.0 / in_features))
+        if muP:
+            if is_output:
+                scale = 1.0 / in_features
+            else:
+                scale = 1.0 / math.sqrt(in_features)
+        else:
+            scale = math.sqrt(2.0 / in_features)
+        weight = Tensor(np.random.randn(out_features, in_features).astype(np.float32) * scale)
         self.register_parameter('weight', weight)
         if bias:
             bias_t = Tensor(np.zeros(out_features, dtype=np.float32))
@@ -325,23 +333,55 @@ class Linear(Module):
 # ---------------------------------------------------------------------------
 
 class Embedding(Module):
-    def __init__(self, num_embeddings, embedding_dim, padding_idx=None, max_norm=None, sparse=False):
+    def __init__(self, num_embeddings, embedding_dim, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False):
         super().__init__()
         import numpy as np
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx
         self.max_norm = max_norm
+        self.norm_type = norm_type
+        self.scale_grad_by_freq = scale_grad_by_freq
+        self.sparse = sparse
         weight = Tensor(np.random.randn(num_embeddings, embedding_dim).astype(np.float32) * 0.02)
         if padding_idx is not None:
             weight.data[padding_idx] = 0.0
         self.register_parameter('weight', weight)
 
+    def _clip_weights(self):
+        import numpy as np
+        if self.max_norm is not None:
+            norms = np.linalg.norm(self.weight.data, ord=self.norm_type, axis=1)
+            mask = norms > self.max_norm
+            if np.any(mask):
+                clipped = self.weight.data[mask] * (self.max_norm / norms[mask, np.newaxis])
+                self.weight.data[mask] = clipped
+
     def forward(self, input):
-        return Tensor(self.weight.data[input.data.astype(int).flatten()].reshape(*input.shape, self.embedding_dim), requires_grad=self.weight.requires_grad)
+        import numpy as np
+        indices = input.data.astype(int).flatten()
+        self._clip_weights()
+        out = self.weight.data[indices].reshape(*input.shape, self.embedding_dim)
+        result = Tensor(out, requires_grad=self.weight.requires_grad)
+        if self.sparse:
+            grad_indices = indices
+            grad_values = np.ones(len(indices), dtype=np.float32)
+            grad_shape = self.weight.shape
+            result._sparse_grad = SparseTensor(grad_indices, grad_values, grad_shape)
+        return result
 
     def extra_repr(self):
         return f"num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}"
+
+
+class SparseTensor:
+    def __init__(self, indices, values, shape):
+        self.indices = indices
+        self.values = values
+        self.shape = shape
+
+    def __repr__(self):
+        return f"SparseTensor(indices={self.indices}, values={self.values}, shape={self.shape})"
 
 
 # ---------------------------------------------------------------------------

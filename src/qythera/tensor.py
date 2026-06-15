@@ -721,20 +721,93 @@ class EinsumBackward:
         equation = ctx.saved[0]
         inputs = ctx.saved[1]
         grads = []
+        parts = equation.split("->")
+        input_subs_list = parts[0].split(",")
+        output_sub = parts[1] if len(parts) > 1 else None
         for i, inp in enumerate(inputs):
-            parts = equation.split("->")
-            lhs = parts[0].split(",")[i]
-            rhs = parts[1] if len(parts) > 1 else parts[0].split(",")[i]
-            remaining = [s for j, s in enumerate(parts[0].split(",")) if j != i]
+            inp_sub = input_subs_list[i]
+            remaining = [input_subs_list[j] for j in range(len(input_subs_list)) if j != i]
             remaining_str = ",".join(remaining) if remaining else ""
-            backward_eq = f"{rhs},{remaining_str}->{lhs}" if remaining_str else f"{rhs}->{lhs}"
-            if remaining_str:
-                other_inputs = [inputs[j] for j in range(len(inputs)) if j != i]
-                g_i = np.einsum(backward_eq, grad, *other_inputs)
+            if output_sub is not None:
+                if remaining_str:
+                    backward_eq = f"{output_sub},{remaining_str}->{inp_sub}"
+                else:
+                    backward_eq = f"{output_sub}->{inp_sub}"
             else:
-                g_i = np.einsum(backward_eq, grad)
+                backward_eq = inp_sub
+            backward_parts = backward_eq.split("->") if "->" in backward_eq else [backward_eq, inp_sub]
+            actual_output = backward_parts[1] if len(backward_parts) > 1 else backward_parts[0]
+            if len(actual_output) != len(set(actual_output)):
+                g_i = _einsum_backward_repeated(grad, inp_sub, remaining_str, input_subs_list, output_sub, inputs, i)
+            else:
+                if remaining_str:
+                    other_inputs_data = [inputs[j].data if isinstance(inputs[j], Tensor) else inputs[j]
+                                        for j in range(len(inputs)) if j != i]
+                    g_i = np.einsum(backward_eq, grad, *other_inputs_data)
+                else:
+                    g_i = np.einsum(backward_eq, grad)
             grads.append(g_i)
         return tuple(grads)
+
+
+def _einsum_backward_repeated(grad, inp_sub, remaining_str, input_subs_list, output_sub, inputs, idx):
+    inp_data = inputs[idx].data if isinstance(inputs[idx], Tensor) else inputs[idx]
+    inp_shape = inp_data.shape
+    remaining_inputs_data = [inputs[j].data if isinstance(inputs[j], Tensor) else inputs[j]
+                             for j in range(len(inputs)) if j != idx]
+    dim_sizes = {}
+    for k, sub in enumerate(input_subs_list):
+        t_data = inputs[k].data if isinstance(inputs[k], Tensor) else inputs[k]
+        for pos, ch in enumerate(sub):
+            if pos < len(t_data.shape):
+                dim_sizes[ch] = t_data.shape[pos]
+    if output_sub is not None:
+        if remaining_str:
+            backward_eq = f"{output_sub},{remaining_str}->{inp_sub}"
+        else:
+            backward_eq = f"{output_sub}->{inp_sub}"
+    else:
+        backward_eq = inp_sub
+    backward_parts = backward_eq.split("->") if "->" in backward_eq else [backward_eq, inp_sub]
+    backward_input = backward_parts[0]
+    actual_output = backward_parts[1] if len(backward_parts) > 1 else backward_parts[0]
+    seen = {}
+    unique_chars = []
+    dup_info = []
+    used_chars = set(actual_output)
+    for axis, ch in enumerate(actual_output):
+        if ch in seen:
+            for cand in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz':
+                if cand not in used_chars:
+                    used_chars.add(cand)
+                    unique_chars.append(cand)
+                    dup_info.append((ch, cand, axis, seen[ch]))
+                    break
+        else:
+            unique_chars.append(ch)
+            seen[ch] = axis
+    unique_output = ''.join(unique_chars)
+    unique_eq = f"{backward_input}->{unique_output}"
+    all_known = all(ch in dim_sizes for ch in unique_output)
+    if not all_known:
+        if len(inp_sub) == 2 and inp_sub[0] == inp_sub[1]:
+            n = inp_shape[0]
+            result = np.zeros(inp_shape, dtype=np.float32)
+            np.fill_diagonal(result, grad.ravel()[:n] if grad.ndim > 0 else grad)
+            return result
+        raise ValueError(f"Cannot resolve einsum backward with repeated output subscripts: {backward_eq}")
+    if remaining_inputs_data:
+        g_unique = np.einsum(unique_eq, grad, *remaining_inputs_data)
+    else:
+        g_unique = np.einsum(unique_eq, grad)
+    for orig_ch, new_ch, dup_axis, orig_axis in reversed(dup_info):
+        n = dim_sizes[orig_ch]
+        diag_idx = np.arange(n)
+        idx_list = [slice(None)] * g_unique.ndim
+        idx_list[orig_axis] = diag_idx
+        idx_list[dup_axis] = diag_idx
+        g_unique = g_unique[tuple(idx_list)]
+    return g_unique
 
 class SVDBackward:
     @staticmethod
@@ -828,15 +901,91 @@ class ConvBackward:
 class PadBackward:
     @staticmethod
     def backward(ctx, grad):
-        pads = ctx.saved[0]
-        sliced = grad
-        for i in range(grad.ndim):
+        pads, mode = ctx.saved[0], ctx.saved[1]
+        pads = _normalize_pads(pads, grad.ndim)
+        if mode == 'constant':
+            sliced = grad
+            for i in range(grad.ndim):
+                lo, hi = pads[i]
+                if lo > 0 or hi > 0:
+                    slc = [slice(None)] * grad.ndim
+                    slc[i] = slice(lo, grad.shape[i] - hi if hi > 0 else None)
+                    sliced = sliced[tuple(slc)]
+            return sliced,
+        inp = ctx.inputs[0]
+        inp_shape = inp.shape
+        working = grad
+        for i in reversed(range(grad.ndim)):
             lo, hi = pads[i]
-            if lo > 0 or hi > 0:
-                slc = [slice(None)] * grad.ndim
-                slc[i] = slice(lo, grad.shape[i] - hi if hi > 0 else None)
-                sliced = sliced[tuple(slc)]
-        return sliced,
+            if lo == 0 and hi == 0:
+                continue
+            inp_len = inp_shape[i]
+            new_shape = list(working.shape)
+            new_shape[i] = inp_len
+            result = np.zeros(new_shape, dtype=np.float32)
+            slc_c = [slice(None)] * working.ndim
+            slc_c[i] = slice(lo, lo + inp_len)
+            slc_r = [slice(None)] * working.ndim
+            slc_r[i] = slice(0, inp_len)
+            result[tuple(slc_r)] = working[tuple(slc_c)]
+            if mode == 'reflect':
+                for k in range(lo):
+                    src_idx = lo - 1 - k
+                    sg = [slice(None)] * working.ndim
+                    sr = [slice(None)] * working.ndim
+                    sg[i] = k
+                    sr[i] = src_idx
+                    result[tuple(sr)] += working[tuple(sg)]
+                for k in range(hi):
+                    src_idx = inp_len - 1 - k
+                    sg = [slice(None)] * working.ndim
+                    sr = [slice(None)] * working.ndim
+                    sg[i] = lo + inp_len + k
+                    sr[i] = src_idx
+                    result[tuple(sr)] += working[tuple(sg)]
+            elif mode == 'replicate':
+                if lo > 0:
+                    sg = [slice(None)] * working.ndim
+                    sg[i] = slice(0, lo)
+                    sr = [slice(None)] * working.ndim
+                    sr[i] = 0
+                    result[tuple(sr)] += working[tuple(sg)].sum(axis=i, keepdims=True)
+                if hi > 0:
+                    sg = [slice(None)] * working.ndim
+                    sg[i] = slice(lo + inp_len, lo + inp_len + hi)
+                    sr = [slice(None)] * working.ndim
+                    sr[i] = inp_len - 1
+                    result[tuple(sr)] += working[tuple(sg)].sum(axis=i, keepdims=True)
+            elif mode == 'circular':
+                for k in range(lo):
+                    src_idx = (inp_len - lo + k) % inp_len
+                    sg = [slice(None)] * working.ndim
+                    sr = [slice(None)] * working.ndim
+                    sg[i] = k
+                    sr[i] = src_idx
+                    result[tuple(sr)] += working[tuple(sg)]
+                for k in range(hi):
+                    src_idx = k
+                    sg = [slice(None)] * working.ndim
+                    sr = [slice(None)] * working.ndim
+                    sg[i] = lo + inp_len + k
+                    sr[i] = src_idx
+                    result[tuple(sr)] += working[tuple(sg)]
+            working = result
+        return working,
+
+
+def _normalize_pads(pads, ndim):
+    if isinstance(pads, int):
+        return tuple((pads, pads) for _ in range(ndim))
+    if isinstance(pads[0], (list, tuple)):
+        return tuple((int(p[0]), int(p[1])) for p in pads)
+    pad_flat = [int(x) for x in pads]
+    if len(pad_flat) == 2 * ndim:
+        return tuple((pad_flat[2 * i], pad_flat[2 * i + 1]) for i in range(ndim))
+    if len(pad_flat) == 2 and ndim == 1:
+        return ((pad_flat[0], pad_flat[1]),)
+    return tuple((pad_flat[0], pad_flat[-1]) for _ in range(ndim))
 
 class UnfoldBackward:
     @staticmethod
@@ -1823,7 +1972,7 @@ class Tensor:
         else:
             result = np.pad(self.data, pad, mode=mode)
         return Tensor(result, requires_grad=self.requires_grad,
-                      _ctx=Context(PadBackward, (self,), (pad,)))
+                      _ctx=Context(PadBackward, (self,), (pad, mode)))
 
     def unfold(self, dim, size, step):
         shape = list(self.shape)
