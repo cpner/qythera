@@ -226,7 +226,8 @@ class DivBackward:
 class PowBackward:
     @staticmethod
     def backward(ctx, grad):
-        a, exp = ctx.inputs
+        a = ctx.inputs[0]
+        exp = ctx.saved[0]
         if isinstance(exp, Tensor):
             return _unbroadcast(grad * exp.data * (a.data ** (exp.data - 1)), a.shape), \
                    _unbroadcast(grad * (a.data ** exp.data) * np.log(np.maximum(a.data, 1e-30)), exp.shape)
@@ -568,7 +569,8 @@ class EmbeddingBackward:
         idx = ctx.saved[0]
         weight = ctx.saved[1]
         g = np.zeros_like(weight)
-        np.add.at(g, idx, grad)
+        grad_reshaped = grad.reshape(len(idx), -1)
+        np.add.at(g, idx, grad_reshaped)
         return g, None
 
 class RMSNormBackward:
@@ -665,7 +667,7 @@ class UnsqueezeBackward:
 class ExpandBackward:
     @staticmethod
     def backward(ctx, grad):
-        return grad.sum(axis=tuple(range(grad.ndim - ctx.inputs[0].ndim))) if grad.ndim > ctx.inputs[0].ndim else grad,
+        return _unbroadcast(grad, ctx.inputs[0].shape),
 
 class FlipBackward:
     @staticmethod
@@ -897,8 +899,69 @@ class TriSolveForwardBackward:
 class ConvBackward:
     @staticmethod
     def backward(ctx, grad):
-        x, weight, stride, padding, dilation, groups, col = ctx.saved
-        return np.zeros_like(x), np.zeros_like(weight)
+        x_data, weight_data, stride, padding, dilation, groups, col = ctx.saved
+        if isinstance(x_data, Tensor):
+            x_data = x_data.data
+        if isinstance(weight_data, Tensor):
+            weight_data = weight_data.data
+        grad = np.asarray(grad, dtype=np.float32)
+        B, C = x_data.shape[:2]
+        G = groups
+        if grad.ndim == 4:
+            KH, KW = weight_data.shape[2], weight_data.shape[3]
+            SH, SW = stride if isinstance(stride, tuple) else (stride, stride)
+            PH, PW = padding if isinstance(padding, tuple) else (padding, padding)
+            DH, DW = dilation if isinstance(dilation, tuple) else (dilation, dilation)
+            H, W = x_data.shape[2], x_data.shape[3]
+            H_out = (H + 2 * PH - DH * (KH - 1) - 1) // SH + 1
+            W_out = (W + 2 * PW - DW * (KW - 1) - 1) // SW + 1
+            Cg, Og = C // G, weight_data.shape[0] // G
+            grad_f = grad.reshape(B, weight_data.shape[0], H_out * W_out)
+            dweight = np.zeros_like(weight_data)
+            dx_pad = np.zeros((B, C, H + 2 * PH, W + 2 * PW))
+            col_rs = col.reshape(B, G, Cg * KH * KW, H_out * W_out)
+            for g in range(G):
+                gg = grad_f[:, g * Og:(g + 1) * Og]
+                cg = col_rs[:, g]
+                wg = weight_data[g * Og:(g + 1) * Og].reshape(Og, Cg * KH * KW)
+                dweight[g * Og:(g + 1) * Og] = np.einsum('bij,bjk->ik', gg, cg).reshape(Og, Cg, KH, KW)
+                dcol = np.einsum('ji,bik->bjk', wg, gg).reshape(B, Cg, KH, KW, H_out, W_out)
+                for ki in range(KH):
+                    for kj in range(KW):
+                        hi = np.arange(H_out) * SH + ki * DH
+                        wj = np.arange(W_out) * SW + kj * DW
+                        hh, ww = np.meshgrid(hi, wj, indexing='ij')
+                        for bi in range(B):
+                            for ci in range(Cg):
+                                dx_pad[bi, g * Cg + ci, hh, ww] += dcol[bi, ci, ki, kj]
+            dx = dx_pad[:, :, PH:PH + H, PW:PW + W] if (PH > 0 or PW > 0) else dx_pad
+            return dx, dweight
+        elif grad.ndim == 3:
+            K = weight_data.shape[2]
+            S = stride if isinstance(stride, int) else stride[0]
+            P = padding if isinstance(padding, int) else padding[0]
+            D = dilation if isinstance(dilation, int) else dilation[0]
+            L = x_data.shape[2]
+            L_out = (L + 2 * P - D * (K - 1) - 1) // S + 1
+            Cg, Og = C // G, weight_data.shape[0] // G
+            grad_f = grad.reshape(B, weight_data.shape[0], L_out)
+            dweight = np.zeros_like(weight_data)
+            dx_pad = np.zeros((B, C, L + 2 * P))
+            col_rs = col.reshape(B, G, Cg * K, L_out)
+            for g in range(G):
+                gg = grad_f[:, g * Og:(g + 1) * Og]
+                cg = col_rs[:, g]
+                wg = weight_data[g * Og:(g + 1) * Og].reshape(Og, Cg * K)
+                dweight[g * Og:(g + 1) * Og] = np.einsum('bij,bjk->ik', gg, cg).reshape(Og, Cg, K)
+                dcol = np.einsum('ji,bik->bjk', wg, gg).reshape(B, Cg, K, L_out)
+                for ki in range(K):
+                    li = np.arange(L_out) * S + ki * D
+                    for bi in range(B):
+                        for ci in range(Cg):
+                            np.add.at(dx_pad[bi, g * Cg + ci], li, dcol[bi, ci, ki])
+            dx = dx_pad[:, :, P:P + L] if P > 0 else dx_pad
+            return dx, dweight
+        return np.zeros_like(x_data), np.zeros_like(weight_data)
 
 class PadBackward:
     @staticmethod
@@ -1094,6 +1157,37 @@ class KronBackward:
         a, b = ctx.inputs
         return _unbroadcast(np.kron(grad, np.ones(b.shape)), a.shape), \
                _unbroadcast(np.kron(np.ones(a.shape), grad), b.shape)
+
+class DropoutBackward:
+    @staticmethod
+    def backward(ctx, grad):
+        mask, scale = ctx.saved
+        return grad * mask * scale,
+
+class LayerNormBackward:
+    @staticmethod
+    def backward(ctx, grad):
+        x_data, gamma_data, bias_data, eps = ctx.saved
+        ndim = x_data.ndim
+        batch_axes = tuple(range(ndim - 1)) if ndim > 1 else ()
+
+        mean = x_data.mean(axis=-1, keepdims=True)
+        var = x_data.var(axis=-1, keepdims=True, ddof=0)
+        std = np.sqrt(var + eps)
+        x_hat = (x_data - mean) / std
+
+        if gamma_data is not None:
+            dx_hat = grad * gamma_data
+            dgamma = (grad * x_hat).sum(axis=batch_axes) if batch_axes else (grad * x_hat).sum()
+        else:
+            dx_hat = grad
+            dgamma = None
+
+        dx = (dx_hat - dx_hat.mean(axis=-1, keepdims=True) - x_hat * (dx_hat * x_hat).mean(axis=-1, keepdims=True)) / std
+
+        dbeta = grad.sum(axis=batch_axes) if batch_axes else grad.sum() if bias_data is not None else None
+
+        return dx, dgamma, dbeta
 
 def _unbroadcast(grad, shape):
     if grad.shape == shape:
@@ -2045,15 +2139,20 @@ class Tensor:
     def cross_entropy_loss(self, target, label_smoothing=0.0):
         if isinstance(target, Tensor):
             target = target.data
-        probs = self.softmax(axis=-1)
-        log_probs = np.log(probs.data + 1e-8)
+        target_idx = target.astype(int)
+        n = target_idx.shape[0]
+        log_probs = self.log_softmax(axis=-1)
+        V = log_probs.shape[-1]
         if label_smoothing > 0:
-            V = probs.shape[-1]
-            loss = -(1 - label_smoothing) * log_probs[np.arange(target.shape[0]), target.astype(int)] - \
-                   label_smoothing * log_probs.mean(axis=-1)
+            one_hot = np.zeros((n, V), dtype=np.float32)
+            one_hot[np.arange(n), target_idx] = 1.0 - label_smoothing
+            one_hot += label_smoothing / V
         else:
-            loss = -log_probs[np.arange(target.shape[0]), target.astype(int)]
-        return Tensor(loss.mean(), requires_grad=self.requires_grad)
+            one_hot = np.zeros((n, V), dtype=np.float32)
+            one_hot[np.arange(n), target_idx] = 1.0
+        one_hot_t = Tensor(one_hot, requires_grad=False)
+        cross = -(log_probs * one_hot_t).sum(axis=-1) / n
+        return cross.mean()
 
     def nll_loss(self, target):
         return nll_loss(self, target)

@@ -67,9 +67,7 @@ class SGD(Optimizer):
                 if momentum != 0:
                     state = self.state.setdefault(id(p), {'momentum_buffer': np.zeros_like(p.data)})
                     buf = state['momentum_buffer']
-                    buf = momentum * buf + g
-                    if dampening != 0:
-                        buf *= (1 - dampening)
+                    buf = momentum * buf + (1 - dampening) * g
                     if nesterov:
                         g = g + momentum * buf
                     else:
@@ -110,8 +108,8 @@ class Adam(Optimizer):
                 bias_correction1 = 1 - b1 ** state['step']
                 bias_correction2 = 1 - b2 ** state['step']
                 step_size = lr / bias_correction1
-                bias_correction2_sqrt = math.sqrt(bias_correction2)
-                p.data -= step_size * state['exp_avg'] / (denom / bias_correction2_sqrt + eps)
+                denom = np.sqrt(state['exp_avg_sq'] / bias_correction2) + eps
+                p.data -= step_size * state['exp_avg'] / denom
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +142,8 @@ class AdamW(Optimizer):
                 bias_correction1 = 1 - b1 ** state['step']
                 bias_correction2 = 1 - b2 ** state['step']
                 step_size = lr / bias_correction1
-                bias_correction2_sqrt = math.sqrt(bias_correction2)
-                p.data -= step_size * state['exp_avg'] / (denom / bias_correction2_sqrt + eps)
+                denom = np.sqrt(state['exp_avg_sq'] / bias_correction2) + eps
+                p.data -= step_size * state['exp_avg'] / denom
                 if wd != 0:
                     p.data *= (1 - lr * wd)
 
@@ -379,8 +377,8 @@ class Lion(Optimizer):
                     continue
                 g = p.grad.data
                 state = self.state.setdefault(id(p), {'exp_avg': np.zeros_like(p.data)})
-                state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g
                 update = np.sign(b1 * state['exp_avg'] + (1 - b1) * g)
+                state['exp_avg'] = b1 * state['exp_avg'] + (1 - b1) * g
                 p.data *= (1 - lr * wd)
                 p.data -= lr * update
 

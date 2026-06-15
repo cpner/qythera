@@ -5,7 +5,7 @@ import weakref
 from collections import OrderedDict
 from contextlib import contextmanager
 from functools import lru_cache
-from qythera.tensor import Tensor, no_grad, zeros, ones, randn, eye
+from qythera.tensor import Tensor, no_grad, zeros, ones, randn, eye, Context, EmbeddingBackward, RMSNormBackward, LayerNormBackward, DropoutBackward, ConvBackward
 
 # ---------------------------------------------------------------------------
 # Weight initialization
@@ -313,10 +313,10 @@ class Linear(Module):
                 scale = 1.0 / math.sqrt(in_features)
         else:
             scale = math.sqrt(2.0 / in_features)
-        weight = Tensor(np.random.randn(out_features, in_features).astype(np.float32) * scale)
+        weight = Tensor(np.random.randn(out_features, in_features).astype(np.float32) * scale, requires_grad=True)
         self.register_parameter('weight', weight)
         if bias:
-            bias_t = Tensor(np.zeros(out_features, dtype=np.float32))
+            bias_t = Tensor(np.zeros(out_features, dtype=np.float32), requires_grad=True)
             self.register_parameter('bias', bias_t)
         else:
             self.bias = None
@@ -346,7 +346,7 @@ class Embedding(Module):
         self.norm_type = norm_type
         self.scale_grad_by_freq = scale_grad_by_freq
         self.sparse = sparse
-        weight = Tensor(np.random.randn(num_embeddings, embedding_dim).astype(np.float32) * 0.02)
+        weight = Tensor(np.random.randn(num_embeddings, embedding_dim).astype(np.float32) * 0.02, requires_grad=True)
         if padding_idx is not None:
             weight.data[padding_idx] = 0.0
         self.register_parameter('weight', weight)
@@ -365,7 +365,8 @@ class Embedding(Module):
         indices = input.data.astype(int).flatten()
         self._clip_weights()
         out = self.weight.data[indices].reshape(*input.shape, self.embedding_dim)
-        result = Tensor(out, requires_grad=self.weight.requires_grad)
+        result = Tensor(out, requires_grad=self.weight.requires_grad,
+                        _ctx=Context(EmbeddingBackward, (self.weight,), (indices, self.weight.data)))
         if self.sparse:
             grad_indices = indices
             grad_values = np.ones(len(indices), dtype=np.float32)
@@ -397,7 +398,7 @@ class RMSNorm(Module):
         self.eps = eps
         if elementwise_affine:
             import numpy as np
-            self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32)))
+            self.register_parameter('weight', Tensor(np.ones(num_features, dtype=np.float32), requires_grad=True))
         else:
             self.weight = None
 
@@ -407,7 +408,13 @@ class RMSNorm(Module):
         out = x.data / norm
         if self.weight is not None:
             out = out * self.weight.data
-        return Tensor(out, requires_grad=x.requires_grad)
+        inputs = [x]
+        saved = [x.data, self.weight.data if self.weight is not None else None, self.eps]
+        if self.weight is not None:
+            inputs.append(self.weight)
+        req = x.requires_grad or (self.weight.requires_grad if self.weight is not None else False)
+        return Tensor(out, requires_grad=req,
+                      _ctx=Context(RMSNormBackward, tuple(inputs), tuple(saved)))
 
     def extra_repr(self):
         return f"eps={self.eps}"
@@ -422,8 +429,8 @@ class LayerNorm(Module):
         self.normalized_shape = normalized_shape
         if elementwise_affine:
             import numpy as np
-            self.register_parameter('weight', Tensor(np.ones(normalized_shape, dtype=np.float32)))
-            self.register_parameter('bias', Tensor(np.zeros(normalized_shape, dtype=np.float32)))
+            self.register_parameter('weight', Tensor(np.ones(normalized_shape, dtype=np.float32), requires_grad=True))
+            self.register_parameter('bias', Tensor(np.zeros(normalized_shape, dtype=np.float32), requires_grad=True))
         else:
             self.weight = None
             self.bias = None
@@ -437,7 +444,20 @@ class LayerNorm(Module):
             x_norm = x_norm * self.weight.data
         if self.bias is not None:
             x_norm = x_norm + self.bias.data
-        return Tensor(x_norm, requires_grad=x.requires_grad)
+        inputs = [x]
+        saved = [x.data, self.weight.data if self.weight is not None else None,
+                 self.bias.data if self.bias is not None else None, self.eps]
+        if self.weight is not None:
+            inputs.append(self.weight)
+        if self.bias is not None:
+            inputs.append(self.bias)
+        req = x.requires_grad
+        if self.weight is not None:
+            req = req or self.weight.requires_grad
+        if self.bias is not None:
+            req = req or self.bias.requires_grad
+        return Tensor(x_norm, requires_grad=req,
+                      _ctx=Context(LayerNormBackward, tuple(inputs), tuple(saved)))
 
 
 class BatchNorm(Module):
@@ -659,8 +679,10 @@ class Dropout(Module):
         import numpy as np
         if not self.training or self.p == 0:
             return x
-        mask = np.random.binomial(1, 1 - self.p, x.shape).astype(np.float32) / (1 - self.p)
-        return Tensor(x.data * mask, requires_grad=x.requires_grad)
+        scale = 1.0 / (1.0 - self.p)
+        mask = np.random.binomial(1, 1 - self.p, x.shape).astype(np.float32)
+        return Tensor(x.data * mask * scale, requires_grad=x.requires_grad,
+                      _ctx=Context(DropoutBackward, (x,), (mask, scale)))
 
 
 class Dropout2d(Module):
@@ -740,7 +762,8 @@ class Conv1d(Module):
             out[:, g * self.out_channels // self.groups:(g + 1) * self.out_channels // self.groups] = np.einsum('bik,bjk->bij', w.reshape(self.out_channels // self.groups, -1), c_in)
         if self.bias is not None:
             out = out + self.bias.data.reshape(1, -1, 1)
-        return Tensor(out, requires_grad=x.requires_grad)
+        return Tensor(out, requires_grad=x.requires_grad,
+                      _ctx=Context(ConvBackward, (x, self.weight), (x.data, self.weight.data, self.stride, self.padding, self.dilation, self.groups, None)))
 
 
 class Conv2d(Module):
@@ -790,7 +813,8 @@ class Conv2d(Module):
         out = out.reshape(B, self.out_channels, H_out, W_out)
         if self.bias is not None:
             out = out + self.bias.data.reshape(1, -1, 1, 1)
-        return Tensor(out, requires_grad=x.requires_grad)
+        return Tensor(out, requires_grad=x.requires_grad,
+                      _ctx=Context(ConvBackward, (x, self.weight), (x.data, self.weight.data, self.stride, self.padding, self.dilation, self.groups, None)))
 
 
 class Conv3d(Module):
@@ -847,7 +871,8 @@ class Conv3d(Module):
         out = out.reshape(B, self.out_channels, D_out, H_out, W_out)
         if self.bias is not None:
             out = out + self.bias.data.reshape(1, -1, 1, 1, 1)
-        return Tensor(out, requires_grad=x.requires_grad)
+        return Tensor(out, requires_grad=x.requires_grad,
+                      _ctx=Context(ConvBackward, (x, self.weight), (x.data, self.weight.data, self.stride, self.padding, self.dilation, self.groups, None)))
 
 
 class ConvTransposed1d(Module):

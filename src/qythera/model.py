@@ -1256,7 +1256,7 @@ class FeedForward(Module):
         if act == "swiglu":
             gate = self.w1(x).silu()
             up = self.w3(x)
-            out = self.w2(Tensor(gate.data * up.data, requires_grad=gate.requires_grad or up.requires_grad))
+            out = self.w2(gate * up)
         elif act == "geglu":
             a = self.w1(x)
             b = self.w3(x)
@@ -2394,7 +2394,8 @@ class Transformer(Module):
         return logits
 
     def generate(self, prompt_ids: Tensor, max_tokens: int = 128,
-                 temperature: float = 0.8, top_k: int = 50, top_p: float = 0.9) -> List[int]:
+                 temperature: float = 0.8, top_k: int = 50, top_p: float = 0.9,
+                 stop_tokens: Optional[List[int]] = None) -> List[int]:
         if isinstance(prompt_ids, np.ndarray):
             prompt_ids = Tensor(prompt_ids)
         ids = list(prompt_ids.data.flatten().astype(int))
@@ -2440,6 +2441,9 @@ class Transformer(Module):
             next_id = int(np.random.choice(len(probs), p=probs))
             generated.append(next_id)
             ids.append(next_id)
+
+            if stop_tokens is not None and next_id in stop_tokens:
+                break
 
             pos = cache.get_seq_len() if cache else len(ids) - 1
             with no_grad():

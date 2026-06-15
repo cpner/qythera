@@ -189,7 +189,7 @@ class Trainer:
         self.initial_batch_size = initial_batch_size
         self.optimizer = optimizer
         if self.weight_decay > 0:
-            no_decay = ['bias', 'norm', 'weight']
+            no_decay = ['bias', 'norm']
             decay_params = [p for n, p in self.model.named_parameters()
                             if p.requires_grad and not any(nd in n for nd in no_decay)]
             no_decay_params = [p for n, p in self.model.named_parameters()
