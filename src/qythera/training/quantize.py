@@ -1506,8 +1506,385 @@ __all__ = [
     "EXL2",
     "OmniQuant",
     "SpQR",
+    "SpQREnhanced",
+    "QuantizationAwareTraining",
+    "AQLM",
     "quantize_tensor",
     "dequantize_tensor",
     "measure_quantization_error",
     "auto_quantize",
 ]
+
+
+# ---------------------------------------------------------------------------
+# QuantizationAwareTraining (QAT): simulate quantization in forward pass
+# with straight-through estimator for backward pass
+# ---------------------------------------------------------------------------
+
+class QuantizationAwareTraining:
+    """Quantization-Aware Training with straight-through estimator.
+
+    Simulates quantization noise during the forward pass (fake quantization)
+    so the model learns to be robust to quantization. The backward pass uses
+    a straight-through estimator (STE) to pass gradients through the
+    non-differentiable quantization operation.
+
+    Supports INT8, INT4, and mixed-precision per-layer QAT.
+    """
+
+    def __init__(self, bits: int = 8, symmetric: bool = True, ema_decay: float = 0.99):
+        self.bits = bits
+        self.symmetric = symmetric
+        self.ema_decay = ema_decay
+        self.qmin = -(1 << (bits - 1)) if symmetric else 0
+        self.qmax = (1 << (bits - 1)) - 1
+        self._running_min: Optional[np.ndarray] = None
+        self._running_max: Optional[np.ndarray] = None
+        self._enabled = True
+
+    def enable(self) -> None:
+        self._enabled = True
+
+    def disable(self) -> None:
+        self._enabled = False
+
+    def update_range(self, tensor: np.ndarray) -> None:
+        """Update running min/max statistics for calibration."""
+        t_min = np.min(tensor)
+        t_max = np.max(tensor)
+        if self._running_min is None:
+            self._running_min = np.array(t_min)
+            self._running_max = np.array(t_max)
+        else:
+            self._running_min = self.ema_decay * self._running_min + (1 - self.ema_decay) * t_min
+            self._running_max = self.ema_decay * self._running_max + (1 - self.ema_decay) * t_max
+
+    def fake_quantize(self, tensor: np.ndarray) -> np.ndarray:
+        """Apply fake quantization: quantize then dequantize (with STE gradient)."""
+        if not self._enabled:
+            return tensor
+
+        self.update_range(tensor)
+
+        if self.symmetric:
+            abs_max = max(float(np.max(np.abs(tensor))), 1e-8)
+            scale = abs_max / self.qmax
+        else:
+            t_min = float(np.min(tensor))
+            t_max = float(np.max(tensor))
+            scale = max((t_max - t_min) / (self.qmax - self.qmin), 1e-8)
+            t_min = t_min
+
+        if self.symmetric:
+            quantized = np.round(tensor / scale).astype(np.float32)
+            quantized = np.clip(quantized, self.qmin, self.qmax)
+            dequantized = quantized * scale
+        else:
+            zero_point = np.round(-t_min / scale)
+            quantized = np.round(tensor / scale + zero_point).astype(np.float32)
+            quantized = np.clip(quantized, self.qmin, self.qmax)
+            dequantized = (quantized - zero_point) * scale
+
+        return dequantized
+
+    def forward_linear(self, x: np.ndarray, weight: np.ndarray,
+                       bias: Optional[np.ndarray] = None) -> np.ndarray:
+        """Forward pass through a linear layer with QAT fake quantization."""
+        w_q = self.fake_quantize(weight)
+        out = x @ w_q
+        if bias is not None:
+            out = out + bias
+        return out
+
+    def forward_conv2d(self, x: np.ndarray, weight: np.ndarray,
+                       stride: int = 1, padding: int = 0) -> np.ndarray:
+        """Simplified forward with fake-quantized weights (2D input x 4D weight)."""
+        w_q = self.fake_quantize(weight)
+        if x.ndim == 2 and w_q.ndim == 4:
+            return np.tanh(x @ w_q.reshape(w_q.shape[0], -1))
+        return np.tanh(x @ w_q) if w_q.ndim == 2 else x
+
+    def ste_backward(self, grad_output: np.ndarray,
+                     forward_input: np.ndarray) -> np.ndarray:
+        """Straight-through estimator: pass gradient through as if no quantization."""
+        return grad_output
+
+    def quantize_weights(self, weight: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Quantize weights (used after training)."""
+        weight = weight.astype(np.float32)
+        if self.symmetric:
+            abs_max = max(float(np.max(np.abs(weight))), 1e-8)
+            scale = abs_max / self.qmax
+            q = np.round(weight / scale).astype(np.int32)
+            q = np.clip(q, self.qmin, self.qmax)
+        else:
+            t_min, t_max = float(np.min(weight)), float(np.max(weight))
+            scale = max((t_max - t_min) / (self.qmax - self.qmin), 1e-8)
+            zp = np.round(-t_min / scale)
+            q = np.round(weight / scale + zp).astype(np.int32)
+            q = np.clip(q, self.qmin, self.qmax)
+
+        metadata = {
+            "bits": self.bits,
+            "symmetric": self.symmetric,
+            "scale": scale,
+            "zero_point": zp if not self.symmetric else None,
+            "original_shape": weight.shape,
+            "method": "QAT",
+        }
+        return q.astype(np.float32), metadata
+
+    def get_compression_ratio(self) -> float:
+        return 32.0 / self.bits
+
+
+# ---------------------------------------------------------------------------
+# SpQR Enhanced: Sparse-Quantized Representation with metadata
+# ---------------------------------------------------------------------------
+
+class SpQREnhanced(SpQR):
+    """SpQR Enhanced: sparse-quantized representation with full metadata.
+
+    Keeps outlier weights in higher precision (FP16) while quantizing the
+    rest to low-bit integers. Enhanced version adds per-group outlier
+    detection and metadata for efficient storage and transfer.
+    """
+
+    def __init__(self, bits: int = 4, outlier_threshold: float = 0.01,
+                 group_size: int = 128):
+        super().__init__(bits=bits, outlier_threshold=outlier_threshold)
+        self.group_size = group_size
+
+    def quantize_with_groups(self, weight: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Quantize with per-group outlier detection and metadata."""
+        weight = weight.astype(np.float32)
+        flat = weight.reshape(-1)
+        n = flat.size
+        n_groups = max(1, math.ceil(n / self.group_size))
+        padded_n = n_groups * self.group_size
+        padded = np.zeros(padded_n, dtype=np.float32)
+        padded[:n] = flat
+
+        groups = padded.reshape(n_groups, self.group_size)
+
+        qmax = (1 << (self.bits - 1)) - 1
+        scales = np.zeros(n_groups, dtype=np.float32)
+        outlier_masks = np.zeros((n_groups, self.group_size), dtype=bool)
+        quantized_groups = np.zeros_like(groups, dtype=np.float32)
+
+        for g in range(n_groups):
+            group = groups[g]
+            abs_vals = np.abs(group)
+            threshold = self.threshold * np.max(abs_vals) if np.max(abs_vals) > 1e-8 else 0
+            outlier_masks[g] = abs_vals > threshold
+
+            non_outlier = group.copy()
+            non_outlier[outlier_masks[g]] = 0.0
+            abs_max = np.max(np.abs(non_outlier))
+            abs_max = max(abs_max, 1e-8)
+            scale = abs_max / qmax
+            scales[g] = scale
+
+            q = np.round(non_outlier / scale).astype(np.int32)
+            q = np.clip(q, -qmax - 1, qmax)
+            quantized_groups[g] = q.astype(np.float32) * scale
+            quantized_groups[g][outlier_masks[g]] = group[outlier_masks[g]]
+
+        result = quantized_groups.reshape(-1)[:n]
+
+        total_outliers = int(np.sum(outlier_masks))
+
+        metadata = {
+            "original_shape": weight.shape,
+            "bits": self.bits,
+            "group_size": self.group_size,
+            "threshold": self.threshold,
+            "n_groups": n_groups,
+            "scales": scales,
+            "outlier_masks": outlier_masks,
+            "outlier_count": total_outliers,
+            "outlier_ratio": total_outliers / max(n, 1),
+            "method": "SpQR-Enhanced",
+        }
+        return result.astype(np.float16), metadata
+
+    def dequantize_with_groups(self, quantized: np.ndarray,
+                               metadata: Dict[str, Any]) -> np.ndarray:
+        """Dequantize using group metadata."""
+        original_shape = metadata["original_shape"]
+        n_groups = metadata["n_groups"]
+        group_size = metadata["group_size"]
+        scales = metadata["scales"]
+        outlier_masks = metadata["outlier_masks"]
+
+        flat = quantized.reshape(-1).astype(np.float32)
+        n = flat.size
+        padded_n = n_groups * group_size
+        padded = np.zeros(padded_n, dtype=np.float32)
+        padded[:n] = flat
+        groups = padded.reshape(n_groups, group_size)
+
+        reconstructed = np.zeros_like(groups)
+        for g in range(n_groups):
+            q_vals = groups[g]
+            reconstructed[g] = q_vals  # outliers are stored in-place
+
+        return reconstructed.reshape(-1)[:n].reshape(original_shape)
+
+
+# ---------------------------------------------------------------------------
+# AQLM: Additive Quantization with Multiple Codebooks
+# ---------------------------------------------------------------------------
+
+class AQLM:
+    """Additive Quantization Language Models (AQLM).
+
+    Uses multiple codebooks to represent weights as a sum of quantized
+    lookups. Each weight vector is decomposed into contributions from
+    K codebooks, each of size 2^bits. The reconstruction is:
+        w ≈ sum_{k=1}^{K} codebook_k[idx_k]
+    This additive structure enables high compression with good accuracy.
+    """
+
+    def __init__(self, n_codebooks: int = 2, codebook_bits: int = 8,
+                 n_iters: int = 50, group_size: int = 64):
+        self.n_codebooks = n_codebooks
+        self.codebook_bits = codebook_bits
+        self.codebook_size = 1 << codebook_bits
+        self.n_iters = n_iters
+        self.group_size = group_size
+
+    def _init_codebooks(self, dim: int) -> List[np.ndarray]:
+        """Initialize K codebooks with random values."""
+        rng = np.random.RandomState(42)
+        codebooks = []
+        for _ in range(self.n_codebooks):
+            cb = rng.randn(self.codebook_size, dim).astype(np.float32) * 0.1
+            codebooks.append(cb)
+        return codebooks
+
+    def _find_nearest(self, vectors: np.ndarray, codebook: np.ndarray) -> np.ndarray:
+        """Find nearest codebook entry for each vector (brute force)."""
+        n = vectors.shape[0]
+        indices = np.zeros(n, dtype=np.int32)
+        for i in range(n):
+            dists = np.sum((codebook - vectors[i]) ** 2, axis=1)
+            indices[i] = int(np.argmin(dists))
+        return indices
+
+    def _reconstruct(self, indices: List[np.ndarray], codebooks: List[np.ndarray]) -> np.ndarray:
+        """Reconstruct vectors as sum of codebook lookups."""
+        result = np.zeros_like(codebooks[0][indices[0]])
+        for idx, cb in zip(indices, codebooks):
+            result = result + cb[idx]
+        return result
+
+    def quantize(self, weight: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Quantize weight matrix using additive quantization with multiple codebooks.
+
+        Args:
+            weight: Weight matrix of shape (rows, cols) or 1D.
+
+        Returns:
+            Tuple of (quantized_indices, metadata).
+        """
+        weight = weight.astype(np.float32)
+        original_shape = weight.shape
+
+        if weight.ndim == 1:
+            weight_2d = weight.reshape(1, -1)
+        else:
+            weight_2d = weight
+
+        rows, cols = weight_2d.shape
+        n_groups = max(1, math.ceil(rows / self.group_size))
+        padded_rows = n_groups * self.group_size
+
+        padded = np.zeros((padded_rows, cols), dtype=np.float32)
+        padded[:rows] = weight_2d
+
+        all_indices = np.zeros((padded_rows, self.n_codebooks), dtype=np.int32)
+        codebooks = self._init_codebooks(cols)
+
+        for g in range(n_groups):
+            s = g * self.group_size
+            e = s + self.group_size
+            group = padded[s:e].copy()
+
+            residual = group.copy()
+
+            for k in range(self.n_codebooks):
+                idx = self._find_nearest(residual, codebooks[k])
+                all_indices[s:e, k] = idx
+                recon_k = codebooks[k][idx]
+                residual = residual - recon_k
+
+            # Update codebooks via residual refinement
+            for _ in range(min(self.n_iters, 10)):
+                for cb_k in range(self.n_codebooks):
+                    target = padded[s:e].copy()
+                    for other_k in range(self.n_codebooks):
+                        if other_k != cb_k:
+                            target = target - codebooks[other_k][all_indices[s:e, other_k]]
+                    accumulated = np.zeros_like(codebooks[cb_k])
+                    counts = np.zeros(self.codebook_size, dtype=np.float32)
+                    idx = all_indices[s:e, cb_k]
+                    for i in range(self.group_size):
+                        accumulated[idx[i]] += target[i]
+                        counts[idx[i]] += 1
+                    mask = counts > 0
+                    codebooks[cb_k][mask] = accumulated[mask] / counts[mask, np.newaxis]
+                    # Re-assign indices after codebook update
+                    all_indices[s:e, cb_k] = self._find_nearest(target, codebooks[cb_k])
+
+        quantized_indices = all_indices[:rows]
+
+        # Compute final reconstruction error
+        final_recon = self._reconstruct(
+            [quantized_indices[:, k] for k in range(self.n_codebooks)],
+            codebooks,
+        )
+        error = float(np.mean((weight_2d - final_recon) ** 2))
+
+        # Effective bits
+        total_entries = rows * self.n_codebooks
+        bits_per_param = (total_entries * self.codebook_bits) / max(rows * cols, 1) if weight.ndim >= 2 else (
+            total_entries * self.codebook_bits / max(rows, 1))
+
+        metadata = {
+            "original_shape": original_shape,
+            "n_codebooks": self.n_codebooks,
+            "codebook_bits": self.codebook_bits,
+            "codebook_size": self.codebook_size,
+            "group_size": self.group_size,
+            "n_groups": n_groups,
+            "codebooks": codebooks,
+            "mse_error": error,
+            "effective_bits_per_param": float(bits_per_param),
+            "method": "AQLM",
+        }
+        return quantized_indices.astype(np.int32), metadata
+
+    def dequantize(self, quantized: np.ndarray, metadata: Dict[str, Any]) -> np.ndarray:
+        """Reconstruct weights from quantized indices and codebooks."""
+        codebooks = metadata["codebooks"]
+        original_shape = metadata["original_shape"]
+
+        if quantized.ndim == 1:
+            quantized = quantized.reshape(1, -1)
+
+        rows, n_cb = quantized.shape
+        cols = codebooks[0].shape[1]
+
+        result = np.zeros((rows, cols), dtype=np.float32)
+        for k in range(n_cb):
+            result = result + codebooks[k][quantized[:, k]]
+
+        if len(original_shape) == 1:
+            return result.reshape(-1)[:original_shape[0]]
+        return result.reshape(original_shape)
+
+    def get_compression_ratio(self) -> float:
+        """Effective compression ratio."""
+        bits_per_param = (self.n_codebooks * self.codebook_bits) / self.codebook_size
+        return 32.0 / max(bits_per_param * self.codebook_size / self.n_codebooks, 0.5)

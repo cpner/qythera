@@ -7,6 +7,8 @@ from typing import Optional
 
 import numpy as np
 
+from qythera.tensor import Tensor
+
 
 class JailbreakDetector:
     JAILBREAK_PATTERNS = [
@@ -543,3 +545,174 @@ class OutputConsistency:
             return 0.0
         unique_ratio = len(set(str(o) for o in outputs)) / len(outputs)
         return unique_ratio
+
+
+class DPNoise:
+    def __init__(
+        self,
+        epsilon: float = 1.0,
+        delta: float = 1e-5,
+        clip_norm: float = 1.0,
+    ):
+        self.epsilon = epsilon
+        self.delta = delta
+        self.clip_norm = clip_norm
+        self.noise_scale = clip_norm * math.sqrt(2 * math.log(1.25 / delta)) / epsilon
+
+    def clip_gradient(self, gradient: np.ndarray) -> np.ndarray:
+        grad_norm = np.linalg.norm(gradient)
+        if grad_norm > self.clip_norm:
+            gradient = gradient * self.clip_norm / grad_norm
+        return gradient
+
+    def add_noise(self, gradient: np.ndarray) -> np.ndarray:
+        clipped = self.clip_gradient(gradient)
+        noise = np.random.normal(0, self.noise_scale, size=clipped.shape)
+        return clipped + noise
+
+    def private_gradient(self, gradients: list) -> np.ndarray:
+        clipped = np.array([self.clip_gradient(g) for g in gradients])
+        mean_grad = np.mean(clipped, axis=0)
+        noise = np.random.normal(0, self.noise_scale, size=mean_grad.shape)
+        return mean_grad + noise
+
+    def get_params(self) -> dict:
+        return {
+            "epsilon": self.epsilon,
+            "delta": self.delta,
+            "clip_norm": self.clip_norm,
+            "noise_scale": self.noise_scale,
+        }
+
+
+class SecureAggregation:
+    def __init__(self, num_parties: int, clip_norm: float = 1.0):
+        self.num_parties = num_parties
+        self.clip_norm = clip_norm
+        self.masks = [np.random.randn(1000) for _ in range(num_parties)]
+
+    def _mask_gradient(self, gradient: np.ndarray, party_id: int) -> np.ndarray:
+        flat = gradient.flatten()
+        mask = self.masks[party_id][:len(flat)]
+        masked = flat + mask
+        return masked.reshape(gradient.shape)
+
+    def _unmask_partial(self, masked_gradient: np.ndarray, party_id: int) -> np.ndarray:
+        flat = masked_gradient.flatten()
+        mask = self.masks[party_id][:len(flat)]
+        unmasked = flat - mask
+        return unmasked.reshape(masked_gradient.shape)
+
+    def encrypt(self, gradient: np.ndarray, party_id: int) -> np.ndarray:
+        clipped = gradient.copy()
+        grad_norm = np.linalg.norm(clipped)
+        if grad_norm > self.clip_norm:
+            clipped = clipped * self.clip_norm / grad_norm
+        return self._mask_gradient(clipped, party_id)
+
+    def aggregate(self, encrypted_gradients: list) -> np.ndarray:
+        if len(encrypted_gradients) == 0:
+            return np.zeros(1)
+        sum_grad = np.zeros_like(encrypted_gradients[0])
+        for i, eg in enumerate(encrypted_gradients):
+            decrypted = self._unmask_partial(eg, i)
+            sum_grad = sum_grad + decrypted
+        return sum_grad / len(encrypted_gradients)
+
+    def verify_aggregation(self, original_gradients: list, aggregated: np.ndarray) -> dict:
+        plain_mean = np.mean(original_gradients, axis=0)
+        error = float(np.mean(np.abs(plain_mean - aggregated)))
+        return {
+            "mean_error": error,
+            "num_parties": len(original_gradients),
+            "aggregation_shape": list(aggregated.shape),
+        }
+
+
+class AdversarialDetector:
+    def __init__(self, model, threshold: float = 0.5):
+        self.model = model
+        self.threshold = threshold
+        self.baseline_stats = {}
+
+    def _compute_logit_stats(self, logits: np.ndarray) -> dict:
+        if logits.ndim == 3:
+            logits = logits[:, -1, :]
+        probs = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+        probs = probs / probs.sum(axis=-1, keepdims=True)
+        entropy = -np.sum(probs * np.log(probs + 1e-8), axis=-1)
+        sorted_probs = np.sort(probs, axis=-1)
+        top1_prob = sorted_probs[:, -1]
+        top2_prob = sorted_probs[:, -2]
+        margin = top1_prob - top2_prob
+        return {
+            "entropy": float(np.mean(entropy)),
+            "top1_prob": float(np.mean(top1_prob)),
+            "top2_prob": float(np.mean(top2_prob)),
+            "margin": float(np.mean(margin)),
+        }
+
+    def _compute_input_stats(self, x: np.ndarray) -> dict:
+        return {
+            "mean": float(np.mean(x)),
+            "std": float(np.std(x)),
+            "max": float(np.max(x)),
+            "min": float(np.min(x)),
+            "l2_norm": float(np.linalg.norm(x)),
+        }
+
+    def set_baseline(self, clean_inputs: np.ndarray):
+        stats_list = []
+        for i in range(len(clean_inputs)):
+            logits = self.model(Tensor(clean_inputs[i:i+1].astype(np.float32)))
+            stats = self._compute_logit_stats(logits.data)
+            stats.update(self._compute_input_stats(clean_inputs[i]))
+            stats_list.append(stats)
+        self.baseline_stats = {
+            "mean_entropy": np.mean([s["entropy"] for s in stats_list]),
+            "mean_top1_prob": np.mean([s["top1_prob"] for s in stats_list]),
+            "mean_l2_norm": np.mean([s["l2_norm"] for s in stats_list]),
+            "std_l2_norm": np.std([s["l2_norm"] for s in stats_list]),
+        }
+
+    def detect_fgsm(self, x: np.ndarray) -> dict:
+        x_tensor = Tensor(x.astype(np.float32))
+        logits = self.model(x_tensor)
+        stats = self._compute_logit_stats(logits.data)
+        input_stats = self._compute_input_stats(x)
+        anomaly_score = 0.0
+        if self.baseline_stats:
+            entropy_diff = abs(stats["entropy"] - self.baseline_stats.get("mean_entropy", stats["entropy"]))
+            prob_diff = abs(stats["top1_prob"] - self.baseline_stats.get("mean_top1_prob", stats["top1_prob"]))
+            anomaly_score = 0.5 * entropy_diff + 0.5 * prob_diff
+        return {
+            "adversarial_detected": anomaly_score > self.threshold,
+            "anomaly_score": anomaly_score,
+            "logit_stats": stats,
+            "input_stats": input_stats,
+        }
+
+    def detect_pgd(self, x: np.ndarray, num_checks: int = 5, epsilon: float = 0.01) -> dict:
+        x_adv = x.copy()
+        detections = []
+        for _ in range(num_checks):
+            noise = np.random.uniform(-epsilon, epsilon, x.shape)
+            x_perturbed = np.clip(x + noise, 0, 1) if x.max() > 1 else x + noise
+            result = self.detect_fgsm(x_perturbed)
+            detections.append(result["adversarial_detected"])
+        vote_count = sum(detections)
+        return {
+            "adversarial_detected": vote_count > len(detections) // 2,
+            "vote_count": vote_count,
+            "total_checks": len(detections),
+            "adversarial_ratio": vote_count / len(detections),
+        }
+
+    def detect(self, x: np.ndarray) -> dict:
+        fgsm_result = self.detect_fgsm(x)
+        pgd_result = self.detect_pgd(x)
+        return {
+            "fgsm": fgsm_result,
+            "pgd": pgd_result,
+            "adversarial_detected": fgsm_result["adversarial_detected"] or pgd_result["adversarial_detected"],
+        }

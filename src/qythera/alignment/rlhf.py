@@ -1006,6 +1006,109 @@ class SelfPlay:
         return pairs
 
 
+class SelfPlayTrainer:
+    def __init__(
+        self,
+        policy: Module,
+        reward_model: RewardModel,
+        ref_model: Optional[Module] = None,
+        lr: float = 1e-6,
+        beta: float = 0.1,
+        num_completions: int = 4,
+        temperature: float = 0.8,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        clip_eps: float = 0.2,
+    ):
+        self.policy = policy
+        self.reward_model = reward_model
+        self.ref_model = ref_model
+        self.beta = beta
+        self.num_completions = num_completions
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
+        self.clip_eps = clip_eps
+        self.optimizer = Adam(policy.parameters(), lr=lr)
+
+    def generate_completions(self, prompt: Tensor, max_tokens: int = 128) -> List[List[int]]:
+        completions = []
+        if hasattr(self.policy, 'generate'):
+            with no_grad():
+                for _ in range(self.num_completions):
+                    comp = self.policy.generate(
+                        prompt,
+                        max_tokens=max_tokens,
+                        temperature=self.temperature,
+                        top_k=self.top_k,
+                        top_p=self.top_p,
+                    )
+                    completions.append(comp)
+        return completions
+
+    def compare_via_reward_model(self, completions: List[List[int]]) -> Tuple[List[int], List[int], float]:
+        if len(completions) < 2:
+            return completions[0], completions[0], 0.0
+        rewards = []
+        for comp in completions:
+            input_ids = np.array([comp], dtype=np.int32)
+            reward = self.reward_model.score(Tensor(input_ids))
+            rewards.append(float(reward))
+        rewards_arr = np.array(rewards)
+        best_idx = int(np.argmax(rewards_arr))
+        worst_idx = int(np.argmin(rewards_arr))
+        return completions[best_idx], completions[worst_idx], rewards_arr[best_idx] - rewards_arr[worst_idx]
+
+    def train_step(self, prompts: List[Tensor], max_tokens: int = 128) -> dict:
+        self.policy.train()
+        all_policy_losses = []
+        all_rewards = []
+
+        for prompt in prompts:
+            completions = self.generate_completions(prompt, max_tokens)
+            if len(completions) < 2:
+                continue
+
+            chosen, rejected, reward_margin = self.compare_via_reward_model(completions)
+            all_rewards.append(reward_margin)
+
+            chosen_np = np.array([chosen], dtype=np.int32)
+            rejected_np = np.array([rejected], dtype=np.int32)
+
+            policy_chosen_lp = _gather_log_probs(_model_log_probs(self.policy, chosen_np), chosen_np)
+            policy_rejected_lp = _gather_log_probs(_model_log_probs(self.policy, rejected_np), rejected_np)
+
+            log_ratio = policy_chosen_lp - policy_rejected_lp
+            ratio = np.exp(log_ratio)
+            clipped = np.clip(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
+            reward_signal = reward_margin
+            loss1 = ratio * reward_signal
+            loss2 = clipped * reward_signal
+            policy_loss = -float(np.minimum(loss1, loss2).mean())
+
+            if self.ref_model is not None:
+                ref_chosen_lp = _gather_log_probs(_model_log_probs(self.ref_model, chosen_np), chosen_np)
+                ref_rejected_lp = _gather_log_probs(_model_log_probs(self.ref_model, rejected_np), rejected_np)
+                kl_chosen = np.mean(policy_chosen_lp - ref_chosen_lp)
+                kl_rejected = np.mean(policy_rejected_lp - ref_rejected_lp)
+                kl = 0.5 * (kl_chosen + kl_rejected)
+                total_loss = policy_loss + self.beta * float(kl)
+            else:
+                total_loss = policy_loss
+
+            all_policy_losses.append(total_loss)
+
+        self.policy.zero_grad()
+        self.optimizer.step()
+
+        return {
+            "policy_loss": float(np.mean(all_policy_losses)) if all_policy_losses else 0.0,
+            "mean_reward_margin": float(np.mean(all_rewards)) if all_rewards else 0.0,
+            "n_prompts": len(prompts),
+            "n_valid_pairs": len(all_policy_losses),
+        }
+
+
 class WeakToStrong:
     def __init__(self, weak_model, strong_model):
         self.weak_model = weak_model

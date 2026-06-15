@@ -1,8 +1,10 @@
 """Profiling and analysis tools for Qythera. Pure Python + NumPy."""
 import cProfile
 import io
+import math
 import os
 import pstats
+import random
 import time
 import tracemalloc
 from collections import defaultdict
@@ -367,3 +369,288 @@ class DatasetInspector:
             hi = int(bin_edges[i + 1])
             result.append({"range": f"{lo}-{hi}", "count": int(hist[i])})
         return result
+
+
+# ---------------------------------------------------------------------------
+# NAS (Neural Architecture Search)
+# ---------------------------------------------------------------------------
+
+class NAS:
+    """Neural Architecture Search with random search, DARTS-style, and evolutionary methods."""
+
+    def __init__(self, search_space: Optional[Dict[str, List]] = None):
+        self.search_space = search_space or {}
+        self.history: List[Dict[str, Any]] = []
+
+    def random_search(
+        self,
+        eval_fn: Callable,
+        num_samples: int = 50,
+        seed: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        rng = random.Random(seed)
+        best_score = -math.inf
+        best_arch = None
+        results = []
+
+        for _ in range(num_samples):
+            arch = {k: rng.choice(v) for k, v in self.search_space.items()}
+            score = eval_fn(arch)
+            results.append({"arch": arch, "score": score})
+            self.history.append({"method": "random", "arch": arch, "score": score})
+            if score > best_score:
+                best_score = score
+                best_arch = arch
+
+        return {"best_arch": best_arch, "best_score": best_score, "trials": results}
+
+    def darts_search(
+        self,
+        eval_fn: Callable,
+        num_ops: int = 8,
+        num_nodes: int = 4,
+        iterations: int = 30,
+        temperature: float = 1.0,
+        temp_decay: float = 0.95,
+    ) -> Dict[str, Any]:
+        ops = list(range(num_ops))
+        arch_params = {}
+        for node in range(num_nodes):
+            for prev in range(node + 1):
+                weights = np.ones(num_ops) / num_ops
+                arch_params[(prev, node)] = weights
+
+        for iteration in range(iterations):
+            total_score = 0.0
+            for (prev, node), weights in arch_params.items():
+                sampled_op = rng_choice(ops, weights)
+                candidate = {
+                    "node": node,
+                    "prev": prev,
+                    "op": sampled_op,
+                    "iteration": iteration,
+                }
+                score = eval_fn(candidate)
+                total_score += score
+                weights[sampled_op] += 0.1
+                weights /= weights.sum()
+
+            temperature *= temp_decay
+            self.history.append({
+                "method": "darts",
+                "iteration": iteration,
+                "score": total_score,
+                "temperature": temperature,
+            })
+
+        best_arch = {}
+        for (prev, node), weights in arch_params.items():
+            best_arch[(prev, node)] = int(np.argmax(weights))
+
+        return {
+            "best_arch": best_arch,
+            "final_weights": {str(k): v.tolist() for k, v in arch_params.items()},
+            "iterations": iterations,
+        }
+
+    def evolutionary_search(
+        self,
+        eval_fn: Callable,
+        population_size: int = 20,
+        generations: int = 15,
+        mutation_rate: float = 0.3,
+        elite_fraction: float = 0.2,
+        seed: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        rng = random.Random(seed)
+        elite_count = max(1, int(population_size * elite_fraction))
+
+        population = [
+            {k: rng.choice(v) for k, v in self.search_space.items()}
+            for _ in range(population_size)
+        ]
+
+        best_overall_score = -math.inf
+        best_overall_arch = None
+
+        for gen in range(generations):
+            scored = []
+            for arch in population:
+                score = eval_fn(arch)
+                scored.append((arch, score))
+                self.history.append({
+                    "method": "evolutionary",
+                    "generation": gen,
+                    "score": score,
+                })
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+
+            if scored[0][1] > best_overall_score:
+                best_overall_score = scored[0][1]
+                best_overall_arch = scored[0][0].copy()
+
+            elites = [a.copy() for a, _ in scored[:elite_count]]
+
+            new_pop = list(elites)
+            while len(new_pop) < population_size:
+                parent = rng.choice(elites).copy()
+                child = self._mutate(parent, rng, mutation_rate)
+                new_pop.append(child)
+
+            population = new_pop
+
+        return {
+            "best_arch": best_overall_arch,
+            "best_score": best_overall_score,
+            "generations": generations,
+        }
+
+    def _mutate(self, arch: Dict, rng: random.Random, rate: float) -> Dict:
+        mutated = arch.copy()
+        for k, v in self.search_space.items():
+            if rng.random() < rate:
+                mutated[k] = rng.choice(v)
+        return mutated
+
+
+def rng_choice(items: list, weights: np.ndarray) -> int:
+    r = random.random()
+    cumulative = 0.0
+    for i, w in enumerate(weights):
+        cumulative += w
+        if r <= cumulative:
+            return items[i]
+    return items[-1]
+
+
+# ---------------------------------------------------------------------------
+# MetaLearning
+# ---------------------------------------------------------------------------
+
+class MetaLearning:
+    """Model-Agnostic Meta-Learning (MAML): inner-loop fine-tune, outer-loop minimize."""
+
+    def __init__(self, inner_lr: float = 0.01, outer_lr: float = 0.001,
+                 inner_steps: int = 5, num_tasks: int = 10):
+        self.inner_lr = inner_lr
+        self.outer_lr = outer_lr
+        self.inner_steps = inner_steps
+        self.num_tasks = num_tasks
+
+    def maml(
+        self,
+        theta: Dict[str, Any],
+        get_task_batch: Callable,
+        loss_fn: Callable,
+        num_outer_epochs: int = 100,
+    ) -> Dict[str, Any]:
+        meta_grad_accum = {k: np.zeros_like(v) if isinstance(v, np.ndarray) else 0.0
+                           for k, v in theta.items()}
+
+        history = []
+        for outer_epoch in range(num_outer_epochs):
+            task_losses = []
+
+            for task_idx in range(self.num_tasks):
+                support, query = get_task_batch(task_idx)
+                theta_prime = {k: v.copy() if isinstance(v, np.ndarray) else v
+                               for k, v in theta.items()}
+
+                for inner_step in range(self.inner_steps):
+                    grad = loss_fn(theta_prime, support)
+                    for k in theta_prime:
+                        if isinstance(theta_prime[k], np.ndarray) and k in grad:
+                            theta_prime[k] = theta_prime[k] - self.inner_lr * grad[k]
+
+                query_grad = loss_fn(theta_prime, query)
+                for k in meta_grad_accum:
+                    if k in query_grad:
+                        meta_grad_accum[k] += query_grad[k]
+
+                task_loss = loss_fn(theta_prime, query)
+                if isinstance(task_loss, dict):
+                    task_losses.append(sum(v for v in task_loss.values() if isinstance(v, (int, float))))
+                else:
+                    task_losses.append(float(task_loss))
+
+            for k in theta:
+                if isinstance(theta[k], np.ndarray) and k in meta_grad_accum:
+                    theta[k] = theta[k] - self.outer_lr * meta_grad_accum[k] / self.num_tasks
+
+            avg_loss = sum(task_losses) / max(len(task_losses), 1)
+            history.append({"epoch": outer_epoch, "avg_loss": avg_loss})
+
+        return {"theta": theta, "history": history, "num_outer_epochs": num_outer_epochs}
+
+
+# ---------------------------------------------------------------------------
+# ContinualLearning
+# ---------------------------------------------------------------------------
+
+class ContinualLearning:
+    """Elastic Weight Consolidation (EWC) regularization for continual learning."""
+
+    def __init__(self, lambda_ewc: float = 1000.0, num_tasks: int = 5):
+        self.lambda_ewc = lambda_ewc
+        self.num_tasks = num_tasks
+        self.fisher_information: Dict[str, Any] = {}
+        self.optimal_params: Dict[str, Any] = {}
+
+    def compute_fisher(self, theta: Dict[str, Any], loss_fn: Callable,
+                       data: Any, num_samples: int = 200) -> Dict[str, np.ndarray]:
+        fisher = {k: np.zeros_like(v) if isinstance(v, np.ndarray) else 0.0
+                  for k, v in theta.items()}
+
+        for _ in range(num_samples):
+            grad = loss_fn(theta, data)
+            for k in fisher:
+                if k in grad and isinstance(grad[k], np.ndarray):
+                    fisher[k] += grad[k] ** 2
+
+        for k in fisher:
+            if isinstance(fisher[k], np.ndarray):
+                fisher[k] /= num_samples
+        return fisher
+
+    def update(self, theta: Dict[str, Any], loss_fn: Callable,
+               data: Any, task_idx: int) -> Dict[str, Any]:
+        current_loss = loss_fn(theta, data)
+
+        ewc_penalty = 0.0
+        if self.optimal_params:
+            for k in theta:
+                if k in self.optimal_params and k in self.fisher_information:
+                    if isinstance(theta[k], np.ndarray):
+                        diff = theta[k] - self.optimal_params[k]
+                        ewc_penalty += float(np.sum(self.fisher_information[k] * diff ** 2))
+
+        total_loss = current_loss + (self.lambda_ewc * ewc_penalty / 2.0)
+
+        grad = loss_fn(theta, data)
+        for k in theta:
+            if isinstance(theta[k], np.ndarray) and k in grad:
+                ewc_grad = self.lambda_ewc * self.fisher_information.get(k, np.zeros_like(theta[k])) * (theta[k] - self.optimal_params.get(k, np.zeros_like(theta[k])))
+                grad[k] = grad[k] + ewc_grad
+                theta[k] = theta[k] - 0.001 * grad[k]
+
+        self.fisher_information = self.compute_fisher(theta, loss_fn, data)
+        self.optimal_params = {k: v.copy() if isinstance(v, np.ndarray) else v
+                               for k, v in theta.items()}
+
+        return {
+            "theta": theta,
+            "loss": float(total_loss) if isinstance(total_loss, (int, float)) else total_loss,
+            "task_idx": task_idx,
+            "ewc_penalty": ewc_penalty,
+        }
+
+    def train_sequence(self, theta: Dict[str, Any], loss_fn: Callable,
+                       get_task_data: Callable) -> List[Dict[str, Any]]:
+        results = []
+        for task_idx in range(self.num_tasks):
+            data = get_task_data(task_idx)
+            result = self.update(theta, loss_fn, data, task_idx)
+            theta = result["theta"]
+            results.append(result)
+        return results

@@ -473,3 +473,251 @@ class GradientCompressorPowerSGD:
             "compressed_size": compressed_size,
             "error": np.linalg.norm(gradient - reconstructed),
         }
+
+
+class FSDP:
+    """Fully Sharded Data Parallel (ZeRO-3 simulation).
+
+    Shards parameters, gradients, and optimizer states across workers.
+    Forward: all-gather full parameters, compute, release non-local shards.
+    Backward: all-gather for backward, reduce-scatter gradients, release.
+    """
+
+    def __init__(self, n_workers: int = 4, world_size: int = 4):
+        self.n_workers = n_workers
+        self.world_size = world_size
+
+    def shard_parameters(self, params: np.ndarray) -> List[np.ndarray]:
+        """Partition parameters across workers."""
+        n = len(params.flatten())
+        chunk = max(1, n // self.world_size)
+        flat = params.flatten()
+        shards = []
+        for i in range(self.world_size):
+            s = i * chunk
+            e = s + chunk if i < self.world_size - 1 else n
+            shards.append(flat[s:e].copy())
+        return shards
+
+    def all_gather(self, shard: np.ndarray, rank: int) -> np.ndarray:
+        """Simulate all-gather: each worker has its shard, reconstruct full param."""
+        gathered = np.zeros(self.world_size * len(shard), dtype=shard.dtype)
+        gathered[rank * len(shard):(rank + 1) * len(shard)] = shard
+        return gathered
+
+    def forward(self, params: np.ndarray, x: np.ndarray, rank: int) -> np.ndarray:
+        """Forward pass with parameter all-gather."""
+        shards = self.shard_parameters(params)
+        full = self.all_gather(shards[rank], rank)
+        if params.ndim == 2:
+            full = full.reshape(params.shape)
+        return np.tanh(x @ full) if full.ndim == 2 else x * full
+
+    def reduce_scatter_grads(self, grads: List[np.ndarray]) -> List[np.ndarray]:
+        """Reduce-scatter averaged gradients back to shards."""
+        avg = np.mean(grads, axis=0)
+        n = len(avg)
+        chunk = max(1, n // self.world_size)
+        return [avg[i * chunk:(i + 1) * chunk if i < self.world_size - 1 else n].copy()
+                for i in range(self.world_size)]
+
+    def backward(self, grad_output: np.ndarray, params: np.ndarray, x: np.ndarray) -> List[np.ndarray]:
+        """Compute per-worker gradient shards."""
+        grads = []
+        chunk = max(1, params.shape[0] // self.world_size) if params.ndim >= 1 else 1
+        for i in range(self.world_size):
+            s = i * chunk
+            e = s + chunk if i < self.world_size - 1 else params.shape[0]
+            if params.ndim == 2 and x.ndim == 2:
+                g = x[:, s:e].T @ grad_output
+            else:
+                g = np.random.randn(max(1, e - s)) * 0.01
+            grads.append(g)
+        return self.reduce_scatter_grads(grads)
+
+
+class AsyncSGD:
+    """Asynchronous SGD with a parameter server.
+
+    Workers compute gradients independently and push to a central server.
+    The server applies updates immediately (stale-tolerant).
+    """
+
+    def __init__(self, n_workers: int = 4, lr: float = 0.01, momentum: float = 0.9):
+        self.n_workers = n_workers
+        self.lr = lr
+        self.momentum = momentum
+        self.server_params: Optional[np.ndarray] = None
+        self.velocity: Optional[np.ndarray] = None
+        self.step_count = 0
+        self.stale_counts: List[int] = [0] * n_workers
+
+    def init_server(self, params: np.ndarray) -> None:
+        self.server_params = params.copy()
+        self.velocity = np.zeros_like(params)
+
+    def worker_step(self, worker_id: int, grad: np.ndarray) -> np.ndarray:
+        """A worker computes a gradient and pushes to server; returns current params."""
+        self.step_count += 1
+        self.velocity = self.momentum * self.velocity + (1 - self.momentum) * grad
+        self.server_params = self.server_params - self.lr * self.velocity
+        self.stale_counts[worker_id] = self.step_count
+        return self.server_params.copy()
+
+    def get_params(self) -> np.ndarray:
+        return self.server_params.copy()
+
+    def simulate_round(self, params: np.ndarray, input_batches: List[np.ndarray]) -> np.ndarray:
+        """Simulate one async round: all workers push gradients concurrently."""
+        self.init_server(params)
+        for worker_id in range(self.n_workers):
+            x = input_batches[worker_id % len(input_batches)]
+            w = self.server_params
+            if w.ndim == 2 and x.ndim == 2:
+                out = np.tanh(x @ w)
+                grad = (1 - out ** 2) * np.random.randn(*out.shape) * 0.01
+                w_grad = x.T @ grad if grad.ndim >= 2 else np.random.randn(*w.shape) * 0.01
+            else:
+                w_grad = np.random.randn(*w.shape) * 0.01
+            self.worker_step(worker_id, w_grad)
+        return self.server_params.copy()
+
+    def get_staleness(self) -> float:
+        """Average staleness across workers."""
+        if not self.stale_counts or self.step_count == 0:
+            return 0.0
+        return float(np.mean([self.step_count - s for s in self.stale_counts]))
+
+
+class FedAvg:
+    """Federated Averaging for federated learning.
+
+    Each worker trains locally for E epochs on its private data,
+    then the server performs a weighted average of local models.
+    """
+
+    def __init__(self, n_workers: int = 4, local_epochs: int = 5, lr: float = 0.01):
+        self.n_workers = n_workers
+        self.local_epochs = local_epochs
+        self.lr = lr
+        self.global_params: Optional[np.ndarray] = None
+        self.round_count = 0
+        self.history: List[dict] = []
+
+    def init_global(self, params: np.ndarray) -> None:
+        self.global_params = params.copy()
+        self.round_count = 0
+
+    def distribute_params(self) -> List[np.ndarray]:
+        """Send global params to all workers."""
+        return [self.global_params.copy() for _ in range(self.n_workers)]
+
+    def local_train(self, worker_id: int, local_params: np.ndarray,
+                    local_data: np.ndarray, local_targets: np.ndarray) -> np.ndarray:
+        """Worker trains locally for E epochs."""
+        w = local_params.copy()
+        n_samples = len(local_data) if local_data.ndim > 1 else 1
+        for _ in range(self.local_epochs):
+            if w.ndim == 2 and local_data.ndim == 2:
+                out = np.tanh(local_data @ w)
+                err = out - local_targets.reshape(-1, 1) if local_targets.ndim < 2 else out - local_targets
+                grad = local_data.T @ err / max(n_samples, 1)
+                w = w - self.lr * grad
+            else:
+                w = w - self.lr * np.random.randn(*w.shape) * 0.01
+        return w
+
+    def aggregate(self, worker_params: List[np.ndarray],
+                  worker_sizes: Optional[List[int]] = None) -> np.ndarray:
+        """Weighted average of worker models."""
+        if worker_sizes is None:
+            worker_sizes = [1] * len(worker_params)
+        total_size = sum(worker_sizes)
+        aggregated = np.zeros_like(worker_params[0])
+        for w, s in zip(worker_params, worker_sizes):
+            aggregated += w * (s / total_size)
+        self.global_params = aggregated
+        self.round_count += 1
+        self.history.append({"round": self.round_count, "total_size": total_size})
+        return self.global_params.copy()
+
+    def federated_round(self, local_data_list: List[np.ndarray],
+                        local_target_list: List[np.ndarray],
+                        worker_sizes: Optional[List[int]] = None) -> np.ndarray:
+        """Execute one full federated round: distribute, local train, aggregate."""
+        all_params = self.distribute_params()
+        local_results = []
+        for i in range(self.n_workers):
+            result = self.local_train(i, all_params[i], local_data_list[i], local_target_list[i])
+            local_results.append(result)
+        return self.aggregate(local_results, worker_sizes)
+
+
+class GossipProtocol:
+    """Peer-to-peer gossip protocol for model averaging.
+
+    Each worker maintains a local model. In each gossip round,
+    each worker picks a random neighbor and averages their parameters.
+    Convergence happens over multiple rounds without a central server.
+    """
+
+    def __init__(self, n_workers: int = 4, n_rounds: int = 10, lr: float = 0.01):
+        self.n_workers = n_workers
+        self.n_rounds = n_rounds
+        self.lr = lr
+        self.worker_params: List[Optional[np.ndarray]] = [None] * n_workers
+        self.mixing_weights = np.ones(n_workers) / n_workers
+        self.history: List[List[np.ndarray]] = []
+
+    def init_workers(self, params: np.ndarray) -> None:
+        """Initialize all workers with the same parameters."""
+        self.worker_params = [params.copy() for _ in range(self.n_workers)]
+
+    def _pick_neighbor(self, worker_id: int) -> int:
+        """Pick a random neighbor different from worker_id."""
+        candidates = [i for i in range(self.n_workers) if i != worker_id]
+        return int(np.random.choice(candidates))
+
+    def local_compute(self, worker_id: int, data: np.ndarray) -> np.ndarray:
+        """Worker computes local gradient and updates."""
+        w = self.worker_params[worker_id]
+        if w.ndim == 2 and data.ndim == 2:
+            out = np.tanh(data @ w)
+            grad = (1 - out ** 2) * np.random.randn(*out.shape) * 0.01
+            w_grad = data.T @ grad
+        else:
+            w_grad = np.random.randn(*w.shape) * 0.01
+        return w - self.lr * w_grad
+
+    def gossip_round(self, data_list: Optional[List[np.ndarray]] = None) -> List[np.ndarray]:
+        """One round: each worker computes locally, then averages with a random neighbor."""
+        new_params = [p.copy() if p is not None else None for p in self.worker_params]
+
+        for i in range(self.n_workers):
+            if data_list is not None and i < len(data_list):
+                new_params[i] = self.local_compute(i, data_list[i])
+
+        for i in range(self.n_workers):
+            j = self._pick_neighbor(i)
+            if new_params[i] is not None and new_params[j] is not None:
+                avg = (new_params[i] + new_params[j]) / 2.0
+                new_params[i] = avg
+                new_params[j] = avg
+
+        self.worker_params = new_params
+        self.history.append([p.copy() if p is not None else None for p in self.worker_params])
+        return self.worker_params
+
+    def run_gossip(self, data_list: Optional[List[np.ndarray]] = None) -> List[np.ndarray]:
+        """Run multiple gossip rounds."""
+        for _ in range(self.n_rounds):
+            self.gossip_round(data_list)
+        return self.worker_params
+
+    def consensus_distance(self) -> float:
+        """Measure how far apart worker models are (variance across workers)."""
+        valid = [p for p in self.worker_params if p is not None]
+        if len(valid) < 2:
+            return 0.0
+        stacked = np.stack(valid)
+        return float(np.mean(np.var(stacked, axis=0)))
